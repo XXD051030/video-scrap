@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local / IDE
+.DS_Store
+.env
+.idea/
+.vscode/
+
+# Downloads and runtime cache — do not commit user media
+downloads/
