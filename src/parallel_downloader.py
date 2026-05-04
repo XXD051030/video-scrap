@@ -49,11 +49,13 @@ class ParallelDownloader:
         min_segment_size: int = 1 * 1024 * 1024,
         chunk_size: int = 256 * 1024,
         timeout: int = 30,
+        lane_limiter: Optional[object] = None,
     ) -> None:
         self.connections = max(1, connections)
         self.min_segment_size = min_segment_size
         self.chunk_size = chunk_size
         self.timeout = timeout
+        self.lane_limiter = lane_limiter
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -115,23 +117,31 @@ class ParallelDownloader:
             req_headers = dict(headers)
             if accept_ranges and size > 0:
                 req_headers["Range"] = f"bytes={start}-{end}"
-            with requests.get(
-                url,
-                headers=req_headers,
-                stream=True,
-                timeout=self.timeout,
-            ) as resp:
-                resp.raise_for_status()
-                offset = start
-                for chunk in resp.iter_content(chunk_size=self.chunk_size):
-                    if self._cancel.is_set():
-                        return
-                    if not chunk:
-                        continue
-                    os.pwrite(fd, chunk, offset)
-                    offset += len(chunk)
-                    per_segment[idx].downloaded += len(chunk)
-                    maybe_report()
+            acquired = False
+            try:
+                if self.lane_limiter is not None:
+                    self.lane_limiter.acquire(lambda: self._cancel.is_set())
+                    acquired = True
+                with requests.get(
+                    url,
+                    headers=req_headers,
+                    stream=True,
+                    timeout=self.timeout,
+                ) as resp:
+                    resp.raise_for_status()
+                    offset = start
+                    for chunk in resp.iter_content(chunk_size=self.chunk_size):
+                        if self._cancel.is_set():
+                            return
+                        if not chunk:
+                            continue
+                        os.pwrite(fd, chunk, offset)
+                        offset += len(chunk)
+                        per_segment[idx].downloaded += len(chunk)
+                        maybe_report()
+            finally:
+                if acquired and self.lane_limiter is not None:
+                    self.lane_limiter.release()
 
         try:
             with ThreadPoolExecutor(max_workers=len(segments)) as pool:

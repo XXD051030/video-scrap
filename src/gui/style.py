@@ -125,16 +125,18 @@ def build_stylesheet() -> str:
     }}
 
     /* ---------- Inputs ---------- */
-    QLineEdit, QComboBox, QPlainTextEdit {{
+    QLineEdit, QComboBox, QPlainTextEdit, QSpinBox, QDoubleSpinBox {{
         background-color: {t.SURFACE_ALT};
         color: {t.TEXT};
         border: 1px solid {t.BORDER};
         border-radius: {t.RADIUS_SM}px;
         padding: 7px 10px;
+        min-height: 18px;
         selection-background-color: {t.ACCENT};
         selection-color: #ffffff;
     }}
-    QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus {{
+    QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus,
+    QSpinBox:focus, QDoubleSpinBox:focus {{
         border: 1px solid {t.ACCENT};
     }}
     QLineEdit#UrlInput {{
@@ -157,6 +159,42 @@ def build_stylesheet() -> str:
         selection-background-color: {t.ACCENT};
         selection-color: #ffffff;
         outline: 0;
+    }}
+    QSpinBox::up-button, QDoubleSpinBox::up-button,
+    QSpinBox::down-button, QDoubleSpinBox::down-button {{
+        background-color: {t.SURFACE};
+        border: 0;
+        width: 18px;
+    }}
+    QSpinBox::up-button, QDoubleSpinBox::up-button {{
+        subcontrol-origin: border;
+        subcontrol-position: top right;
+        border-top-right-radius: {t.RADIUS_SM}px;
+    }}
+    QSpinBox::down-button, QDoubleSpinBox::down-button {{
+        subcontrol-origin: border;
+        subcontrol-position: bottom right;
+        border-bottom-right-radius: {t.RADIUS_SM}px;
+    }}
+    QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+    QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+        background-color: {t.BORDER_STRONG};
+    }}
+    QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+        image: none;
+        border-left: 4px solid transparent;
+        border-right: 4px solid transparent;
+        border-bottom: 5px solid {t.TEXT_MUTED};
+        width: 0;
+        height: 0;
+    }}
+    QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+        image: none;
+        border-left: 4px solid transparent;
+        border-right: 4px solid transparent;
+        border-top: 5px solid {t.TEXT_MUTED};
+        width: 0;
+        height: 0;
     }}
 
     /* ---------- Buttons ---------- */
@@ -210,7 +248,6 @@ def build_stylesheet() -> str:
     }}
     QPushButton#Link:hover {{
         color: {t.ACCENT_HOVER};
-        text-decoration: underline;
     }}
     QPushButton#Link:disabled {{
         color: {t.TEXT_DIM};
@@ -223,6 +260,7 @@ def build_stylesheet() -> str:
     }}
     QPushButton#Ghost:hover {{
         background-color: {t.SURFACE_ALT};
+        border-color: {t.BORDER_STRONG};
     }}
 
     /* ---------- List ---------- */
@@ -249,21 +287,6 @@ def build_stylesheet() -> str:
         border: 1px solid {t.ACCENT};
         color: {t.TEXT};
     }}
-    QListWidget#VideoList::indicator {{
-        width: 16px;
-        height: 16px;
-        border-radius: 4px;
-        border: 1px solid {t.BORDER_STRONG};
-        background-color: {t.SURFACE_ALT};
-    }}
-    QListWidget#VideoList::indicator:hover {{
-        border-color: {t.ACCENT};
-    }}
-    QListWidget#VideoList::indicator:checked {{
-        background-color: {t.ACCENT};
-        border-color: {t.ACCENT};
-        image: none;
-    }}
 
     /* ---------- Splitter ---------- */
     QSplitter::handle {{
@@ -281,14 +304,28 @@ def build_stylesheet() -> str:
         background-color: {t.SURFACE_ALT};
         border: 1px solid {t.BORDER};
         border-radius: 6px;
-        height: 12px;
         text-align: center;
         color: {t.TEXT_MUTED};
         font-size: 11px;
     }}
     QProgressBar::chunk {{
         background-color: {t.ACCENT};
-        border-radius: 5px;
+        border-radius: 6px;
+    }}
+    QFrame#DownloadRow {{
+        background-color: {t.SURFACE};
+        border: 1px solid {t.BORDER};
+        border-radius: {t.RADIUS_SM}px;
+    }}
+    QLabel[role="downloadTitle"] {{
+        color: {t.TEXT};
+        font-size: 12px;
+        font-weight: 600;
+    }}
+    QLabel[role="downloadMeta"] {{
+        color: {t.TEXT_MUTED};
+        font-size: 11px;
+        font-family: "SF Mono", Menlo, Consolas, monospace;
     }}
 
     /* ---------- Slider (preview seek bar) ---------- */

@@ -84,11 +84,13 @@ DEFAULT_BYTES_PER_SECOND = 2 * 1024 * 1024
 CHUNK_SIZE = 64 * 1024
 PREFETCH_CHUNK_SIZE = 512 * 1024
 DEFAULT_BUFFER_SECONDS = 60
+PLAYBACK_HLS_PREFETCH_CONNECTIONS = 8
 
 # Shared pool that all HLS prefetchers submit segment downloads into so
 # parallelism is bounded across the whole proxy.
 _HLS_POOL = ThreadPoolExecutor(
-    max_workers=8, thread_name_prefix="HlsPrefetch"
+    max_workers=PLAYBACK_HLS_PREFETCH_CONNECTIONS,
+    thread_name_prefix="HlsPrefetch",
 )
 
 
@@ -163,9 +165,8 @@ class _Entry:
         fd, path = tempfile.mkstemp(
             dir=str(cache_dir), prefix="vs_", suffix=".bin"
         )
-        os.close(fd)
         self.cache_path = Path(path)
-        self._file = open(self.cache_path, "r+b")
+        self._file = os.fdopen(fd, "r+b")
         self._file_lock = threading.Lock()
 
         # Sorted, non-overlapping cached byte intervals [start, end_exclusive).
@@ -317,12 +318,12 @@ class _Entry:
         with self._file_lock:
             try:
                 self._file.close()
-            except Exception:  # noqa: BLE001
+            except OSError:
                 pass
-        try:
-            self.cache_path.unlink()
-        except OSError:
-            pass
+            try:
+                self.cache_path.unlink()
+            except OSError:
+                pass
 
 
 class _Prefetcher(threading.Thread):
@@ -332,7 +333,6 @@ class _Prefetcher(threading.Thread):
         self,
         entry: _Entry,
         get_buffer_bytes: Callable[[], int],
-        is_paused: Callable[[], bool],
         on_status: Optional[Callable[[str], None]] = None,
     ) -> None:
         super().__init__(
@@ -341,7 +341,6 @@ class _Prefetcher(threading.Thread):
         )
         self.entry = entry
         self.get_buffer_bytes = get_buffer_bytes
-        self.is_paused = is_paused
         self.on_status = on_status
 
     def run(self) -> None:  # noqa: D401 (Thread API)
@@ -358,11 +357,6 @@ class _Prefetcher(threading.Thread):
             entry.player_event.clear()
 
         while not entry.closed:
-            if self.is_paused():
-                # A download is running - don't fight it for bandwidth.
-                entry.player_event.wait(timeout=2.0)
-                entry.player_event.clear()
-                continue
             buffer_bytes = max(0, self.get_buffer_bytes())
             if buffer_bytes <= 0:
                 entry.player_event.wait(timeout=2.0)
@@ -485,7 +479,6 @@ class _HlsPrefetcher(threading.Thread):
         self,
         manifest_entry: _Entry,
         get_buffer_seconds: Callable[[], int],
-        is_paused: Callable[[], bool],
         on_status: Optional[Callable[[str], None]] = None,
     ) -> None:
         super().__init__(
@@ -494,7 +487,6 @@ class _HlsPrefetcher(threading.Thread):
         )
         self.entry = manifest_entry
         self.get_buffer_seconds = get_buffer_seconds
-        self.is_paused = is_paused
         self.on_status = on_status
         # Suppress repeated chatter for the same player position.
         self._last_announced_anchor: Optional[int] = None
@@ -507,10 +499,6 @@ class _HlsPrefetcher(threading.Thread):
             entry.player_event.clear()
 
         while not entry.closed:
-            if self.is_paused():
-                entry.player_event.wait(timeout=2.0)
-                entry.player_event.clear()
-                continue
             target = max(0, self.get_buffer_seconds())
             if target <= 0:
                 entry.player_event.wait(timeout=2.0)
@@ -589,7 +577,7 @@ class _HlsPrefetcher(threading.Thread):
                 segment.upstream,
                 headers=segment.headers,
                 stream=True,
-                timeout=20,
+                timeout=(5, 10),
                 allow_redirects=True,
             )
         except Exception:  # noqa: BLE001
@@ -649,9 +637,6 @@ class MediaProxyServer:
         self._settings_store = settings_store
         self._on_status = on_status
         self._buffer_seconds: int = DEFAULT_BUFFER_SECONDS
-        # Background prefetch is suspended while a download is running so
-        # the two never compete for upstream bandwidth.
-        self._download_active: bool = False
         if settings_store is not None:
             initial = settings_store.get()
             try:
@@ -759,28 +744,6 @@ class MediaProxyServer:
     def buffer_seconds(self) -> int:
         return self._buffer_seconds
 
-    def is_prefetch_paused(self) -> bool:
-        return self._download_active
-
-    def set_download_active(self, active: bool) -> None:
-        """Tell the proxy whether a foreground download is in flight.
-
-        While ``active`` is True, every prefetch worker idles so the
-        download has the upstream link to itself.
-        """
-        if self._download_active == bool(active):
-            return
-        self._download_active = bool(active)
-        # Wake every prefetcher so they pick up the new state.
-        with self._lock:
-            entries = list(self._entries.values())
-        for entry in entries:
-            entry.player_event.set()
-        if self._download_active:
-            self._emit("buffer: paused while download is running")
-        else:
-            self._emit("buffer: resumed after download finished")
-
     def _emit(self, message: str) -> None:
         if self._on_status is None:
             return
@@ -829,7 +792,6 @@ class MediaProxyServer:
             prefetcher = _Prefetcher(
                 entry,
                 get_buffer_bytes=self.buffer_bytes,
-                is_paused=self.is_prefetch_paused,
                 on_status=self._on_status,
             )
             with self._lock:
@@ -1012,7 +974,6 @@ class MediaProxyServer:
             worker = _HlsPrefetcher(
                 manifest_entry,
                 get_buffer_seconds=self.buffer_seconds,
-                is_paused=self.is_prefetch_paused,
                 on_status=self._on_status,
             )
             self._hls_prefetchers[token] = worker

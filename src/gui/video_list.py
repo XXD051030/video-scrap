@@ -1,4 +1,4 @@
-"""Video list widget with thumbnail + checkbox rows."""
+"""Video list widget with thumbnail rows."""
 
 from __future__ import annotations
 
@@ -20,13 +20,10 @@ from .workers import ThumbnailWorker
 class VideoListWidget(QListWidget):
     """Show scraped videos with thumbnails and basic metadata.
 
-    Selection itself is the download queue: anything highlighted by the user
-    (single click, Cmd-click, Shift-click) will be downloaded. The current
-    item (last clicked) drives the preview pane.
+    The current item drives both the preview pane and the download action.
     """
 
     selection_changed = pyqtSignal(object)
-    selection_count_changed = pyqtSignal(int)
 
     THUMB_SIZE = QSize(176, 99)
 
@@ -34,9 +31,7 @@ class VideoListWidget(QListWidget):
         super().__init__(parent)
         self.setObjectName("VideoList")
         self.setIconSize(self.THUMB_SIZE)
-        # Multi-select with Cmd/Shift; the selection itself is the
-        # "queue" - no separate checkbox column.
-        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setUniformItemSizes(False)
         self.setSpacing(0)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -45,7 +40,6 @@ class VideoListWidget(QListWidget):
         )
         self._items: List[VideoItem] = []
         self._thumb_workers: List[ThumbnailWorker] = []
-        self.itemSelectionChanged.connect(self._on_selection_changed)
         self.currentItemChanged.connect(self._on_current_item_changed)
 
     def set_videos(self, videos: List[VideoItem]) -> None:
@@ -56,7 +50,6 @@ class VideoListWidget(QListWidget):
         for index, video in enumerate(self._items):
             text = self._format_text(video)
             item = QListWidgetItem(text)
-            # No ItemIsUserCheckable - selection IS the queue.
             item.setSizeHint(QSize(0, self.THUMB_SIZE.height() + 22))
             item.setData(Qt.ItemDataRole.UserRole, index)
             placeholder = QPixmap(self.THUMB_SIZE)
@@ -79,29 +72,14 @@ class VideoListWidget(QListWidget):
     def videos(self) -> List[VideoItem]:
         return list(self._items)
 
-    def checked_videos(self) -> List[VideoItem]:
-        """Currently selected videos - kept name for backwards compatibility."""
-        return self.selected_videos()
-
-    def selected_videos(self) -> List[VideoItem]:
-        result: List[VideoItem] = []
-        for item in self.selectedItems():
-            idx = item.data(Qt.ItemDataRole.UserRole)
-            if isinstance(idx, int) and 0 <= idx < len(self._items):
-                result.append(self._items[idx])
-        return result
-
-    def set_all_checked(self, checked: bool) -> None:
-        if checked:
-            self.selectAll()
-        else:
-            self.clearSelection()
-
     def current_video(self) -> Optional[VideoItem]:
         row = self.currentRow()
         if row < 0 or row >= len(self._items):
             return None
         return self._items[row]
+
+    def shutdown(self) -> None:
+        self._stop_workers()
 
     def _format_text(self, video: VideoItem) -> str:
         duration = format_duration(video.duration)
@@ -148,9 +126,6 @@ class VideoListWidget(QListWidget):
         painter.end()
         return rounded
 
-    def _on_selection_changed(self) -> None:
-        self.selection_count_changed.emit(len(self.selectedItems()))
-
     def _on_current_item_changed(self, _current, _previous) -> None:
         self.selection_changed.emit(self.current_video())
 
@@ -159,5 +134,7 @@ class VideoListWidget(QListWidget):
             if worker.isRunning():
                 worker.requestInterruption()
                 worker.quit()
-                worker.wait(50)
+                if not worker.wait(1000):
+                    worker.terminate()
+                    worker.wait(1000)
         self._thumb_workers.clear()

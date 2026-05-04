@@ -47,6 +47,14 @@ def _ext_of(url: str) -> Optional[str]:
     return None
 
 
+def _is_known_player_placeholder(url: str) -> bool:
+    """Ignore demo assets bundled by web players, not the page's real media."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    return host.endswith("artplayer.org") and path.startswith("/assets/sample/")
+
+
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -241,7 +249,7 @@ class VideoScraper:
                 log(f"JS decoder failed: {exc}")
                 hidden_urls = []
             for idx, link in enumerate(hidden_urls, 1):
-                if link in seen_urls:
+                if _is_known_player_placeholder(link) or link in seen_urls:
                     continue
                 seen_urls.add(link)
                 ext = _ext_of(link)
@@ -297,6 +305,16 @@ class VideoScraper:
 
         items: List[VideoItem] = []
         for entry in entries:
+            format_urls = [
+                fmt.get("url")
+                for fmt in (entry.get("formats") or [])
+                if fmt.get("url")
+            ]
+            if format_urls and all(
+                _is_known_player_placeholder(link) for link in format_urls
+            ):
+                log("yt-dlp returned only player demo media; ignoring it.")
+                continue
             video_url = (
                 entry.get("webpage_url")
                 or entry.get("original_url")
@@ -424,6 +442,8 @@ class VideoScraper:
             if not cand:
                 continue
             cand = html_module.unescape(cand).strip()
+            if _is_known_player_placeholder(cand):
+                continue
             if cand and cand not in seen:
                 seen.add(cand)
                 unique.append(cand)

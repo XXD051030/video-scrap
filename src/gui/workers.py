@@ -12,7 +12,12 @@ from typing import List, Optional
 import requests
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-from ..downloader import DownloadProgress, VideoDownloader, build_request_headers
+from ..downloader import (
+    DownloadLaneLimiter,
+    DownloadProgress,
+    VideoDownloader,
+    build_request_headers,
+)
 from ..scraper import VideoItem, VideoScraper
 
 
@@ -83,34 +88,53 @@ class DownloadWorker(QThread):
         items: List[VideoItem],
         output_dir: Path,
         quality: str = "best",
+        parallel_connections: int = 8,
+        lane_limiter: Optional[DownloadLaneLimiter] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
         self.items = items
         self.output_dir = output_dir
         self.quality = quality
+        self.parallel_connections = parallel_connections
+        self.lane_limiter = lane_limiter
         self._cancelled = False
+        self._keep_partial = False
+        self._downloader: Optional[VideoDownloader] = None
 
-    def cancel(self) -> None:
+    def cancel(self, keep_partial: bool = False) -> None:
         self._cancelled = True
+        self._keep_partial = self._keep_partial or keep_partial
+        if self._downloader is not None:
+            self._downloader.cancel(keep_partial=keep_partial)
 
     def run(self) -> None:
-        downloader = VideoDownloader(self.output_dir)
-        for index, item in enumerate(self.items):
-            if self._cancelled:
-                break
-            self.item_started.emit(index, item)
+        downloader = VideoDownloader(
+            self.output_dir,
+            parallel_connections=self.parallel_connections,
+            lane_limiter=self.lane_limiter,
+        )
+        self._downloader = downloader
+        try:
+            for index, item in enumerate(self.items):
+                if self._cancelled:
+                    break
+                self.item_started.emit(index, item)
 
-            def on_progress(progress: DownloadProgress, idx: int = index) -> None:
-                self.item_progress.emit(idx, progress)
+                def on_progress(progress: DownloadProgress, idx: int = index) -> None:
+                    self.item_progress.emit(idx, progress)
 
-            try:
-                final_path = downloader.download(
-                    item,
-                    quality=self.quality,
-                    on_progress=on_progress,
-                )
-                self.item_finished.emit(index, str(final_path))
-            except Exception as exc:  # noqa: BLE001
-                self.item_failed.emit(index, str(exc))
-        self.all_done.emit()
+                try:
+                    final_path = downloader.download(
+                        item,
+                        quality=self.quality,
+                        on_progress=on_progress,
+                    )
+                    if not self._cancelled or final_path.exists():
+                        self.item_finished.emit(index, str(final_path))
+                except Exception as exc:  # noqa: BLE001
+                    if not self._cancelled or self._keep_partial:
+                        self.item_failed.emit(index, str(exc))
+        finally:
+            self._downloader = None
+            self.all_done.emit()

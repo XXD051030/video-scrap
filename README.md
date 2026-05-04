@@ -25,7 +25,8 @@ TikTok, Vimeo, Instagram, etc.).
   scrubbing the timeline is instant inside the cached window. Adjust it
   from **Preferences** (⌘,) — cache lives in a temp folder that's wiped
   on app exit.
-- Multi-select with checkboxes and bulk download.
+- Single selection: click a video to preview it, then download that current
+  video.
 - Quality picker (best / 1080p / 720p / 480p / audio only).
 - Automatic ``Referer`` header for sites that hot-link-protect their CDN.
 - Custom output folder, with progress bar and live log.
@@ -63,9 +64,9 @@ python main.py
 2. Browse the discovered videos in the left list. Click any item to load
    metadata and thumbnail on the right; click **Play** to preview it
    inline when the source is directly playable.
-3. Tick the checkboxes of the videos you want.
+3. Click the video you want to download.
 4. (Optional) Change quality and choose a download folder.
-5. Click **Download selected**.
+5. Click **Download current**.
 
 Files are saved to `./downloads` by default.
 
@@ -86,7 +87,7 @@ video scrap/
     ├── utils.py
     └── gui/
         ├── main_window.py
-        ├── video_list.py     # left list with thumbnails + checkboxes
+        ├── video_list.py     # left list with thumbnails
         ├── preview_panel.py  # right preview + embedded player
         ├── settings_dialog.py # Preferences dialog (playback buffer)
         ├── js_renderer.py    # headless QWebEnginePage fallback

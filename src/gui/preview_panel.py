@@ -92,6 +92,7 @@ class PreviewPanel(QWidget):
     """Display details and an embedded media player for a selected video."""
 
     player_message = pyqtSignal(str)
+    playback_activity_changed = pyqtSignal(bool)
 
     def __init__(
         self,
@@ -103,6 +104,8 @@ class PreviewPanel(QWidget):
         self._thumb_worker: Optional[ThumbnailWorker] = None
         self._proxy = proxy
         self._active_proxy_url: Optional[str] = None
+        self._pending_playable_url: Optional[str] = None
+        self._source_loaded = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -129,8 +132,7 @@ class PreviewPanel(QWidget):
         self.thumbnail_label.setFrameShape(QFrame.Shape.NoFrame)
         self.thumbnail_label.setStyleSheet(
             f"color: {Tokens.TEXT_MUTED};"
-            f" background-color: {Tokens.MEDIA_BG};"
-            f" border-radius: {Tokens.RADIUS}px;"
+            " background-color: transparent;"
             " font-size: 14px;"
         )
         self.thumbnail_label.setSizePolicy(
@@ -140,10 +142,6 @@ class PreviewPanel(QWidget):
         self.video_widget = QVideoWidget()
         self.video_widget.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        self.video_widget.setStyleSheet(
-            f"background-color: {Tokens.MEDIA_BG};"
-            f" border-radius: {Tokens.RADIUS}px;"
         )
 
         # Order matters: thumbnail at index 0 (default), video at index 1.
@@ -229,8 +227,12 @@ class PreviewPanel(QWidget):
 
     def show_video(self, video: Optional[VideoItem]) -> None:
         self._stop()
+        self.player.setSource(QUrl())
         self._release_proxy_url()
+        self._stop_thumb_worker()
         self._current = video
+        self._pending_playable_url = None
+        self._source_loaded = False
         self._show_thumbnail_view()
 
         if video is None:
@@ -284,11 +286,25 @@ class PreviewPanel(QWidget):
 
         playable_url = self._best_playable_url(video)
         if playable_url:
-            wrapped = self._wrap_with_proxy(playable_url, video)
-            self.player.setSource(QUrl(wrapped))
+            self._pending_playable_url = playable_url
             self._set_controls_enabled(True)
         else:
             self._set_controls_enabled(False)
+
+    def release_stream(self) -> None:
+        """Stop playback and release any local proxy stream."""
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self._release_proxy_url()
+        self._source_loaded = False
+        self._show_thumbnail_view()
+
+    def is_playing(self) -> bool:
+        return self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+
+    def shutdown(self) -> None:
+        self.release_stream()
+        self._stop_thumb_worker()
 
     def _wrap_with_proxy(self, playable_url: str, video: VideoItem) -> str:
         """Route URLs that need a Referer through the local proxy."""
@@ -372,6 +388,17 @@ class PreviewPanel(QWidget):
     def _on_thumb_failed(self, _index: int, message: str) -> None:
         self.thumbnail_label.setText(f"(Thumbnail error: {message})")
 
+    def _stop_thumb_worker(self) -> None:
+        worker = self._thumb_worker
+        self._thumb_worker = None
+        if worker is None or not worker.isRunning():
+            return
+        worker.requestInterruption()
+        worker.quit()
+        if not worker.wait(1000):
+            worker.terminate()
+            worker.wait(1000)
+
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.play_button.setEnabled(enabled)
         self.stop_button.setEnabled(enabled)
@@ -384,6 +411,8 @@ class PreviewPanel(QWidget):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         else:
+            if not self._ensure_source_loaded():
+                return
             # Make the video widget visible BEFORE calling play() - Qt's
             # FFmpeg media backend will not render frames into a hidden
             # widget, which previously left playback stuck in the
@@ -393,6 +422,16 @@ class PreviewPanel(QWidget):
 
     def _stop(self) -> None:
         self.player.stop()
+
+    def _ensure_source_loaded(self) -> bool:
+        if self._source_loaded:
+            return True
+        if self._current is None or not self._pending_playable_url:
+            return False
+        wrapped = self._wrap_with_proxy(self._pending_playable_url, self._current)
+        self.player.setSource(QUrl(wrapped))
+        self._source_loaded = True
+        return True
 
     def _on_position_changed(self, position: int) -> None:
         if not self.position_slider.isSliderDown():
@@ -409,13 +448,16 @@ class PreviewPanel(QWidget):
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self.play_button.setText("❚❚  Pause")
             self._show_video_view()
+            self.playback_activity_changed.emit(True)
         elif state == QMediaPlayer.PlaybackState.PausedState:
             self.play_button.setText("▶  Play")
+            self.playback_activity_changed.emit(False)
             # Keep the video frame visible while paused.
         else:
             # Stopped - back to thumbnail.
             self.play_button.setText("▶  Play")
             self._show_thumbnail_view()
+            self.playback_activity_changed.emit(False)
 
     def _on_media_status_changed(self, status) -> None:
         # When media is loading or buffering, switch to the video surface
