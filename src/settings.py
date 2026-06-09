@@ -21,6 +21,11 @@ PLAYBACK_BUFFER_MIN = 0
 PLAYBACK_BUFFER_MAX = 300
 PLAYBACK_BUFFER_DEFAULT = 60
 
+THEME_DARK = "dark"
+THEME_LIGHT = "light"
+VALID_THEMES = (THEME_DARK, THEME_LIGHT)
+THEME_DEFAULT = THEME_DARK
+
 
 def _config_dir() -> Path:
     if sys.platform == "darwin":
@@ -42,13 +47,15 @@ class AppSettings:
     """Plain-data container for everything we persist."""
 
     playback_buffer_seconds: int = PLAYBACK_BUFFER_DEFAULT
+    theme: str = THEME_DEFAULT
 
     def normalised(self) -> "AppSettings":
         clamped = max(
             PLAYBACK_BUFFER_MIN,
             min(PLAYBACK_BUFFER_MAX, int(self.playback_buffer_seconds)),
         )
-        return AppSettings(playback_buffer_seconds=clamped)
+        theme = self.theme if self.theme in VALID_THEMES else THEME_DEFAULT
+        return AppSettings(playback_buffer_seconds=clamped, theme=theme)
 
     @classmethod
     def load(cls) -> "AppSettings":

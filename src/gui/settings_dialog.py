@@ -16,10 +16,9 @@ from PyQt6.QtWidgets import (
 from ..settings import (
     PLAYBACK_BUFFER_MAX,
     PLAYBACK_BUFFER_MIN,
-    AppSettings,
     SettingsStore,
 )
-from .style import Tokens
+from .style import get_theme
 
 
 class SettingsDialog(QDialog):
@@ -33,6 +32,7 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(420)
 
         current = store.get()
+        theme = get_theme(current.theme)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 18, 20, 16)
@@ -44,7 +44,7 @@ class SettingsDialog(QDialog):
             "but uses more temporary disk space."
         )
         intro.setWordWrap(True)
-        intro.setStyleSheet(f"color: {Tokens.TEXT_MUTED};")
+        intro.setStyleSheet(f"color: {theme.text_muted};")
         root.addWidget(intro)
 
         form = QFormLayout()
@@ -72,7 +72,7 @@ class SettingsDialog(QDialog):
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(
-            f"color: {Tokens.TEXT_DIM}; font-size: 12px;"
+            f"color: {theme.text_dim}; font-size: 12px;"
         )
         root.addWidget(hint)
 
@@ -97,7 +97,7 @@ class SettingsDialog(QDialog):
         root.addWidget(buttons)
 
     def _on_accept(self) -> None:
-        self._store.update(
-            AppSettings(playback_buffer_seconds=self.buffer_spin.value())
-        )
+        settings = self._store.get()
+        settings.playback_buffer_seconds = self.buffer_spin.value()
+        self._store.update(settings)
         self.accept()

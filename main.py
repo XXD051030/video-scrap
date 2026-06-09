@@ -8,14 +8,12 @@ import sys
 from PyQt6.QtWidgets import QApplication
 
 from src.gui.main_window import MainWindow
-from src.gui.style import build_stylesheet
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Video Scraper")
     app.setStyle("Fusion")
-    app.setStyleSheet(build_stylesheet())
 
     window = MainWindow()
     atexit.register(_safe_stop_proxy, window)

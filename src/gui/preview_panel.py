@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 from ..media_proxy import MediaProxyServer
 from ..scraper import VideoItem
 from ..utils import format_duration
-from .style import Tokens
+from .style import DARK, Theme
 from .workers import ThumbnailWorker
 
 
@@ -97,12 +97,14 @@ class PreviewPanel(QWidget):
     def __init__(
         self,
         proxy: Optional[MediaProxyServer] = None,
+        theme: Optional[Theme] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._current: Optional[VideoItem] = None
         self._thumb_worker: Optional[ThumbnailWorker] = None
         self._proxy = proxy
+        self._accent = (theme or DARK).accent
         self._active_proxy_url: Optional[str] = None
         self._pending_playable_url: Optional[str] = None
         self._source_loaded = False
@@ -114,27 +116,19 @@ class PreviewPanel(QWidget):
         # Stack the thumbnail and the video widget so they share the same
         # screen real estate. Whichever one is on top is what the user sees.
         self.media_stack_host = QWidget()
+        self.media_stack_host.setObjectName("MediaStage")
         self.media_stack_host.setMinimumSize(360, 260)
         self.media_stack_host.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        self.media_stack_host.setStyleSheet(
-            f"background-color: {Tokens.MEDIA_BG};"
-            f" border-radius: {Tokens.RADIUS}px;"
-            f" border: 1px solid {Tokens.BORDER};"
         )
         self.media_stack = QStackedLayout(self.media_stack_host)
         self.media_stack.setStackingMode(QStackedLayout.StackingMode.StackOne)
         self.media_stack.setContentsMargins(0, 0, 0, 0)
 
         self.thumbnail_label = QLabel("◐  Select a video to preview")
+        self.thumbnail_label.setObjectName("ThumbHint")
         self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumbnail_label.setFrameShape(QFrame.Shape.NoFrame)
-        self.thumbnail_label.setStyleSheet(
-            f"color: {Tokens.TEXT_MUTED};"
-            " background-color: transparent;"
-            " font-size: 14px;"
-        )
         self.thumbnail_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -178,11 +172,7 @@ class PreviewPanel(QWidget):
         controls.addWidget(self.position_slider, stretch=1)
 
         self.time_label = QLabel("00:00 / 00:00")
-        self.time_label.setStyleSheet(
-            f"color: {Tokens.TEXT_MUTED};"
-            ' font-family: "SF Mono", Menlo, Consolas, monospace;'
-            " font-size: 12px;"
-        )
+        self.time_label.setObjectName("TimeLabel")
         controls.addWidget(self.time_label)
         layout.addLayout(controls)
 
@@ -203,11 +193,7 @@ class PreviewPanel(QWidget):
         info.addWidget(self.meta_label)
 
         self.url_label = QLabel("")
-        self.url_label.setStyleSheet(
-            f"color: {Tokens.ACCENT};"
-            ' font-family: "SF Mono", Menlo, Consolas, monospace;'
-            " font-size: 12px;"
-        )
+        self.url_label.setObjectName("UrlLink")
         self.url_label.setOpenExternalLinks(True)
         self.url_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
@@ -263,13 +249,7 @@ class PreviewPanel(QWidget):
             meta_parts.append("Source: yt-dlp extractor")
         self.meta_label.setText("  •  ".join(meta_parts))
 
-        host = urlparse(video.url).netloc or video.url
-        self.url_label.setText(
-            f'<a href="{video.url}" style="color: {Tokens.ACCENT};'
-            ' text-decoration: none;">'
-            f"{host}  ↗</a>"
-        )
-        self.url_label.setToolTip(video.url)
+        self._render_url_label(video)
 
         self.thumbnail_label.setText("Loading thumbnail...")
         self.thumbnail_label.setPixmap(QPixmap())
@@ -305,6 +285,22 @@ class PreviewPanel(QWidget):
     def shutdown(self) -> None:
         self.release_stream()
         self._stop_thumb_worker()
+
+    def apply_theme(self, theme: Theme) -> None:
+        """Re-tint the one piece of theme-dependent inline content (the URL
+        link colour); everything else repaints from the global stylesheet."""
+        self._accent = theme.accent
+        if self._current is not None:
+            self._render_url_label(self._current)
+
+    def _render_url_label(self, video: VideoItem) -> None:
+        host = urlparse(video.url).netloc or video.url
+        self.url_label.setText(
+            f'<a href="{video.url}" style="color: {self._accent};'
+            ' text-decoration: none;">'
+            f"{host}  ↗</a>"
+        )
+        self.url_label.setToolTip(video.url)
 
     def _wrap_with_proxy(self, playable_url: str, video: VideoItem) -> str:
         """Route URLs that need a Referer through the local proxy."""

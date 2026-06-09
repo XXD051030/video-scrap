@@ -8,6 +8,7 @@ from typing import List, Optional
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QKeySequence
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -35,7 +36,7 @@ from ..settings import SettingsStore
 from ..utils import format_bytes, is_valid_url
 from .preview_panel import PreviewPanel
 from .settings_dialog import SettingsDialog
-from .style import Tokens
+from .style import build_stylesheet, get_theme
 from .video_list import VideoListWidget
 from .workers import DownloadWorker, ScrapeWorker
 
@@ -96,6 +97,7 @@ class MainWindow(QMainWindow):
         ]
         self._download_rows: list[dict[str, object]] = []
         self.stop_downloads_action: Optional[QAction] = None
+        self.theme_action: Optional[QAction] = None
         self.js_scraper: Optional[JSPageScraper] = None
         self.interactive_dialog: Optional["InteractiveScrapeDialog"] = None
         self._current_url: str = ""
@@ -106,6 +108,8 @@ class MainWindow(QMainWindow):
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.settings_store = SettingsStore()
+        self._theme_name = self.settings_store.get().theme
+        self._theme = get_theme(self._theme_name)
         self.proxy_status.connect(self.log)
         self.media_proxy = MediaProxyServer(
             settings_store=self.settings_store,
@@ -114,6 +118,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_menu()
+        self._apply_theme(self._theme_name, persist=False)
 
     # ------------------------------------------------------------------ UI
 
@@ -126,7 +131,6 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self._build_url_card())
         root.addWidget(self._build_splitter(), stretch=1)
-        root.addWidget(self._build_download_card())
         root.addWidget(self._build_progress_row())
         root.addWidget(self._build_logs_section())
 
@@ -195,9 +199,12 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_card)
         right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(8)
-        self.preview_panel = PreviewPanel(proxy=self.media_proxy)
+        self.preview_panel = PreviewPanel(
+            proxy=self.media_proxy, theme=self._theme
+        )
         self.preview_panel.player_message.connect(self.log)
-        right_layout.addWidget(self.preview_panel)
+        right_layout.addWidget(self.preview_panel, stretch=1)
+        right_layout.addWidget(self._build_download_controls())
 
         splitter.addWidget(left_card)
         splitter.addWidget(right_card)
@@ -206,10 +213,10 @@ class MainWindow(QMainWindow):
         splitter.setSizes([480, 820])
         return splitter
 
-    def _build_download_card(self) -> QWidget:
-        card = _make_card()
-        layout = QHBoxLayout(card)
-        layout.setContentsMargins(14, 12, 14, 12)
+    def _build_download_controls(self) -> QWidget:
+        wrap = QWidget()
+        layout = QHBoxLayout(wrap)
+        layout.setContentsMargins(2, 6, 2, 0)
         layout.setSpacing(10)
 
         quality_label = QLabel("Quality")
@@ -224,9 +231,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.quality_combo)
 
         sep = QFrame()
+        sep.setObjectName("VSep")
         sep.setFrameShape(QFrame.Shape.NoFrame)
         sep.setFixedSize(1, 24)
-        sep.setStyleSheet(f"background-color: {Tokens.BORDER};")
         layout.addWidget(sep)
 
         save_label = QLabel("Save to")
@@ -253,7 +260,7 @@ class MainWindow(QMainWindow):
         self.download_button.setMinimumWidth(170)
         self.download_button.clicked.connect(self.start_download)
         layout.addWidget(self.download_button)
-        return card
+        return wrap
 
     def _build_progress_row(self) -> QWidget:
         wrap = QWidget()
@@ -402,6 +409,24 @@ class MainWindow(QMainWindow):
         about_action.setShortcut(QKeySequence.StandardKey.HelpContents)
         about_action.triggered.connect(self._show_about)
         toolbar.addAction(about_action)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        toolbar.addWidget(spacer)
+
+        self.theme_action = QAction("☀", self)
+        self.theme_action.triggered.connect(self._toggle_theme)
+        toolbar.addAction(self.theme_action)
+        theme_btn = toolbar.widgetForAction(self.theme_action)
+        if theme_btn is not None:
+            theme_btn.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextOnly
+            )
+            font = theme_btn.font()
+            font.setPointSize(font.pointSize() + 3)
+            theme_btn.setFont(font)
 
     # ------------------------------------------------------------- helpers
 
@@ -1028,6 +1053,37 @@ class MainWindow(QMainWindow):
     def _open_preferences(self) -> None:
         dialog = SettingsDialog(self.settings_store, self)
         dialog.exec()
+
+    # ------------------------------------------------------------- theming
+
+    def _apply_theme(self, name: str, persist: bool = True) -> None:
+        self._theme_name = name
+        self._theme = get_theme(name)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_stylesheet(self._theme))
+        self.preview_panel.apply_theme(self._theme)
+        self._update_theme_action_text()
+        if persist:
+            settings = self.settings_store.get()
+            settings.theme = name
+            self.settings_store.update(settings)
+
+    def _toggle_theme(self) -> None:
+        self._apply_theme(
+            "light" if self._theme_name == "dark" else "dark",
+            persist=True,
+        )
+
+    def _update_theme_action_text(self) -> None:
+        if self.theme_action is None:
+            return
+        if self._theme_name == "dark":
+            self.theme_action.setText("☀")
+            self.theme_action.setToolTip("Switch to light theme")
+        else:
+            self.theme_action.setText("☾")
+            self.theme_action.setToolTip("Switch to dark theme")
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
         self._closing = True
