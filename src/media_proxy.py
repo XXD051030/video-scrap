@@ -205,6 +205,12 @@ class _Entry:
         # absolute upstream URL, so refreshing a live / no-store manifest
         # doesn't leak a fresh _Entry (+ temp file) per segment each time.
         self.hls_child_by_upstream: Dict[str, "_Entry"] = {}
+        # Force manifest handling even when the URL extension / content-type
+        # doesn't look like one (e.g. a .jpg-disguised m3u8 + signed token).
+        self.force_manifest = False
+        # The media extension chosen for this entry's proxy URL, kept stable
+        # across manifest re-fetches so reused children don't revert to .bin.
+        self.proxy_ext = "bin"
 
     # ----- interval bookkeeping --------------------------------------------
 
@@ -774,6 +780,7 @@ class MediaProxyServer:
         referer: Optional[str] = None,
         extra_headers: Optional[Dict[str, str]] = None,
         parent: Optional[_Entry] = None,
+        is_hls: bool = False,
     ) -> str:
         if not upstream:
             raise ValueError("upstream URL required")
@@ -793,6 +800,7 @@ class MediaProxyServer:
             referer=referer,
             parent=parent,
         )
+        entry.force_manifest = is_hls
         with self._lock:
             self._entries[token] = entry
             self._token_by_entry[id(entry)] = token
@@ -814,6 +822,16 @@ class MediaProxyServer:
             prefetcher.start()
 
         ext = _derive_ext(upstream)
+        if ext == "bin":
+            # FFmpeg's HLS demuxer rejects segment/manifest URLs whose
+            # extension isn't on its allow-list, so a .jpg-disguised stream
+            # would download but never play. Give it a media extension.
+            if is_hls:
+                ext = "m3u8"
+            elif parent is not None:
+                # Unknown-extension child of a manifest -> treat as a segment.
+                ext = "ts"
+        entry.proxy_ext = ext
         return f"{self.base_url}/play/{token}.{ext}"
 
     def unregister(self, token_or_url: str) -> None:
@@ -911,6 +929,8 @@ class MediaProxyServer:
         parent.player_event.set()
 
     def _likely_manifest(self, entry: _Entry) -> bool:
+        if entry.force_manifest:
+            return True
         path = urlparse(entry.upstream).path.lower()
         return path.endswith(".m3u8") or path.endswith(".mpd")
 
@@ -941,12 +961,13 @@ class MediaProxyServer:
             content_type = (
                 upstream.headers.get("Content-Type") or ""
             ).lower().split(";")[0].strip()
-            if not self._looks_like_m3u8(entry.upstream, content_type):
-                # Not actually a manifest - hand back to the regular path.
-                return False
-
             final_url = upstream.url or entry.upstream
             text = upstream.text
+            if not self._looks_like_m3u8(entry.upstream, content_type) and not (
+                text.lstrip().startswith("#EXTM3U")
+            ):
+                # Not actually a manifest - hand back to the regular path.
+                return False
             rewritten, segment_entries, segment_durations = self._rewrite_m3u8(
                 text, final_url, entry
             )
@@ -1451,9 +1472,8 @@ class MediaProxyServer:
         if existing is not None and not existing.closed:
             existing_token = self._token_for(existing)
             if existing_token is not None:
-                ext = _derive_ext(absolute)
                 return (
-                    f"{self.base_url}/play/{existing_token}.{ext}",
+                    f"{self.base_url}/play/{existing_token}.{existing.proxy_ext}",
                     existing,
                 )
         local = self.register(

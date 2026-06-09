@@ -15,10 +15,12 @@ invoked from the GUI when these three stages return nothing useful.
 
 from __future__ import annotations
 
+import base64
 import html as html_module
+import json
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -174,6 +176,59 @@ def _extract_config_hls(html: str, page_url: str) -> List[str]:
         if url not in urls:
             urls.append(url)
     return urls
+
+
+# --- Encrypted Next.js player config (rou.video & clones) --------------------
+# These sites are Next.js apps that ship the real (signed, time-limited) HLS
+# URL *encrypted* inside ``__NEXT_DATA__.props.pageProps.ev`` and only decode
+# it client-side on a play click, so nothing playable is in the static HTML.
+# The player's cipher is trivial: base64-decode ``ev.d``, subtract ``ev.k``
+# from each byte, then JSON.parse -> {"videoUrl": ...}. The recovered URL is a
+# normal HLS manifest (often disguised with a .jpg extension).
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL
+)
+
+
+def _decrypt_next_ev(ev: Dict) -> Optional[Dict]:
+    """Mirror the player's decode: ``JSON.parse(atob(d) shifted down by k)``."""
+    d = ev.get("d")
+    k = ev.get("k")
+    if not isinstance(d, str) or not isinstance(k, int):
+        return None
+    try:
+        raw = base64.b64decode(d + "=" * (-len(d) % 4))
+        text = "".join(chr((b - k) % 256) for b in raw)
+        obj = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _extract_next_data_ev_hls(html: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Recover ``(video_url, title)`` from an encrypted Next.js ``ev`` blob."""
+    m = _NEXT_DATA_RE.search(html)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except Exception:  # noqa: BLE001
+        return None
+    page_props = (data.get("props") or {}).get("pageProps") or {}
+    ev = page_props.get("ev")
+    if not isinstance(ev, dict):
+        return None
+    decoded = _decrypt_next_ev(ev)
+    if not decoded:
+        return None
+    video_url = decoded.get("videoUrl") or decoded.get("url")
+    if not isinstance(video_url, str) or not video_url.lower().startswith(
+        ("http://", "https://")
+    ):
+        return None
+    video = page_props.get("video") or {}
+    title = video.get("nameZh") or video.get("name")
+    return video_url, (title if isinstance(title, str) else None)
 
 
 @dataclass
@@ -347,6 +402,23 @@ class VideoScraper:
                     f"Player-config extractor recovered {len(new_hls)} "
                     f"HLS stream(s)"
                 )
+
+        if html_text:
+            try:
+                ev_hls = _extract_next_data_ev_hls(html_text)
+            except Exception as exc:  # noqa: BLE001
+                log(f"Encrypted-config extractor failed: {exc}")
+                ev_hls = None
+            if ev_hls and ev_hls[0] not in seen_urls:
+                ev_url, ev_title = ev_hls
+                seen_urls.add(ev_url)
+                results.insert(
+                    0,
+                    self._item_from_hls(
+                        ev_url, url, ev_title or page_title, poster
+                    ),
+                )
+                log("Encrypted player-config extractor recovered the HLS stream")
 
         log(f"Found {len(results)} video(s).")
         return results

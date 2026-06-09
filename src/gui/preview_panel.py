@@ -307,7 +307,9 @@ class PreviewPanel(QWidget):
         if self._proxy is None or not video.referer:
             return playable_url
         try:
-            local = self._proxy.register(playable_url, referer=video.referer)
+            local = self._proxy.register(
+                playable_url, referer=video.referer, is_hls=video.is_hls
+            )
         except Exception:  # noqa: BLE001
             return playable_url
         self._active_proxy_url = local
