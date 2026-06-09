@@ -120,6 +120,62 @@ def _is_embed_iframe(url: str) -> bool:
     return any(k in path for k in EMBED_PATH_KEYWORDS)
 
 
+# --- Inline player-config HLS extraction -------------------------------------
+# A family of self-hosted "tube" CMSs (91AV and its mirror domains, etc.) hide
+# the real video behind a JSON player config rather than a plain <source>: an
+# ``online_video`` object carrying a ``hash_id`` and a *relative* ``m3u8_path``,
+# plus a ``lines`` array of CDN hosts. The page's <source> tags only hold short
+# ``preview.mp4`` hover-teasers. The playable manifest is assembled at runtime
+# as ``https://<cdn-host>/videos/<hash_id>/<manifest-file>``.
+_CONFIG_HASH_ID_RE = re.compile(r'"hash_id"\s*:\s*"([0-9a-fA-F]{16,})"')
+_CONFIG_M3U8_PATH_RE = re.compile(r'"m3u8_path"\s*:\s*"([^"]+?\.m3u8)"')
+_CONFIG_LINE_HOST_RE = re.compile(
+    r'\[\s*"line\d+"\s*,\s*"[^"]*"\s*,\s*"([A-Za-z0-9.\-]+\.[A-Za-z]{2,})"\s*\]'
+)
+_PREVIEW_HOST_RE = re.compile(
+    r'https?://([A-Za-z0-9.\-]+)/videos/[0-9a-fA-F]{16,}/', re.IGNORECASE
+)
+_PREVIEW_TEASER_RE = re.compile(
+    r'/preview\.(?:mp4|webm|m4v|mov)(?:\?|$)', re.IGNORECASE
+)
+
+
+def _is_preview_teaser(url: str) -> bool:
+    """True for ``.../preview.mp4`` style hover-teaser clips (not the real video)."""
+    return bool(_PREVIEW_TEASER_RE.search(url))
+
+
+def _extract_config_hls(html: str, page_url: str) -> List[str]:
+    """Recover HLS manifest URLs from an inline tube-CMS player config.
+
+    Returns absolute ``.../videos/<hash>/<file>.m3u8`` URLs (one per CDN host
+    advertised on the page), or an empty list when the pattern isn't present.
+    """
+    m_hash = _CONFIG_HASH_ID_RE.search(html)
+    m_path = _CONFIG_M3U8_PATH_RE.search(html)
+    if not m_hash or not m_path:
+        return []
+    hash_id = m_hash.group(1)
+    manifest_file = m_path.group(1).rsplit("/", 1)[-1] or "play.m3u8"
+
+    hosts: List[str] = []
+    for host in (
+        _CONFIG_LINE_HOST_RE.findall(html) + _PREVIEW_HOST_RE.findall(html)
+    ):
+        host = host.strip().strip("/")
+        if host and host not in hosts:
+            hosts.append(host)
+    if not hosts:
+        return []
+
+    urls: List[str] = []
+    for host in hosts:
+        url = f"https://{host}/videos/{hash_id}/{manifest_file}"
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
 @dataclass
 class VideoItem:
     """One scraped video entry shown to the user."""
@@ -268,8 +324,50 @@ class VideoScraper:
             if hidden_urls:
                 log(f"Decoder recovered {len(hidden_urls)} hidden URL(s)")
 
+        if html_text:
+            log("Trying inline player-config HLS extractor...")
+            try:
+                config_hls = _extract_config_hls(html_text, url)
+            except Exception as exc:  # noqa: BLE001
+                log(f"Config HLS extractor failed: {exc}")
+                config_hls = []
+            new_hls: List[VideoItem] = []
+            for link in config_hls:
+                if link in seen_urls:
+                    continue
+                seen_urls.add(link)
+                new_hls.append(
+                    self._item_from_hls(link, url, page_title, poster)
+                )
+            if new_hls:
+                # Real full-length streams go first so the UI selects one by
+                # default instead of a preview teaser.
+                results[:0] = new_hls
+                log(
+                    f"Player-config extractor recovered {len(new_hls)} "
+                    f"HLS stream(s)"
+                )
+
         log(f"Found {len(results)} video(s).")
         return results
+
+    def _item_from_hls(
+        self,
+        url: str,
+        source_url: str,
+        title: str,
+        poster: Optional[str],
+    ) -> VideoItem:
+        return VideoItem(
+            title=title,
+            url=url,
+            source_url=source_url,
+            thumbnail=poster,
+            ext="m3u8",
+            is_direct=True,
+            is_hls=True,
+            referer=source_url,
+        )
 
     def _scrape_with_ytdlp(
         self,
@@ -442,7 +540,7 @@ class VideoScraper:
             if not cand:
                 continue
             cand = html_module.unescape(cand).strip()
-            if _is_known_player_placeholder(cand):
+            if _is_known_player_placeholder(cand) or _is_preview_teaser(cand):
                 continue
             if cand and cand not in seen:
                 seen.add(cand)
