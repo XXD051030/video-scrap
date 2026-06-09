@@ -26,6 +26,7 @@ class VideoListWidget(QListWidget):
     selection_changed = pyqtSignal(object)
 
     THUMB_SIZE = QSize(176, 99)
+    THUMB_CONCURRENCY = 6
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -40,6 +41,9 @@ class VideoListWidget(QListWidget):
         )
         self._items: List[VideoItem] = []
         self._thumb_workers: List[ThumbnailWorker] = []
+        self._thumb_queue: List[tuple] = []
+        self._thumb_running: int = 0
+        self._thumb_gen: int = 0
         self.currentItemChanged.connect(self._on_current_item_changed)
 
     def set_videos(self, videos: List[VideoItem]) -> None:
@@ -59,12 +63,11 @@ class VideoListWidget(QListWidget):
             self.addItem(item)
 
             if video.thumbnail:
-                worker = ThumbnailWorker(
-                    index, video.thumbnail, referer=video.referer, parent=self
+                self._thumb_queue.append(
+                    (index, video.thumbnail, video.referer)
                 )
-                worker.ready.connect(self._apply_thumbnail)
-                worker.start()
-                self._thumb_workers.append(worker)
+
+        self._pump_thumbs()
 
         if self._items:
             self.setCurrentRow(0)
@@ -91,7 +94,35 @@ class VideoListWidget(QListWidget):
             line2_parts.append("direct link")
         return f"{video.title}\n{'  •  '.join(line2_parts)}"
 
-    def _apply_thumbnail(self, index: int, data: bytes) -> None:
+    def _pump_thumbs(self) -> None:
+        # Keep at most THUMB_CONCURRENCY thumbnail fetches in flight so a
+        # large playlist doesn't spawn hundreds of threads + sockets at once.
+        gen = self._thumb_gen
+        while (
+            self._thumb_queue
+            and self._thumb_running < self.THUMB_CONCURRENCY
+        ):
+            index, url, referer = self._thumb_queue.pop(0)
+            worker = ThumbnailWorker(index, url, referer=referer, parent=self)
+            worker.ready.connect(
+                lambda i, d, g=gen: self._apply_thumbnail(i, d, g)
+            )
+            worker.finished.connect(lambda g=gen: self._on_thumb_done(g))
+            self._thumb_workers.append(worker)
+            self._thumb_running += 1
+            worker.start()
+
+    def _on_thumb_done(self, gen: int) -> None:
+        # Ignore stragglers from a previous list (gen mismatch); otherwise a
+        # finished worker frees one slot and lets the next queued one start.
+        if gen != self._thumb_gen:
+            return
+        self._thumb_running = max(0, self._thumb_running - 1)
+        self._pump_thumbs()
+
+    def _apply_thumbnail(self, index: int, data: bytes, gen: int = -1) -> None:
+        if gen != -1 and gen != self._thumb_gen:
+            return
         if index < 0 or index >= self.count():
             return
         pixmap = QPixmap()
@@ -130,6 +161,11 @@ class VideoListWidget(QListWidget):
         self.selection_changed.emit(self.current_video())
 
     def _stop_workers(self) -> None:
+        # Invalidate in-flight / queued work for the previous list first so
+        # late ready/finished signals are ignored (generation guard).
+        self._thumb_gen += 1
+        self._thumb_queue = []
+        self._thumb_running = 0
         for worker in self._thumb_workers:
             if worker.isRunning():
                 worker.requestInterruption()

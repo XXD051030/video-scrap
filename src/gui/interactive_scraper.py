@@ -228,6 +228,12 @@ class InteractiveScrapeDialog(QDialog):
         except Exception as exc:  # noqa: BLE001
             self.log.emit(f"[interactive] interceptor install failed: {exc}")
 
+        # The "Use videos" / "Cancel" buttons call QDialog.done()/hide(),
+        # which does NOT fire closeEvent, so also detach on `finished` -
+        # otherwise the interceptor leaks onto the shared profile and keeps
+        # observing requests during later headless scrapes.
+        self.finished.connect(self._detach_interceptor)
+
         self._page.loadFinished.connect(self._on_load_finished)
         self._page.urlChanged.connect(self._on_url_changed)
         self._page.titleChanged.connect(self._on_title_changed)
@@ -292,11 +298,15 @@ class InteractiveScrapeDialog(QDialog):
         self.finished_with_results.emit(videos, iframes, self._page_title)
         self.accept()
 
-    def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+    def _detach_interceptor(self, *_args) -> None:
         # Detach our interceptor so the next dialog / headless fallback
         # starts from a clean slate. The profile itself (+ cookies) lives on.
+        # Safe to call more than once.
         try:
             self._profile.setUrlRequestInterceptor(None)  # type: ignore[arg-type]
         except Exception:  # noqa: BLE001
             pass
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        self._detach_interceptor()
         super().closeEvent(event)

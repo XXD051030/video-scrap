@@ -162,12 +162,16 @@ class VideoDownloader:
         self._partial_on_cancel = self._partial_on_cancel or keep_partial
         if self._parallel is not None:
             self._parallel.cancel()
-        if self._ffmpeg_proc is not None and self._ffmpeg_proc.poll() is None:
-            self._ffmpeg_proc.terminate()
+        proc = self._ffmpeg_proc
+        if proc is not None and proc.poll() is None:
+            # Snapshot into a local first: the download thread may null out
+            # self._ffmpeg_proc between the check and the call, which would
+            # otherwise raise AttributeError on None.
+            proc.terminate()
             try:
-                self._ffmpeg_proc.wait(timeout=3)
+                proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                self._ffmpeg_proc.kill()
+                proc.kill()
         if self._lane_limiter is not None:
             self._lane_limiter.wake()
 
@@ -478,15 +482,18 @@ class VideoDownloader:
         resp = requests.get(url, headers=headers, timeout=(10, 60), allow_redirects=True)
         resp.raise_for_status()
         text = resp.text
-        variant = self._pick_hls_variant(text, resp.url)
-        if variant is None:
-            return resp.url, text
+        final_url = resp.url
+        variant = self._pick_hls_variant(text, final_url)
         resp.close()
+        if variant is None:
+            return final_url, text
         child = requests.get(
             variant, headers=headers, timeout=(10, 60), allow_redirects=True
         )
         child.raise_for_status()
-        return child.url, child.text
+        child_url, child_text = child.url, child.text
+        child.close()
+        return child_url, child_text
 
     def _pick_hls_variant(self, text: str, manifest_url: str) -> Optional[str]:
         best_score = -1

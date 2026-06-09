@@ -37,14 +37,13 @@ from __future__ import annotations
 import os
 import re
 import secrets
-import socket
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -200,6 +199,10 @@ class _Entry:
         self.hls_index: Optional[int] = None
         # Highest segment index the player has requested so far.
         self.hls_player_segment_idx: int = 0
+        # Reuse child segment entries across manifest re-fetches, keyed by
+        # absolute upstream URL, so refreshing a live / no-store manifest
+        # doesn't leak a fresh _Entry (+ temp file) per segment each time.
+        self.hls_child_by_upstream: Dict[str, "_Entry"] = {}
 
     # ----- interval bookkeeping --------------------------------------------
 
@@ -315,6 +318,7 @@ class _Entry:
             return
         self.closed = True
         self.player_event.set()
+        self.hls_child_by_upstream.clear()
         with self._file_lock:
             try:
                 self._file.close()
@@ -685,12 +689,11 @@ class MediaProxyServer:
                 self.send_header("Allow", "GET, HEAD, OPTIONS")
                 self.end_headers()
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(("127.0.0.1", 0))
-        self._port = sock.getsockname()[1]
-        sock.close()
-
-        self._server = ThreadingHTTPServer(("127.0.0.1", self._port), _Handler)
+        # Bind to port 0 so the OS hands us a free port while the server
+        # keeps the socket - no bind/close/re-open window for another
+        # process to grab the port in between.
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._port = self._server.server_address[1]
         self._thread = threading.Thread(
             target=self._server.serve_forever,
             name="MediaProxyServer",
@@ -1242,6 +1245,10 @@ class MediaProxyServer:
             chunk_start = pos_in_body
             pos_in_body += len(chunk)
             chunk_end_excl = pos_in_body
+            # The 200 body is the whole file from offset 0, so mirror it
+            # into the cache as we stream; seeking back no longer forces a
+            # full re-download.
+            entry.write_at(chunk_start, chunk)
             if chunk_end_excl <= start:
                 continue
             if end_inclusive is not None and chunk_start > end_inclusive:
@@ -1422,6 +1429,20 @@ class MediaProxyServer:
         absolute = urljoin(base_url, url)
         if not absolute.lower().startswith(("http://", "https://")):
             return url, None
+        # Reuse an existing child for this upstream URL. Without this, every
+        # manifest re-fetch (live HLS, Cache-Control: no-store) registers a
+        # brand-new _Entry + temp file for each segment and never frees the
+        # previous batch.
+        with self._lock:
+            existing = manifest_entry.hls_child_by_upstream.get(absolute)
+        if existing is not None and not existing.closed:
+            existing_token = self._token_for(existing)
+            if existing_token is not None:
+                ext = _derive_ext(absolute)
+                return (
+                    f"{self.base_url}/play/{existing_token}.{ext}",
+                    existing,
+                )
         local = self.register(
             absolute,
             referer=manifest_entry.referer,
@@ -1431,12 +1452,6 @@ class MediaProxyServer:
         token = leaf.rsplit(".", 1)[0]
         with self._lock:
             child = self._entries.get(token)
+            if child is not None:
+                manifest_entry.hls_child_by_upstream[absolute] = child
         return local, child
-
-
-def normalize_upstream(url: str) -> str:
-    """Encode any non-ASCII path so requests doesn't reject it."""
-    parsed = urlparse(url)
-    if not parsed.scheme:
-        return url
-    return urlunparse(parsed)

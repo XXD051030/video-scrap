@@ -150,7 +150,14 @@ class ParallelDownloader:
                     for i, span in enumerate(segments)
                 ]
                 for fut in as_completed(futures):
-                    fut.result()
+                    try:
+                        fut.result()
+                    except Exception:
+                        # One segment failed: cancel so the sibling threads
+                        # stop streaming immediately instead of each finishing
+                        # its whole range before we surface the error.
+                        self._cancel.set()
+                        raise
         except Exception:
             try:
                 os.close(fd)

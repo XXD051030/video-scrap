@@ -133,8 +133,14 @@ class DownloadWorker(QThread):
                     if not self._cancelled or final_path.exists():
                         self.item_finished.emit(index, str(final_path))
                 except Exception as exc:  # noqa: BLE001
-                    if not self._cancelled or self._keep_partial:
+                    if not self._cancelled:
                         self.item_failed.emit(index, str(exc))
+                    elif self._keep_partial:
+                        self.item_failed.emit(index, str(exc))
+                    else:
+                        # Plain stop (no partial kept): surface it as a stop
+                        # so the row isn't later mislabeled "Complete".
+                        self.item_failed.emit(index, "Stopped")
         finally:
             self._downloader = None
             self.all_done.emit()
