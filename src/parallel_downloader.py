@@ -23,6 +23,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 
+from .net import build_session
+
 
 @dataclass
 class _SegmentProgress:
@@ -57,9 +59,16 @@ class ParallelDownloader:
         self.timeout = timeout
         self.lane_limiter = lane_limiter
         self._cancel = threading.Event()
+        self._session = build_session(pool=max(self.connections, 8))
 
     def cancel(self) -> None:
         self._cancel.set()
+
+    def close(self) -> None:
+        try:
+            self._session.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def download(
         self,
@@ -122,7 +131,7 @@ class ParallelDownloader:
                 if self.lane_limiter is not None:
                     self.lane_limiter.acquire(lambda: self._cancel.is_set())
                     acquired = True
-                with requests.get(
+                with self._session.get(
                     url,
                     headers=req_headers,
                     stream=True,
@@ -200,7 +209,7 @@ class ParallelDownloader:
         size = 0
         accept_ranges = False
         try:
-            resp = requests.head(
+            resp = self._session.head(
                 url, headers=headers, allow_redirects=True, timeout=self.timeout
             )
             if resp.ok:
@@ -215,7 +224,7 @@ class ParallelDownloader:
             try:
                 probe_headers = dict(headers)
                 probe_headers["Range"] = "bytes=0-1"
-                resp = requests.get(
+                resp = self._session.get(
                     url,
                     headers=probe_headers,
                     stream=True,

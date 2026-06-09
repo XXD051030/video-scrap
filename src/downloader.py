@@ -28,6 +28,7 @@ try:
 except Exception:  # noqa: BLE001
     _CryptoAES = None
 
+from .net import build_session
 from .parallel_downloader import ParallelDownloader
 from .scraper import VideoItem
 from .utils import safe_filename
@@ -156,6 +157,13 @@ class VideoDownloader:
         self._ffmpeg_proc: Optional[subprocess.Popen[str]] = None
         self._cancelled = False
         self._partial_on_cancel = False
+        self._session = build_session(pool=max(self.parallel_connections, 8))
+
+    def close(self) -> None:
+        try:
+            self._session.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def cancel(self, keep_partial: bool = False) -> None:
         self._cancelled = True
@@ -479,7 +487,7 @@ class VideoDownloader:
         url: str,
         headers: Dict[str, str],
     ) -> tuple[str, str]:
-        resp = requests.get(url, headers=headers, timeout=(10, 60), allow_redirects=True)
+        resp = self._session.get(url, headers=headers, timeout=(10, 60), allow_redirects=True)
         resp.raise_for_status()
         text = resp.text
         final_url = resp.url
@@ -487,7 +495,7 @@ class VideoDownloader:
         resp.close()
         if variant is None:
             return final_url, text
-        child = requests.get(
+        child = self._session.get(
             variant, headers=headers, timeout=(10, 60), allow_redirects=True
         )
         child.raise_for_status()
@@ -562,7 +570,7 @@ class VideoDownloader:
                     absolute_key = urljoin(manifest_url, key_uri)
                     key = key_cache.get(absolute_key)
                     if key is None:
-                        key_resp = requests.get(
+                        key_resp = self._session.get(
                             absolute_key,
                             headers=headers,
                             timeout=(10, 60),
@@ -599,7 +607,7 @@ class VideoDownloader:
                     self._lane_limiter.acquire(lambda: self._cancelled)
                     acquired = True
                 chunks: list[bytes] = []
-                with requests.get(
+                with self._session.get(
                     segment.url,
                     headers=headers,
                     stream=True,
@@ -808,6 +816,7 @@ class VideoDownloader:
                 progress=relay,
             )
         finally:
+            self._parallel.close()
             self._parallel = None
 
         if on_progress is not None:
@@ -944,7 +953,7 @@ class VideoDownloader:
 
     def _probe_hls_duration(self, item: VideoItem) -> Optional[float]:
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 item.url,
                 headers=build_request_headers(item.referer),
                 timeout=(10, 60),

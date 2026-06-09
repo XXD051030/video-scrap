@@ -18,7 +18,12 @@ from ..downloader import (
     VideoDownloader,
     build_request_headers,
 )
+from ..net import build_session
 from ..scraper import VideoItem, VideoScraper
+
+# One pooled session shared by all thumbnail fetches (only a few run at a
+# time) so repeated hits to the same image CDN reuse connections.
+_THUMB_SESSION = build_session(pool=6)
 
 
 class ScrapeWorker(QThread):
@@ -67,7 +72,7 @@ class ThumbnailWorker(QThread):
         try:
             headers = build_request_headers(self.referer)
             headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-            resp = requests.get(self.url, headers=headers, timeout=15)
+            resp = _THUMB_SESSION.get(self.url, headers=headers, timeout=15)
             resp.raise_for_status()
             self.ready.emit(self.index, resp.content)
         except Exception as exc:  # noqa: BLE001
@@ -142,5 +147,9 @@ class DownloadWorker(QThread):
                         # so the row isn't later mislabeled "Complete".
                         self.item_failed.emit(index, "Stopped")
         finally:
+            try:
+                downloader.close()
+            except Exception:  # noqa: BLE001
+                pass
             self._downloader = None
             self.all_done.emit()

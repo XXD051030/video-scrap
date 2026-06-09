@@ -47,6 +47,8 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
+from .net import build_session
+
 
 M3U8_CONTENT_TYPES = {
     "application/vnd.apple.mpegurl",
@@ -337,6 +339,7 @@ class _Prefetcher(threading.Thread):
         self,
         entry: _Entry,
         get_buffer_bytes: Callable[[], int],
+        session: requests.Session,
         on_status: Optional[Callable[[str], None]] = None,
     ) -> None:
         super().__init__(
@@ -345,6 +348,7 @@ class _Prefetcher(threading.Thread):
         )
         self.entry = entry
         self.get_buffer_bytes = get_buffer_bytes
+        self.session = session
         self.on_status = on_status
 
     def run(self) -> None:  # noqa: D401 (Thread API)
@@ -402,7 +406,7 @@ class _Prefetcher(threading.Thread):
         headers = dict(entry.headers)
         headers["Range"] = f"bytes={start}-{end_inclusive}"
         try:
-            resp = requests.get(
+            resp = self.session.get(
                 entry.upstream,
                 headers=headers,
                 stream=True,
@@ -483,6 +487,7 @@ class _HlsPrefetcher(threading.Thread):
         self,
         manifest_entry: _Entry,
         get_buffer_seconds: Callable[[], int],
+        session: requests.Session,
         on_status: Optional[Callable[[str], None]] = None,
     ) -> None:
         super().__init__(
@@ -491,6 +496,7 @@ class _HlsPrefetcher(threading.Thread):
         )
         self.entry = manifest_entry
         self.get_buffer_seconds = get_buffer_seconds
+        self.session = session
         self.on_status = on_status
         # Suppress repeated chatter for the same player position.
         self._last_announced_anchor: Optional[int] = None
@@ -577,7 +583,7 @@ class _HlsPrefetcher(threading.Thread):
         if segment.closed or segment.cached_run_end(0) > 0:
             return
         try:
-            resp = requests.get(
+            resp = self.session.get(
                 segment.upstream,
                 headers=segment.headers,
                 stream=True,
@@ -638,6 +644,7 @@ class MediaProxyServer:
         self._cache_dir: Path = Path(
             tempfile.mkdtemp(prefix="video_scraper_cache_")
         )
+        self._session = build_session(pool=32)
         self._settings_store = settings_store
         self._on_status = on_status
         self._buffer_seconds: int = DEFAULT_BUFFER_SECONDS
@@ -723,6 +730,10 @@ class MediaProxyServer:
             self._cache_dir.rmdir()
         except OSError:
             pass
+        try:
+            self._session.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------ settings
 
@@ -795,6 +806,7 @@ class MediaProxyServer:
             prefetcher = _Prefetcher(
                 entry,
                 get_buffer_bytes=self.buffer_bytes,
+                session=self._session,
                 on_status=self._on_status,
             )
             with self._lock:
@@ -909,7 +921,7 @@ class MediaProxyServer:
     ) -> bool:
         """Fetch + rewrite an HLS manifest. Returns False if not a manifest."""
         try:
-            upstream = requests.get(
+            upstream = self._session.get(
                 entry.upstream,
                 headers=entry.headers,
                 timeout=20,
@@ -977,6 +989,7 @@ class MediaProxyServer:
             worker = _HlsPrefetcher(
                 manifest_entry,
                 get_buffer_seconds=self.buffer_seconds,
+                session=self._session,
                 on_status=self._on_status,
             )
             self._hls_prefetchers[token] = worker
@@ -988,7 +1001,7 @@ class MediaProxyServer:
         self, request: BaseHTTPRequestHandler, entry: _Entry
     ) -> None:
         try:
-            resp = requests.request(
+            resp = self._session.request(
                 method="HEAD",
                 url=entry.upstream,
                 headers=entry.headers,
@@ -1174,7 +1187,7 @@ class MediaProxyServer:
 
         try:
             try:
-                resp = requests.get(
+                resp = self._session.get(
                     entry.upstream,
                     headers=headers,
                     stream=True,
@@ -1266,7 +1279,7 @@ class MediaProxyServer:
         headers = dict(entry.headers)
         headers["Range"] = "bytes=0-0"
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 entry.upstream,
                 headers=headers,
                 stream=True,
@@ -1303,7 +1316,7 @@ class MediaProxyServer:
         if range_header:
             headers["Range"] = range_header
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 entry.upstream,
                 headers=headers,
                 stream=True,
