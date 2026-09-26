@@ -41,6 +41,7 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
@@ -74,6 +75,14 @@ _EXTINF_RE = re.compile(r"#EXTINF:([0-9.]+)", re.IGNORECASE)
 _CONTENT_RANGE_RE = re.compile(
     r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE
 )
+_UNSAFE_EXTRA_HEADERS = {
+    "connection", "content-length", "cookie", "host", "proxy-authorization",
+    "range", "transfer-encoding",
+}
+_CROSS_HOST_MEDIA_HEADERS = {
+    "accept", "accept-encoding", "accept-language", "origin", "referer",
+    "user-agent",
+}
 
 # Estimated playback bitrate when we don't know the actual one. ~16 Mbps,
 # which comfortably covers most 1080p web video. This is only used to
@@ -156,11 +165,15 @@ class _Entry:
         cache_dir: Path,
         referer: Optional[str] = None,
         parent: Optional["_Entry"] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+        cookiejar: Optional[CookieJar] = None,
     ) -> None:
         self.upstream = upstream
         self.headers = headers
         self.referer = referer
         self.parent = parent
+        self.extra_headers = dict(extra_headers or {})
+        self.cookiejar = cookiejar
         self.children: List["_Entry"] = []
 
         fd, path = tempfile.mkstemp(
@@ -211,6 +224,12 @@ class _Entry:
         # The media extension chosen for this entry's proxy URL, kept stable
         # across manifest re-fetches so reused children don't revert to .bin.
         self.proxy_ext = "bin"
+
+    @property
+    def cookie_kwargs(self) -> dict:
+        # requests builds a fresh cookie header for the actual URL (and for
+        # each redirect), preserving CookieJar's domain/path/secure rules.
+        return {"cookies": self.cookiejar} if self.cookiejar is not None else {}
 
     # ----- interval bookkeeping --------------------------------------------
 
@@ -418,6 +437,7 @@ class _Prefetcher(threading.Thread):
                 stream=True,
                 timeout=20,
                 allow_redirects=True,
+                **entry.cookie_kwargs,
             )
         except Exception:  # noqa: BLE001
             return
@@ -595,6 +615,7 @@ class _HlsPrefetcher(threading.Thread):
                 stream=True,
                 timeout=(5, 10),
                 allow_redirects=True,
+                **segment.cookie_kwargs,
             )
         except Exception:  # noqa: BLE001
             return
@@ -781,6 +802,7 @@ class MediaProxyServer:
         extra_headers: Optional[Dict[str, str]] = None,
         parent: Optional[_Entry] = None,
         is_hls: bool = False,
+        cookiejar: Optional[CookieJar] = None,
     ) -> str:
         if not upstream:
             raise ValueError("upstream URL required")
@@ -790,8 +812,15 @@ class MediaProxyServer:
         headers = build_request_headers(referer)
         # Player streams care more about media types than HTML.
         headers["Accept"] = "*/*"
-        if extra_headers:
-            headers.update(extra_headers)
+        # A literal Cookie header ignores domain scoping. Host / Range and
+        # transport headers must also be controlled by requests and by the
+        # byte-range cache rather than by extractor-provided metadata.
+        safe_extra_headers = {
+            key: value
+            for key, value in (extra_headers or {}).items()
+            if isinstance(key, str) and key.lower() not in _UNSAFE_EXTRA_HEADERS
+        }
+        headers.update(safe_extra_headers)
 
         entry = _Entry(
             upstream=upstream,
@@ -799,6 +828,8 @@ class MediaProxyServer:
             cache_dir=self._cache_dir,
             referer=referer,
             parent=parent,
+            extra_headers=safe_extra_headers,
+            cookiejar=cookiejar,
         )
         entry.force_manifest = is_hls
         with self._lock:
@@ -946,6 +977,7 @@ class MediaProxyServer:
                 headers=entry.headers,
                 timeout=20,
                 allow_redirects=True,
+                **entry.cookie_kwargs,
             )
         except Exception as exc:  # noqa: BLE001
             request.send_response(502)
@@ -1028,6 +1060,7 @@ class MediaProxyServer:
                 headers=entry.headers,
                 timeout=15,
                 allow_redirects=True,
+                **entry.cookie_kwargs,
             )
         except Exception as exc:  # noqa: BLE001
             request.send_response(502)
@@ -1214,6 +1247,7 @@ class MediaProxyServer:
                     stream=True,
                     timeout=30,
                     allow_redirects=True,
+                    **entry.cookie_kwargs,
                 )
             except Exception:  # noqa: BLE001
                 return
@@ -1306,6 +1340,7 @@ class MediaProxyServer:
                 stream=True,
                 timeout=15,
                 allow_redirects=True,
+                **entry.cookie_kwargs,
             )
         except Exception:  # noqa: BLE001
             return
@@ -1343,6 +1378,7 @@ class MediaProxyServer:
                 stream=True,
                 timeout=30,
                 allow_redirects=True,
+                **entry.cookie_kwargs,
             )
         except Exception as exc:  # noqa: BLE001
             request.send_response(502)
@@ -1476,10 +1512,24 @@ class MediaProxyServer:
                     f"{self.base_url}/play/{existing_token}.{existing.proxy_ext}",
                     existing,
                 )
+        same_host = (
+            urlparse(absolute).hostname == urlparse(manifest_entry.upstream).hostname
+        )
+        child_headers = (
+            manifest_entry.extra_headers
+            if same_host
+            else {
+                key: value
+                for key, value in manifest_entry.extra_headers.items()
+                if key.lower() in _CROSS_HOST_MEDIA_HEADERS
+            }
+        )
         local = self.register(
             absolute,
             referer=manifest_entry.referer,
+            extra_headers=child_headers,
             parent=manifest_entry,
+            cookiejar=manifest_entry.cookiejar,
         )
         leaf = local.rsplit("/", 1)[-1]
         token = leaf.rsplit(".", 1)[0]

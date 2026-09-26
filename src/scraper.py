@@ -16,12 +16,14 @@ invoked from the GUI when these three stages return nothing useful.
 from __future__ import annotations
 
 import base64
+import copy
 import html as html_module
 import json
 import re
 from dataclasses import dataclass, field
+from http.cookiejar import CookieJar
 from typing import Callable, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 import yt_dlp
@@ -31,6 +33,72 @@ from .js_decoder import decode_obfuscated_urls
 
 
 HLS_EXTS = {"m3u8", "mpd"}
+
+_X_POST_HOSTS = {
+    "x.com",
+    "www.x.com",
+    "m.x.com",
+    "mobile.x.com",
+    "twitter.com",
+    "www.twitter.com",
+    "m.twitter.com",
+    "mobile.twitter.com",
+}
+_X_POST_PATH = re.compile(
+    r"^/(?:[^/]+/status|i/web/status|statuses)/\d+(?:/(?:video|photo)/\d+)?/?$"
+)
+_X_COOKIE_DOMAINS = ("x.com", "twitter.com", "twimg.com")
+
+
+def is_x_post_url(url: str) -> bool:
+    """Recognize actual X/Twitter post URLs, never lookalike domains."""
+    try:
+        parsed = urlparse(url.strip())
+        return (
+            parsed.scheme.lower() in {"http", "https"}
+            and parsed.hostname is not None
+            and parsed.hostname.lower() in _X_POST_HOSTS
+            and not parsed.username
+            and not parsed.password
+            and bool(_X_POST_PATH.fullmatch(parsed.path))
+        )
+    except ValueError:
+        return False
+
+
+def _x_cookiejar_from(jar: CookieJar) -> CookieJar:
+    """Retain only X media-site cookies; never attach the whole browser jar."""
+    filtered = CookieJar()
+    for cookie in jar:
+        domain = cookie.domain.lstrip(".").lower()
+        if any(
+            domain == allowed or domain.endswith(f".{allowed}")
+            for allowed in _X_COOKIE_DOMAINS
+        ):
+            filtered.set_cookie(copy.copy(cookie))
+    return filtered
+
+
+def _has_video_format(entry: Dict) -> bool:
+    """Reject photos, audio-only entries, and unresolved embed pages."""
+    for fmt in entry.get("formats") or []:
+        if not isinstance(fmt, dict) or not fmt.get("url"):
+            continue
+        if (fmt.get("vcodec") or "").lower() == "none":
+            continue
+        if (fmt.get("ext") or "").lower() in {
+            "m4a", "mp3", "aac", "opus", "ogg", "flac", "wav"
+        }:
+            continue
+        return True
+    return False
+
+
+def _x_full_post_url(url: str) -> str:
+    """A /video/N share link must still expose the full post playlist."""
+    parsed = urlparse(url)
+    path = re.sub(r"/(?:video|photo)/\d+/?$", "", parsed.path)
+    return urlunparse(parsed._replace(path=path))
 
 
 def _is_hls(url: str, ext: Optional[str] = None) -> bool:
@@ -249,6 +317,9 @@ class VideoItem:
     formats: List[Dict] = field(default_factory=list)
     raw: Optional[Dict] = None
     referer: Optional[str] = None
+    x_playlist_index: Optional[int] = None
+    x_auth_browser: Optional[str] = None
+    x_cookiejar: Optional[CookieJar] = field(default=None, repr=False)
 
     @property
     def resolution(self) -> str:
@@ -270,9 +341,13 @@ class VideoScraper:
         self,
         url: str,
         progress: Optional[ProgressCallback] = None,
+        x_auth_browser: Optional[str] = None,
     ) -> List[VideoItem]:
         url = url.strip()
         log = progress or (lambda _msg: None)
+
+        if is_x_post_url(url):
+            return self._scrape_x_with_ytdlp(url, log, x_auth_browser)
 
         results: List[VideoItem] = []
         seen_urls: set[str] = set()
@@ -422,6 +497,110 @@ class VideoScraper:
 
         log(f"Found {len(results)} video(s).")
         return results
+
+    def _scrape_x_with_ytdlp(
+        self,
+        url: str,
+        log: ProgressCallback,
+        x_auth_browser: Optional[str],
+    ) -> List[VideoItem]:
+        """Extract each X post video once, keeping its playlist identity."""
+        class _SilentLogger:
+            def debug(self, _msg: str) -> None: ...
+            def info(self, _msg: str) -> None: ...
+            def warning(self, _msg: str) -> None: ...
+            def error(self, _msg: str) -> None: ...
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": False,
+            "noplaylist": False,
+            "ignoreerrors": False,
+            "logger": _SilentLogger(),
+        }
+        if x_auth_browser:
+            ydl_opts["cookiesfrombrowser"] = (x_auth_browser,)
+
+        log("Reading X post videos with yt-dlp...")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(_x_full_post_url(url), download=False)
+                cookies = (
+                    _x_cookiejar_from(ydl.cookiejar) if x_auth_browser else None
+                )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"X video extraction failed: {exc}") from exc
+
+        if not isinstance(info, dict):
+            raise RuntimeError("No video information was returned for this X post")
+
+        if info.get("_type") == "playlist":
+            entries = info.get("entries") or []
+        else:
+            entries = [info]
+
+        items: List[VideoItem] = []
+        seen_media: set[str] = set()
+        used_titles: set[str] = set()
+        for index, entry in enumerate(entries, 1):
+            if not isinstance(entry, dict) or not _has_video_format(entry):
+                continue
+            entry_index = entry.get("playlist_index")
+            if not isinstance(entry_index, int) or entry_index < 1:
+                entry_index = index
+            # TwitterIE uses the media entity id for each playlist entry.
+            # A duplicate card or variant of that entity must not add another
+            # row, while a distinct entity keeps its original playlist index.
+            media_id = entry.get("id")
+            if not media_id or str(media_id) == str(info.get("id")):
+                media_id = entry.get("thumbnail") or next(
+                    (fmt.get("url") for fmt in entry.get("formats") or []
+                     if isinstance(fmt, dict) and fmt.get("url")),
+                    f"entry:{entry_index}",
+                )
+            media_key = str(media_id)
+            if media_key in seen_media:
+                continue
+            seen_media.add(media_key)
+
+            base_title = str(entry.get("title") or info.get("title") or "X video")
+            title = base_title
+            suffix = entry_index
+            while title in used_titles:
+                title = f"{base_title} #{suffix}"
+                suffix += 1
+            used_titles.add(title)
+
+            items.append(
+                VideoItem(
+                    title=title,
+                    url=url,
+                    source_url=url,
+                    thumbnail=entry.get("thumbnail"),
+                    duration=entry.get("duration"),
+                    width=entry.get("width"),
+                    height=entry.get("height"),
+                    ext=entry.get("ext"),
+                    uploader=entry.get("uploader") or entry.get("channel"),
+                    is_direct=False,
+                    formats=entry.get("formats") or [],
+                    raw=entry,
+                    referer=url,
+                    x_playlist_index=entry_index,
+                    x_auth_browser=x_auth_browser,
+                    x_cookiejar=cookies,
+                )
+            )
+
+        if not items:
+            raise RuntimeError(
+                "No playable video found in this X post; it may require "
+                "login, or the post may have no video"
+            )
+        log(f"Found {len(items)} X video(s).")
+        return items
 
     def _item_from_hls(
         self,

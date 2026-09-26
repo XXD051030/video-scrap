@@ -64,7 +64,7 @@ class VideoListWidget(QListWidget):
 
             if video.thumbnail:
                 self._thumb_queue.append(
-                    (index, video.thumbnail, video.referer)
+                    (index, video.thumbnail, video.referer, video.x_cookiejar)
                 )
 
         self._pump_thumbs()
@@ -102,8 +102,10 @@ class VideoListWidget(QListWidget):
             self._thumb_queue
             and self._thumb_running < self.THUMB_CONCURRENCY
         ):
-            index, url, referer = self._thumb_queue.pop(0)
-            worker = ThumbnailWorker(index, url, referer=referer, parent=self)
+            index, url, referer, cookies = self._thumb_queue.pop(0)
+            worker = ThumbnailWorker(
+                index, url, referer=referer, parent=self, cookies=cookies
+            )
             worker.ready.connect(
                 lambda i, d, g=gen: self._apply_thumbnail(i, d, g)
             )

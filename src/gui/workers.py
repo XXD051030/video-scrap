@@ -6,6 +6,7 @@ network I/O.
 
 from __future__ import annotations
 
+from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import List, Optional
 
@@ -33,14 +34,24 @@ class ScrapeWorker(QThread):
     finished_with_results = pyqtSignal(list)
     failed = pyqtSignal(str)
 
-    def __init__(self, url: str, parent: Optional[QObject] = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        parent: Optional[QObject] = None,
+        x_auth_browser: Optional[str] = None,
+    ) -> None:
         super().__init__(parent)
         self.url = url
+        self.x_auth_browser = x_auth_browser
 
     def run(self) -> None:
         scraper = VideoScraper()
         try:
-            results = scraper.scrape(self.url, progress=self.log.emit)
+            results = scraper.scrape(
+                self.url,
+                progress=self.log.emit,
+                x_auth_browser=self.x_auth_browser,
+            )
             self.finished_with_results.emit(results)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
@@ -62,17 +73,24 @@ class ThumbnailWorker(QThread):
         url: str,
         referer: Optional[str] = None,
         parent: Optional[QObject] = None,
+        cookies: Optional[CookieJar] = None,
     ) -> None:
         super().__init__(parent)
         self.index = index
         self.url = url
         self.referer = referer
+        self.cookies = cookies
 
     def run(self) -> None:
         try:
             headers = build_request_headers(self.referer)
             headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-            resp = _THUMB_SESSION.get(self.url, headers=headers, timeout=15)
+            resp = _THUMB_SESSION.get(
+                self.url,
+                headers=headers,
+                cookies=self.cookies,
+                timeout=15,
+            )
             resp.raise_for_status()
             self.ready.emit(self.index, resp.content)
         except Exception as exc:  # noqa: BLE001

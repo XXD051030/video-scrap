@@ -30,7 +30,7 @@ except Exception:  # noqa: BLE001
 
 from .net import build_session
 from .parallel_downloader import ParallelDownloader
-from .scraper import VideoItem
+from .scraper import VideoItem, is_x_post_url
 from .utils import safe_filename
 
 
@@ -65,6 +65,21 @@ def build_request_headers(referer: Optional[str]) -> Dict[str, str]:
         if parsed.scheme and parsed.netloc:
             headers["Origin"] = f"{parsed.scheme}://{parsed.netloc}"
     return headers
+
+
+def _x_download_url(url: str) -> str:
+    """Use the post URL so playlist selection is not bypassed by /video/N."""
+    parsed = urlparse(url)
+    path = re.sub(r"/(?:video|photo)/\d+/?$", "", parsed.path).rstrip("/")
+    return parsed._replace(path=path, query="", fragment="").geturl()
+
+
+def _x_output_stem(item: VideoItem, playlist_index: int) -> str:
+    """Keep different videos in one post (and posts with equal titles) separate."""
+    post_id = re.search(r"/(?:status|statuses)/(\d+)", urlparse(item.url).path)
+    if post_id is None:
+        raise ValueError("Invalid X post URL")
+    return f"{safe_filename(item.title, max_len=80)}_x_{post_id.group(1)}_video_{playlist_index}"
 
 
 @dataclass
@@ -227,10 +242,24 @@ class VideoDownloader:
             return self._download_direct(item, on_progress)
 
         fmt = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"])
-        title = safe_filename(item.title)
+        is_x_item = is_x_post_url(item.url)
+        x_index = item.x_playlist_index if is_x_item else None
+        if x_index is not None and x_index < 1:
+            raise ValueError("X video index must be positive")
+        title = (
+            _x_output_stem(item, x_index)
+            if x_index is not None
+            else safe_filename(item.title)
+        )
         outtmpl = str(self.output_dir / f"{title}.%(ext)s")
 
         last_path: Dict[str, Optional[str]] = {"path": None}
+        final_path: Dict[str, Optional[str]] = {"path": None}
+
+        def post_hook(filename: str) -> None:
+            # yt-dlp calls this after merging and moving the finished file.
+            # The progress hook can still point to a temporary format file.
+            final_path["path"] = filename
 
         def hook(data: Dict) -> None:
             status = data.get("status", "")
@@ -283,8 +312,22 @@ class VideoDownloader:
             "http_headers": http_headers,
         }
 
+        if is_x_item:
+            ydl_opts["post_hooks"] = [post_hook]
+            ydl_opts["overwrites"] = False
+            if item.x_auth_browser:
+                ydl_opts["cookiesfrombrowser"] = (item.x_auth_browser,)
+            if x_index is not None:
+                ydl_opts["playlist_items"] = str(x_index)
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([item.url])
+            result = ydl.download([_x_download_url(item.url) if is_x_item else item.url])
+
+        if is_x_item:
+            completed = final_path["path"]
+            if result or not completed or not Path(completed).is_file():
+                raise RuntimeError("Selected X video did not produce a finished file")
+            last_path["path"] = completed
 
         if on_progress:
             on_progress(

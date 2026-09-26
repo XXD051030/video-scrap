@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 
 from ..downloader import DownloadLaneLimiter, QUALITY_FORMATS, DownloadProgress
 from ..media_proxy import MediaProxyServer
-from ..scraper import VideoItem, build_items_from_urls
+from ..scraper import VideoItem, build_items_from_urls, is_x_post_url
 from ..settings import SettingsStore
 from ..utils import format_bytes, is_valid_url
 from .preview_panel import PreviewPanel
@@ -101,6 +101,7 @@ class MainWindow(QMainWindow):
         self.js_scraper: Optional[JSPageScraper] = None
         self.interactive_dialog: Optional["InteractiveScrapeDialog"] = None
         self._current_url: str = ""
+        self._current_x_auth_browser: Optional[str] = None
         self._logs_expanded: bool = False
         self._download_failed_count: int = 0
         self._closing: bool = False
@@ -155,7 +156,28 @@ class MainWindow(QMainWindow):
         )
         self.url_input.setClearButtonEnabled(True)
         self.url_input.returnPressed.connect(self.start_scrape)
+        self.url_input.textChanged.connect(self._update_x_auth_visibility)
         layout.addWidget(self.url_input, stretch=1)
+
+        self.x_auth_label = QLabel("X session")
+        self.x_auth_combo = QComboBox()
+        self.x_auth_combo.addItem("Public", None)
+        for label, browser in (
+            ("Chrome", "chrome"),
+            ("Safari", "safari"),
+            ("Firefox", "firefox"),
+            ("Edge", "edge"),
+            ("Brave", "brave"),
+        ):
+            self.x_auth_combo.addItem(label, browser)
+        self.x_auth_combo.setToolTip(
+            "Choose a browser already signed in to X when this post requires login. "
+            "The app does not save your X password."
+        )
+        self.x_auth_label.hide()
+        self.x_auth_combo.hide()
+        layout.addWidget(self.x_auth_label)
+        layout.addWidget(self.x_auth_combo)
 
         self.scrape_button = QPushButton("Scrape")
         self.scrape_button.setObjectName("Primary")
@@ -164,6 +186,11 @@ class MainWindow(QMainWindow):
         self.scrape_button.clicked.connect(self.start_scrape)
         layout.addWidget(self.scrape_button)
         return card
+
+    def _update_x_auth_visibility(self, text: str) -> None:
+        is_x = is_x_post_url(text.strip())
+        self.x_auth_label.setVisible(is_x)
+        self.x_auth_combo.setVisible(is_x)
 
     def _build_splitter(self) -> QWidget:
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -482,7 +509,13 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat("Scraping...")
         self._current_url = url
 
-        self.scrape_worker = ScrapeWorker(url, self)
+        x_auth_browser = (
+            self.x_auth_combo.currentData() if is_x_post_url(url) else None
+        )
+        self._current_x_auth_browser = x_auth_browser
+        self.scrape_worker = ScrapeWorker(
+            url, self, x_auth_browser=x_auth_browser
+        )
         self.scrape_worker.log.connect(self.log)
         self.scrape_worker.finished_with_results.connect(self._on_scrape_done)
         self.scrape_worker.failed.connect(self._on_scrape_failed)
@@ -501,6 +534,23 @@ class MainWindow(QMainWindow):
             self.progress_bar.setFormat(f"Found {len(videos)} video(s)")
             self.statusBar().showMessage(f"Found {len(videos)} video(s)")
             self._reset_scrape_button()
+            return
+
+        if is_x_post_url(self._current_url):
+            self._reset_scrape_button()
+            self.progress_bar.setFormat("No X videos found")
+            self.statusBar().showMessage("No X videos found")
+            suggestion = (
+                " If it plays in a browser where you are signed in, choose "
+                "that browser in X session and scrape again."
+                if self._current_x_auth_browser is None
+                else " Check that the selected browser is signed in to X."
+            )
+            QMessageBox.information(
+                self,
+                "No X videos",
+                "No accessible video was found in this X post." + suggestion,
+            )
             return
 
         if WEBENGINE_AVAILABLE and self._current_url:
@@ -663,6 +713,19 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Scrape failed")
         self.statusBar().showMessage("Scrape failed")
+        if is_x_post_url(self._current_url):
+            self.log(f"X extraction failed: {message}")
+            QMessageBox.warning(
+                self,
+                "X video extraction failed",
+                message + (
+                    "\n\nIf this post plays in a browser where you are signed "
+                    "in, select that browser in X session and try again."
+                    if self._current_x_auth_browser is None
+                    else ""
+                ),
+            )
+            return
         QMessageBox.critical(self, "Scrape failed", message)
 
     def _on_video_selected(self, video: Optional[VideoItem]) -> None:

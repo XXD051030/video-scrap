@@ -10,6 +10,8 @@ TikTok, Vimeo, Instagram, etc.).
 ## Features
 
 - Paste any URL and discover all videos on that page.
+- X / Twitter post links show one row per video, with in-app playback and
+  download of the selected video.
 - Four-stage extraction:
   1. **yt-dlp** for 1000+ supported sites,
   2. **HTML scan** for `<video>` / `<source>` / og:video / direct links,
@@ -68,6 +70,15 @@ python main.py
 4. (Optional) Change quality and choose a download folder.
 5. Click **Download current**.
 
+For an X / Twitter post, paste its `x.com` or `twitter.com` status link.
+If X requires a login, first sign in to X in a supported browser, then
+choose that browser from **X session** beside the URL and scrape again.
+The app reads the browser session only when you select it; it does not
+ask for or save your X password, and does not export cookies to a file.
+Private or restricted posts are available only if your account can view
+them. Select the video you want from the list when a post has multiple
+videos, and use **Play** to preview it before downloading.
+
 Files are saved to `./downloads` by default.
 
 ## Project layout
@@ -99,6 +110,6 @@ video scrap/
 - Inline preview works best on direct media URLs (e.g. `.mp4`, `.webm`).
   For some yt-dlp sources the streamable URL may not be playable
   directly in Qt's media backend; the download itself still works fine.
-- Some pages require login or geo-unblocking. yt-dlp supports cookies
-  and proxies via its config file (`~/.config/yt-dlp/config`) if you
-  need that.
+- Some pages require login or are unavailable from a particular region.
+  For X posts, use the **X session** browser selector when your account
+  can view the post. Other sites may need the interactive browser mode.

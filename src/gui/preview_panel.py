@@ -107,6 +107,8 @@ class PreviewPanel(QWidget):
         self._accent = (theme or DARK).accent
         self._active_proxy_url: Optional[str] = None
         self._pending_playable_url: Optional[str] = None
+        self._pending_playable_headers: dict[str, str] = {}
+        self._pending_is_hls = False
         self._source_loaded = False
 
         layout = QVBoxLayout(self)
@@ -218,6 +220,8 @@ class PreviewPanel(QWidget):
         self._stop_thumb_worker()
         self._current = video
         self._pending_playable_url = None
+        self._pending_playable_headers = {}
+        self._pending_is_hls = False
         self._source_loaded = False
         self._show_thumbnail_view()
 
@@ -256,7 +260,11 @@ class PreviewPanel(QWidget):
 
         if video.thumbnail:
             self._thumb_worker = ThumbnailWorker(
-                0, video.thumbnail, referer=video.referer, parent=self
+                0,
+                video.thumbnail,
+                referer=video.referer,
+                cookies=getattr(video, "x_cookiejar", None),
+                parent=self,
             )
             self._thumb_worker.ready.connect(self._apply_thumbnail)
             self._thumb_worker.failed.connect(self._on_thumb_failed)
@@ -264,7 +272,19 @@ class PreviewPanel(QWidget):
         else:
             self.thumbnail_label.setText("(No thumbnail available)")
 
-        playable_url = self._best_playable_url(video)
+        if self._is_x_video(video):
+            selected = self._best_x_preview_format(video)
+            playable_url = selected.get("url") if selected else None
+            if selected:
+                raw_headers = (video.raw or {}).get("http_headers") or {}
+                format_headers = selected.get("http_headers") or {}
+                if isinstance(raw_headers, dict):
+                    self._pending_playable_headers.update(raw_headers)
+                if isinstance(format_headers, dict):
+                    self._pending_playable_headers.update(format_headers)
+                self._pending_is_hls = self._is_hls_format(selected)
+        else:
+            playable_url = self._best_playable_url(video)
         if playable_url:
             self._pending_playable_url = playable_url
             self._set_controls_enabled(True)
@@ -302,15 +322,80 @@ class PreviewPanel(QWidget):
         )
         self.url_label.setToolTip(video.url)
 
-    def _wrap_with_proxy(self, playable_url: str, video: VideoItem) -> str:
+    @staticmethod
+    def _is_x_video(video: VideoItem) -> bool:
+        host = (urlparse(video.source_url).hostname or "").lower()
+        return host in {"x.com", "twitter.com"} or host.endswith(
+            (".x.com", ".twitter.com")
+        )
+
+    @staticmethod
+    def _is_hls_format(fmt: dict) -> bool:
+        protocol = str(fmt.get("protocol") or "").lower()
+        ext = str(fmt.get("ext") or "").lower()
+        path = urlparse(str(fmt.get("url") or "")).path.lower()
+        return "m3u8" in protocol or ext == "m3u8" or path.endswith(".m3u8")
+
+    @classmethod
+    def _best_x_preview_format(cls, video: VideoItem) -> Optional[dict]:
+        """Prefer a combined MP4; use HLS if X exposes no suitable MP4."""
+        options = []
+        for fmt in video.formats or []:
+            url = fmt.get("url")
+            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+                continue
+            vcodec = str(fmt.get("vcodec") or "").lower()
+            acodec = str(fmt.get("acodec") or "").lower()
+            if vcodec == "none":
+                continue
+            is_hls = cls._is_hls_format(fmt)
+            ext = str(fmt.get("ext") or "").lower()
+            is_mp4 = ext == "mp4" or urlparse(url).path.lower().endswith(".mp4")
+            if not is_hls and not is_mp4:
+                continue
+            # Explicit audio is preferable to an unknown codec; a silent
+            # MP4 remains usable when X supplies no format with audio.
+            audio = 2 if acodec and acodec != "none" else (1 if not acodec else 0)
+            if not is_hls and audio > 0:
+                category = 3
+            elif is_hls:
+                category = 2
+            else:
+                category = 1
+            try:
+                height = int(fmt.get("height") or 0)
+            except (TypeError, ValueError):
+                height = 0
+            options.append(((category, audio, height), fmt))
+        return max(options, key=lambda option: option[0])[1] if options else None
+
+    def _wrap_with_proxy(self, playable_url: str, video: VideoItem) -> Optional[str]:
         """Route URLs that need a Referer through the local proxy."""
-        if self._proxy is None or not video.referer:
+        is_x_video = self._is_x_video(video)
+        if self._proxy is None:
+            if is_x_video:
+                self.player_message.emit("X preview unavailable: media proxy is not running.")
+                return None
+            return playable_url
+        if not is_x_video and not video.referer:
             return playable_url
         try:
-            local = self._proxy.register(
-                playable_url, referer=video.referer, is_hls=video.is_hls
-            )
-        except Exception:  # noqa: BLE001
+            if is_x_video:
+                local = self._proxy.register(
+                    playable_url,
+                    referer=video.referer,
+                    extra_headers=self._pending_playable_headers,
+                    cookiejar=getattr(video, "x_cookiejar", None),
+                    is_hls=self._pending_is_hls,
+                )
+            else:
+                local = self._proxy.register(
+                    playable_url, referer=video.referer, is_hls=video.is_hls
+                )
+        except Exception as exc:  # noqa: BLE001
+            if is_x_video:
+                self.player_message.emit(f"X preview setup failed: {exc}")
+                return None
             return playable_url
         self._active_proxy_url = local
         return local
@@ -427,6 +512,8 @@ class PreviewPanel(QWidget):
         if self._current is None or not self._pending_playable_url:
             return False
         wrapped = self._wrap_with_proxy(self._pending_playable_url, self._current)
+        if not wrapped:
+            return False
         self.player.setSource(QUrl(wrapped))
         self._source_loaded = True
         return True
@@ -478,6 +565,10 @@ class PreviewPanel(QWidget):
         if error == QMediaPlayer.Error.NoError:
             return
         message = error_string or str(error)
+        if self._current is not None and self._is_x_video(self._current):
+            message += " X media links can expire; paste the post link again to refresh it."
+            self.thumbnail_label.setPixmap(QPixmap())
+            self.thumbnail_label.setText("X preview failed. Re-scan the post and try again.")
         self.player_message.emit(f"Player error: {message}")
         # Reset back to thumbnail so the user understands playback failed.
         self._show_thumbnail_view()
