@@ -111,9 +111,14 @@ def decode_obfuscated_urls(html: str) -> List[str]:
     out: List[str] = []
     for strings, ints, pos in _candidate_pairs(html):
         n = len(ints)
+        positions: dict[int, int] = {}
+        for index, value in enumerate(ints):
+            # Match list.index()'s first-occurrence behaviour while avoiding
+            # a full scan of the permutation for every fragment.
+            positions.setdefault(value, index)
         try:
-            joined = "".join(strings[ints.index(i)] for i in range(n))
-        except ValueError:
+            joined = "".join(strings[positions[i]] for i in range(n))
+        except KeyError:
             continue
         decoded_once = unquote(joined)
         candidates = {joined, decoded_once}

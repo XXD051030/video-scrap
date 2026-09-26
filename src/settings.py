@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -71,18 +72,34 @@ class AppSettings:
                 kwargs[field_name] = data[field_name]
         try:
             return cls(**kwargs).normalised()
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return cls()
 
     def save(self) -> None:
+        temp_path = None
         try:
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS_PATH.write_text(
-                json.dumps(asdict(self), indent=2), "utf-8"
-            )
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=SETTINGS_PATH.parent,
+                prefix=f".{SETTINGS_PATH.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                temp_file.write(json.dumps(asdict(self), indent=2))
+            os.replace(temp_path, SETTINGS_PATH)
+            temp_path = None
         except OSError:
             # Persisting is best-effort; failing to write must not crash the app.
             pass
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 class SettingsStore:

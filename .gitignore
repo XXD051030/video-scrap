@@ -10,6 +10,12 @@ venv/
 dist/
 build/
 
+# Test output
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
 # Local / IDE
 .DS_Store
 .env

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -51,14 +52,19 @@ def test_is_preview_teaser() -> None:
 
 
 def test_scrape_html_drops_preview_and_surfaces_hls() -> None:
-    # End-to-end of the pure-parsing parts (no network): feed the HTML through
-    # the same helpers scrape() uses and assert the HLS wins, previews dropped.
-    hls = _extract_config_hls(SAMPLE_HTML, PAGE)
-    assert hls, "expected an HLS url from the config"
-    item = VideoScraper()._item_from_hls(hls[0], PAGE, "Some Clip - 91AV", None)
-    assert item.is_hls and item.is_direct
-    assert item.ext == "m3u8"
-    assert item.referer == PAGE
+    # Exercise the public scrape path while keeping both network layers local.
+    response = Mock(text=SAMPLE_HTML, url=PAGE)
+    with patch("src.scraper.requests.get", return_value=response), patch.object(
+        VideoScraper, "_scrape_with_ytdlp", return_value=[]
+    ):
+        items = VideoScraper().scrape(PAGE)
+
+    hls_urls = set(_extract_config_hls(SAMPLE_HTML, PAGE))
+    assert hls_urls, "expected an HLS url from the config"
+    assert hls_urls == {item.url for item in items}
+    assert all(item.is_hls and item.is_direct for item in items)
+    assert all(item.ext == "m3u8" and item.referer == PAGE for item in items)
+    assert not any("preview.mp4" in item.url for item in items)
 
 
 if __name__ == "__main__":
