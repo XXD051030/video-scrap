@@ -83,7 +83,7 @@ def test_x_media_in_one_post_have_distinct_names(tmp_path: Path) -> None:
             final = Path(self.opts["outtmpl"].replace("%(ext)s", "mp4"))
             final.write_text(index)
             self.opts["post_hooks"][0](str(final))
-            outputs.append(final)
+            outputs.append(final.name)
             return 0
 
     with patch("src.downloader.yt_dlp.YoutubeDL", FakeYDL):
@@ -95,7 +95,7 @@ def test_x_media_in_one_post_have_distinct_names(tmp_path: Path) -> None:
             downloader.close()
 
     assert first != second
-    assert outputs == [first, second]
+    assert outputs == [first.name, second.name]
     assert first.read_text() == "1"
     assert second.read_text() == "2"
 
@@ -115,9 +115,12 @@ def test_lookalike_domain_keeps_generic_download_behavior(tmp_path: Path) -> Non
 
         def download(self, urls: list[str]) -> int:
             captured["urls"] = urls
+            final = Path(captured["opts"]["outtmpl"].replace("%(ext)s", "mp4"))
+            final.write_bytes(b"generic video")
             captured["opts"]["progress_hooks"][0](
-                {"status": "finished", "filename": str(tmp_path / "Shared title.mp4")}
+                {"status": "finished", "filename": str(final)}
             )
+            captured["opts"]["post_hooks"][0](str(final))
             return 0
 
     item = VideoItem(
@@ -137,8 +140,9 @@ def test_lookalike_domain_keeps_generic_download_behavior(tmp_path: Path) -> Non
     assert captured["urls"] == [item.url]
     assert "playlist_items" not in captured["opts"]
     assert "cookiesfrombrowser" not in captured["opts"]
-    assert "post_hooks" not in captured["opts"]
+    assert "overwrites" not in captured["opts"]
     assert result == tmp_path / "Shared title.mp4"
+    assert result.read_bytes() == b"generic video"
 
 
 def test_x_download_without_finished_file_is_failure(tmp_path: Path) -> None:

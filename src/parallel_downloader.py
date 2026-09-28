@@ -14,6 +14,8 @@ Range support.
 from __future__ import annotations
 
 import os
+import re
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,6 +42,84 @@ class ParallelDownloadResult:
 
 ProgressFn = Callable[[int, int, float], None]
 """``(downloaded_bytes, total_bytes, speed_bytes_per_sec)``"""
+
+
+_CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)", re.IGNORECASE)
+
+
+def _parse_content_range(value: str) -> Optional[Tuple[int, int, int]]:
+    match = _CONTENT_RANGE_RE.fullmatch(value.strip())
+    if match is None:
+        return None
+    start, end, total = map(int, match.groups())
+    if end < start or total <= end:
+        return None
+    return start, end, total
+
+
+def _publish_unique(part_path: Path, output_path: Path) -> Path:
+    """Atomically publish a finished file without replacing an existing one."""
+    index = 0
+    while True:
+        candidate = (
+            output_path
+            if index == 0
+            else output_path.with_name(
+                f"{output_path.stem} ({index}){output_path.suffix}"
+            )
+        )
+        try:
+            # The temporary file is in the same directory/filesystem. A hard
+            # link fails atomically if another download claimed this name.
+            os.link(part_path, candidate)
+            return candidate
+        except FileExistsError:
+            index += 1
+        except OSError:
+            # Some removable and network filesystems do not support hard
+            # links. Reserve the name exclusively, then atomically replace
+            # only our own placeholder with the completed temporary file.
+            try:
+                fd = os.open(
+                    str(candidate), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+            except FileExistsError:
+                index += 1
+                continue
+            reserved = None
+            try:
+                reserved = os.fstat(fd)
+                os.close(fd)
+                os.replace(part_path, candidate)
+            except OSError:
+                if reserved is None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                try:
+                    current = candidate.stat()
+                    if reserved is None or (current.st_dev, current.st_ino) == (
+                        reserved.st_dev,
+                        reserved.st_ino,
+                    ):
+                        candidate.unlink()
+                except OSError:
+                    pass
+                raise
+            return candidate
+
+
+def _open_unique_part(directory: Path) -> Tuple[int, Path]:
+    """Create a private temporary name while retaining normal output mode."""
+    for _ in range(10):
+        part_path = directory / f".video-scrap-{secrets.token_hex(16)}.part"
+        try:
+            fd = os.open(str(part_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            return fd, part_path
+        except FileExistsError:
+            continue
+    raise FileExistsError("Could not reserve a unique temporary download file")
 
 
 class ParallelDownloader:
@@ -78,26 +158,17 @@ class ParallelDownloader:
         progress: Optional[ProgressFn] = None,
     ) -> ParallelDownloadResult:
         headers = dict(headers or {})
+        # Range offsets must refer to the bytes returned by iter_content.
+        headers["Accept-Encoding"] = "identity"
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        part_path = output_path.with_suffix(output_path.suffix + ".part")
-
         size, accept_ranges = self._probe(url, headers)
         segments = self._plan(size, accept_ranges)
-
-        try:
-            part_path.unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001
-            pass
 
         # Open a single fd once and share across threads. ``os.pwrite``
         # writes at an absolute offset without using/modifying the fd's
         # file pointer, so concurrent writes are safe.
-        fd = os.open(
-            str(part_path),
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            0o644,
-        )
+        fd, part_path = _open_unique_part(output_path.parent)
         if size > 0:
             try:
                 os.ftruncate(fd, size)
@@ -138,16 +209,76 @@ class ParallelDownloader:
                     timeout=self.timeout,
                 ) as resp:
                     resp.raise_for_status()
+                    response_length = resp.headers.get("Content-Length")
+                    if response_length is not None:
+                        try:
+                            response_length = int(response_length)
+                        except ValueError as exc:
+                            raise RuntimeError("Invalid response length") from exc
+                        if response_length < 0:
+                            raise RuntimeError("Invalid response length")
+
+                    if accept_ranges and size > 0:
+                        expected_length = end - start + 1
+                        actual_range = _parse_content_range(
+                            resp.headers.get("Content-Range", "")
+                        )
+                        if resp.status_code != 206 or actual_range != (
+                            start, end, size
+                        ):
+                            raise RuntimeError(
+                                f"Range response mismatch for bytes={start}-{end}: "
+                                f"HTTP {resp.status_code}, "
+                                f"Content-Range {resp.headers.get('Content-Range', '')!r}"
+                            )
+                        if resp.headers.get("Content-Encoding", "").strip().lower() not in (
+                            "", "identity"
+                        ):
+                            raise RuntimeError("Range response is content-encoded")
+                    else:
+                        if resp.status_code != 200:
+                            raise RuntimeError(
+                                f"Single-stream response was HTTP {resp.status_code}, not 200"
+                            )
+                        expected_length = size if size > 0 else response_length
+
+                    if (
+                        response_length is not None
+                        and expected_length is not None
+                        and response_length != expected_length
+                    ):
+                        raise RuntimeError(
+                            f"Response length mismatch: expected {expected_length}, "
+                            f"Content-Length {response_length}"
+                        )
+
                     offset = start
+                    received = 0
                     for chunk in resp.iter_content(chunk_size=self.chunk_size):
                         if self._cancel.is_set():
                             return
                         if not chunk:
                             continue
-                        os.pwrite(fd, chunk, offset)
+                        if (
+                            expected_length is not None
+                            and received + len(chunk) > expected_length
+                        ):
+                            raise RuntimeError("Response length exceeds expected bytes")
+                        written = 0
+                        while written < len(chunk):
+                            count = os.pwrite(fd, chunk[written:], offset + written)
+                            if count <= 0:
+                                raise OSError("Short write while saving download")
+                            written += count
                         offset += len(chunk)
+                        received += len(chunk)
                         per_segment[idx].downloaded += len(chunk)
                         maybe_report()
+                    if expected_length is not None and received != expected_length:
+                        raise RuntimeError(
+                            f"Response length mismatch: expected {expected_length}, "
+                            f"received {received}"
+                        )
             finally:
                 if acquired and self.lane_limiter is not None:
                     self.lane_limiter.release()
@@ -182,30 +313,40 @@ class ParallelDownloader:
             os.fsync(fd)
         except OSError:
             pass
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            part_path.unlink(missing_ok=True)
+            raise
 
-        if self._cancel.is_set():
-            try:
-                part_path.unlink(missing_ok=True)
-            except Exception:  # noqa: BLE001
-                pass
-            raise RuntimeError("Download cancelled")
-
-        os.replace(str(part_path), str(output_path))
+        try:
+            if self._cancel.is_set():
+                raise RuntimeError("Download cancelled")
+            if size > 0 and part_path.stat().st_size != size:
+                raise RuntimeError("Download length mismatch")
+            published_path = _publish_unique(part_path, output_path)
+        except Exception:
+            part_path.unlink(missing_ok=True)
+            raise
+        try:
+            part_path.unlink()
+        except OSError:
+            # The complete file is already published; a leftover .part can be
+            # cleaned up later without marking this download as failed.
+            pass
 
         elapsed = time.monotonic() - start_ts
-        final_size = output_path.stat().st_size
+        final_size = published_path.stat().st_size
         if progress is not None:
             progress(final_size, final_size, final_size / max(elapsed, 1e-3))
         return ParallelDownloadResult(
-            path=output_path, size=final_size, elapsed=elapsed
+            path=published_path, size=final_size, elapsed=elapsed
         )
 
     def _probe(
         self, url: str, headers: Dict[str, str]
     ) -> Tuple[int, bool]:
-        # Prefer HEAD; some servers ignore Range info on HEAD, so fall back
-        # to a tiny GET range request as a confirmation.
+        # HEAD is only advisory: confirm Range support with an actual GET.
         size = 0
         accept_ranges = False
         try:
@@ -220,32 +361,42 @@ class ParallelDownloader:
         except Exception:  # noqa: BLE001
             pass
 
-        if not accept_ranges or size == 0:
-            try:
-                probe_headers = dict(headers)
-                probe_headers["Range"] = "bytes=0-1"
-                resp = self._session.get(
-                    url,
-                    headers=probe_headers,
-                    stream=True,
-                    timeout=self.timeout,
-                    allow_redirects=True,
-                )
-                with resp:
-                    if resp.status_code == 206:
-                        accept_ranges = True
-                        cr = resp.headers.get("Content-Range") or ""
-                        if "/" in cr:
-                            try:
-                                size = int(cr.rsplit("/", 1)[-1])
-                            except ValueError:
-                                pass
-                        if size == 0:
-                            size = int(resp.headers.get("Content-Length") or 0)
-                    elif resp.ok:
-                        size = int(resp.headers.get("Content-Length") or 0)
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            probe_headers = dict(headers)
+            probe_headers["Range"] = "bytes=0-1"
+            resp = self._session.get(
+                url,
+                headers=probe_headers,
+                stream=True,
+                timeout=self.timeout,
+                allow_redirects=True,
+            )
+            with resp:
+                if resp.status_code == 206:
+                    reported_range = _parse_content_range(
+                        resp.headers.get("Content-Range", "")
+                    )
+                    accept_ranges = bool(
+                        reported_range
+                        and reported_range[0] == 0
+                        and reported_range[1] == min(1, reported_range[2] - 1)
+                        and (
+                            not resp.headers.get("Content-Length")
+                            or int(resp.headers["Content-Length"])
+                            == reported_range[1] + 1
+                        )
+                        and resp.headers.get("Content-Encoding", "").strip().lower()
+                        in ("", "identity")
+                    )
+                    if accept_ranges and reported_range is not None:
+                        size = reported_range[2]
+                else:
+                    accept_ranges = False
+        except Exception:  # noqa: BLE001
+            accept_ranges = False
+        if not accept_ranges:
+            # A 200 probe is not consumed. The full GET supplies its own length.
+            size = 0
         return size, accept_ranges
 
     def _plan(self, size: int, accept_ranges: bool) -> List[Tuple[int, int]]:

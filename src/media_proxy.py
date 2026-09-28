@@ -139,7 +139,7 @@ def _parse_range_header(value: Optional[str]) -> Optional[Tuple[Optional[int], O
 def _parse_content_range(value: Optional[str]) -> Optional[Tuple[int, int, Optional[int]]]:
     if not value:
         return None
-    match = _CONTENT_RANGE_RE.search(value)
+    match = _CONTENT_RANGE_RE.fullmatch(value.strip())
     if not match:
         return None
     start = int(match.group(1))
@@ -147,6 +147,45 @@ def _parse_content_range(value: Optional[str]) -> Optional[Tuple[int, int, Optio
     total_str = match.group(3)
     total = int(total_str) if total_str.isdigit() else None
     return start, end, total
+
+
+def _has_identity_encoding(resp: requests.Response) -> bool:
+    encoding = (resp.headers.get("Content-Encoding") or "identity").strip().lower()
+    return encoding == "identity"
+
+
+def _parse_content_length(value: Optional[str]) -> Optional[int]:
+    if value is None or not value.isascii() or not value.isdigit():
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _validated_partial_range(
+    resp: requests.Response,
+    requested_start: int,
+    requested_end: Optional[int],
+    known_total: Optional[int] = None,
+) -> Optional[Tuple[int, Optional[int]]]:
+    """Return the declared end/total only when a 206 matches our request."""
+    if resp.status_code != 206 or not _has_identity_encoding(resp):
+        return None
+    content_range = _parse_content_range(resp.headers.get("Content-Range"))
+    if content_range is None:
+        return None
+    start, end, total = content_range
+    if start != requested_start or end < start:
+        return None
+    if requested_end is not None and end > requested_end:
+        return None
+    if total is not None and (total <= 0 or end >= total):
+        return None
+    if known_total is not None:
+        if end >= known_total or (total is not None and total != known_total):
+            return None
+    return end, total
 
 
 class _Entry:
@@ -430,6 +469,7 @@ class _Prefetcher(threading.Thread):
         entry = self.entry
         headers = dict(entry.headers)
         headers["Range"] = f"bytes={start}-{end_inclusive}"
+        headers["Accept-Encoding"] = "identity"
         try:
             resp = self.session.get(
                 entry.upstream,
@@ -443,18 +483,23 @@ class _Prefetcher(threading.Thread):
             return
 
         try:
-            if resp.status_code not in (200, 206):
+            if (
+                resp.status_code not in (200, 206)
+                or not _has_identity_encoding(resp)
+            ):
                 return
 
             if resp.status_code == 200:
                 # Server ignored Range and sent the whole body. Cache it
                 # from offset 0 (the body is the full file).
-                cl = resp.headers.get("Content-Length")
-                if cl:
-                    try:
-                        entry.total_size = int(cl)
-                    except ValueError:
-                        pass
+                cl_header = resp.headers.get("Content-Length")
+                if cl_header is not None:
+                    length = _parse_content_length(cl_header)
+                    if length is None or (
+                        entry.total_size is not None and length != entry.total_size
+                    ):
+                        return
+                    entry.total_size = length
                 pos = 0
                 for chunk in resp.iter_content(chunk_size=PREFETCH_CHUNK_SIZE):
                     if entry.closed:
@@ -465,16 +510,28 @@ class _Prefetcher(threading.Thread):
                     pos += len(chunk)
                 return
 
-            self._learn_total_size(resp)
+            checked = _validated_partial_range(
+                resp, start, end_inclusive, entry.total_size
+            )
+            if checked is None:
+                return
+            declared_end, total = checked
+            if entry.total_size is None and total is not None:
+                entry.total_size = total
             pos = start
             for chunk in resp.iter_content(chunk_size=PREFETCH_CHUNK_SIZE):
                 if entry.closed:
                     return
                 if not chunk:
                     continue
-                entry.write_at(pos, chunk)
-                pos += len(chunk)
-                if pos > end_inclusive + 1:
+                # A broken upstream can send more bytes than Content-Range
+                # declared. Never cache beyond the verified interval.
+                safe = chunk[:declared_end + 1 - pos]
+                if not safe:
+                    return
+                entry.write_at(pos, safe)
+                pos += len(safe)
+                if pos > declared_end:
                     return
                 # If the player suddenly needs bytes far ahead of us,
                 # abandon this fetch so the main loop can re-plan.
@@ -489,20 +546,6 @@ class _Prefetcher(threading.Thread):
             try:
                 resp.close()
             except Exception:  # noqa: BLE001
-                pass
-
-    def _learn_total_size(self, resp: requests.Response) -> None:
-        if self.entry.total_size is not None:
-            return
-        cr = _parse_content_range(resp.headers.get("Content-Range"))
-        if cr and cr[2]:
-            self.entry.total_size = cr[2]
-            return
-        cl = resp.headers.get("Content-Length")
-        if cl and resp.status_code == 200:
-            try:
-                self.entry.total_size = int(cl)
-            except ValueError:
                 pass
 
 
@@ -608,10 +651,12 @@ class _HlsPrefetcher(threading.Thread):
     def _fetch_segment(self, segment: _Entry) -> None:
         if segment.closed or segment.cached_run_end(0) > 0:
             return
+        headers = dict(segment.headers)
+        headers["Accept-Encoding"] = "identity"
         try:
             resp = self.session.get(
                 segment.upstream,
-                headers=segment.headers,
+                headers=headers,
                 stream=True,
                 timeout=(5, 10),
                 allow_redirects=True,
@@ -620,14 +665,13 @@ class _HlsPrefetcher(threading.Thread):
         except Exception:  # noqa: BLE001
             return
         try:
-            if resp.status_code not in (200, 206):
+            # This request has no Range header; a partial body has no known
+            # offset and must not be cached at byte zero.
+            if resp.status_code != 200 or not _has_identity_encoding(resp):
                 return
-            cl = resp.headers.get("Content-Length")
-            if cl and resp.status_code == 200:
-                try:
-                    segment.total_size = int(cl)
-                except ValueError:
-                    pass
+            cl = _parse_content_length(resp.headers.get("Content-Length"))
+            if cl is not None:
+                segment.total_size = cl
             pos = 0
             for chunk in resp.iter_content(chunk_size=PREFETCH_CHUNK_SIZE):
                 if segment.closed:
@@ -1053,11 +1097,13 @@ class MediaProxyServer:
     def _serve_head(
         self, request: BaseHTTPRequestHandler, entry: _Entry
     ) -> None:
+        headers = dict(entry.headers)
+        headers["Accept-Encoding"] = "identity"
         try:
             resp = self._session.request(
                 method="HEAD",
                 url=entry.upstream,
-                headers=entry.headers,
+                headers=headers,
                 timeout=15,
                 allow_redirects=True,
                 **entry.cookie_kwargs,
@@ -1073,11 +1119,14 @@ class MediaProxyServer:
             return
         try:
             cl = resp.headers.get("Content-Length")
-            if cl and entry.total_size is None:
-                try:
-                    entry.total_size = int(cl)
-                except ValueError:
-                    pass
+            if (
+                entry.total_size is None
+                and resp.status_code == 200
+                and _has_identity_encoding(resp)
+            ):
+                length = _parse_content_length(cl)
+                if length is not None:
+                    entry.total_size = length
             request.send_response(resp.status_code)
             for key, value in resp.headers.items():
                 if key.lower() in {"transfer-encoding", "connection", "keep-alive"}:
@@ -1224,6 +1273,7 @@ class MediaProxyServer:
         self, entry: _Entry, start: int, end_inclusive: Optional[int]
     ) -> Iterable[bytes]:
         headers = dict(entry.headers)
+        headers["Accept-Encoding"] = "identity"
         if end_inclusive is not None:
             headers["Range"] = f"bytes={start}-{end_inclusive}"
         else:
@@ -1253,23 +1303,21 @@ class MediaProxyServer:
                 return
 
             try:
-                if resp.status_code not in (200, 206):
+                if (
+                    resp.status_code not in (200, 206)
+                    or not _has_identity_encoding(resp)
+                ):
                     return
-                if entry.total_size is None:
-                    cr = _parse_content_range(
-                        resp.headers.get("Content-Range")
-                    )
-                    if cr and cr[2]:
-                        entry.total_size = cr[2]
-                    else:
-                        cl = resp.headers.get("Content-Length")
-                        if cl and resp.status_code == 200:
-                            try:
-                                entry.total_size = int(cl)
-                            except ValueError:
-                                pass
 
                 if resp.status_code == 200:
+                    cl_header = resp.headers.get("Content-Length")
+                    if cl_header is not None:
+                        length = _parse_content_length(cl_header)
+                        if length is None or (
+                            entry.total_size is not None and length != entry.total_size
+                        ):
+                            return
+                        entry.total_size = length
                     # Server ignored the Range header. Stream the
                     # requested slice without writing the bytes at the
                     # wrong offset (the body starts at 0, not `start`).
@@ -1278,16 +1326,27 @@ class MediaProxyServer:
                     )
                     return
 
+                checked = _validated_partial_range(
+                    resp, start, end_inclusive, entry.total_size
+                )
+                if checked is None:
+                    return
+                declared_end, total = checked
+                if entry.total_size is None and total is not None:
+                    entry.total_size = total
                 pos = start
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     if entry.closed:
                         return
                     if not chunk:
                         continue
-                    entry.write_at(pos, chunk)
-                    pos += len(chunk)
-                    yield chunk
-                    if end_inclusive is not None and pos > end_inclusive + 1:
+                    safe = chunk[:declared_end + 1 - pos]
+                    if not safe:
+                        return
+                    entry.write_at(pos, safe)
+                    pos += len(safe)
+                    yield safe
+                    if pos > declared_end:
                         return
             finally:
                 try:
@@ -1333,6 +1392,7 @@ class MediaProxyServer:
             return
         headers = dict(entry.headers)
         headers["Range"] = "bytes=0-0"
+        headers["Accept-Encoding"] = "identity"
         try:
             resp = self._session.get(
                 entry.upstream,
@@ -1345,16 +1405,21 @@ class MediaProxyServer:
         except Exception:  # noqa: BLE001
             return
         try:
-            cr = _parse_content_range(resp.headers.get("Content-Range"))
-            if cr and cr[2]:
-                entry.total_size = cr[2]
+            checked = _validated_partial_range(resp, 0, 0)
+            if checked is not None and checked[1] is not None:
+                received = 0
+                for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                    received += len(chunk)
+                    if received > 1:
+                        return
+                if received == 1:
+                    entry.total_size = checked[1]
                 return
-            cl = resp.headers.get("Content-Length")
-            if cl and resp.status_code == 200:
-                try:
-                    entry.total_size = int(cl)
-                except ValueError:
-                    pass
+            cl = _parse_content_length(resp.headers.get("Content-Length"))
+            if cl is not None and resp.status_code == 200 and _has_identity_encoding(resp):
+                entry.total_size = cl
+        except Exception:  # noqa: BLE001
+            return
         finally:
             try:
                 resp.close()

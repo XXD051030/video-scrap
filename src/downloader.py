@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 import shutil
@@ -29,7 +29,7 @@ except Exception:  # noqa: BLE001
     _CryptoAES = None
 
 from .net import build_session
-from .parallel_downloader import ParallelDownloader
+from .parallel_downloader import ParallelDownloader, _publish_unique
 from .scraper import VideoItem, is_x_post_url
 from .utils import safe_filename
 
@@ -204,6 +204,52 @@ class VideoDownloader:
         quality: str = "best",
         on_progress: Optional[ProgressHandler] = None,
     ) -> Path:
+        """Keep each task's backend files private until its result is ready."""
+        destination = self.output_dir
+        final_progress: Optional[DownloadProgress] = None
+        with tempfile.TemporaryDirectory(
+            prefix=".video-scrap-job-", dir=destination, ignore_cleanup_errors=True
+        ) as work_dir:
+            self.output_dir = Path(work_dir)
+
+            def relay(progress: DownloadProgress) -> None:
+                nonlocal final_progress
+                if progress.status in {"completed", "partial"}:
+                    final_progress = progress
+                elif on_progress is not None:
+                    on_progress(progress)
+
+            try:
+                staged = self._download_to_stage(
+                    item, quality, relay if on_progress is not None else None
+                )
+                if (
+                    not staged.is_file()
+                    or staged.resolve().parent != self.output_dir.resolve()
+                ):
+                    raise RuntimeError("Download did not produce a finished file")
+                published = _publish_unique(staged, destination / staged.name)
+            finally:
+                self.output_dir = destination
+
+        if on_progress is not None and final_progress is not None:
+            on_progress(replace(final_progress, filename=str(published)))
+        return published
+
+    def _discard_staged_outputs(self) -> None:
+        """Remove an unsuccessful HLS backend's files before trying another."""
+        for path in self.output_dir.iterdir():
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+
+    def _download_to_stage(
+        self,
+        item: VideoItem,
+        quality: str,
+        on_progress: Optional[ProgressHandler],
+    ) -> Path:
         self._cancelled = False
         self._partial_on_cancel = False
         # HLS / DASH manifests are not single files - they reference dozens
@@ -215,6 +261,7 @@ class VideoDownloader:
             except Exception:
                 if self._cancelled:
                     raise
+                self._discard_staged_outputs()
                 if on_progress is not None:
                     on_progress(
                         DownloadProgress(
@@ -227,6 +274,7 @@ class VideoDownloader:
                 except Exception:
                     if self._cancelled:
                         raise
+                    self._discard_staged_outputs()
                     ffmpeg = shutil.which("ffmpeg")
                     if not ffmpeg:
                         raise
@@ -303,6 +351,7 @@ class VideoDownloader:
             "quiet": True,
             "no_warnings": True,
             "progress_hooks": [hook],
+            "post_hooks": [post_hook],
             "merge_output_format": "mp4",
             "concurrent_fragment_downloads": 2,
             "retries": 5,
@@ -313,7 +362,6 @@ class VideoDownloader:
         }
 
         if is_x_item:
-            ydl_opts["post_hooks"] = [post_hook]
             ydl_opts["overwrites"] = False
             if item.x_auth_browser:
                 ydl_opts["cookiesfrombrowser"] = (item.x_auth_browser,)
@@ -323,10 +371,13 @@ class VideoDownloader:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             result = ydl.download([_x_download_url(item.url) if is_x_item else item.url])
 
+        if result and not is_x_item:
+            raise RuntimeError("yt-dlp download failed")
+        completed = final_path["path"] or last_path["path"]
         if is_x_item:
-            completed = final_path["path"]
             if result or not completed or not Path(completed).is_file():
                 raise RuntimeError("Selected X video did not produce a finished file")
+        if completed and Path(completed).is_file():
             last_path["path"] = completed
 
         if on_progress:
@@ -724,6 +775,10 @@ class VideoDownloader:
         title = safe_filename(item.title)
         outtmpl = str(self.output_dir / f"{title}.%(ext)s")
         last_path: Dict[str, Optional[str]] = {"path": None}
+        final_path: Dict[str, Optional[str]] = {"path": None}
+
+        def post_hook(filename: str) -> None:
+            final_path["path"] = filename
 
         def hook(data: Dict) -> None:
             if self._cancelled:
@@ -792,6 +847,7 @@ class VideoDownloader:
             "no_warnings": True,
             "noprogress": True,
             "progress_hooks": [hook],
+            "post_hooks": [post_hook],
             "merge_output_format": "mp4",
             "hls_prefer_native": True,
             "concurrent_fragment_downloads": 4,
@@ -803,7 +859,13 @@ class VideoDownloader:
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([item.url])
+            result = ydl.download([item.url])
+
+        if result:
+            raise RuntimeError("Native HLS download failed")
+
+        if final_path["path"] and Path(final_path["path"]).is_file():
+            last_path["path"] = final_path["path"]
 
         if on_progress is not None:
             on_progress(
