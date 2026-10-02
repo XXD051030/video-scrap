@@ -112,10 +112,12 @@ def _publish_unique(part_path: Path, output_path: Path) -> Path:
 
 def _open_unique_part(directory: Path) -> Tuple[int, Path]:
     """Create a private temporary name while retaining normal output mode."""
+    # Windows CRT descriptors default to text mode unless opened as binary.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     for _ in range(10):
         part_path = directory / f".video-scrap-{secrets.token_hex(16)}.part"
         try:
-            fd = os.open(str(part_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            fd = os.open(str(part_path), flags, 0o644)
             return fd, part_path
         except FileExistsError:
             continue
@@ -165,10 +167,11 @@ class ParallelDownloader:
         size, accept_ranges = self._probe(url, headers)
         segments = self._plan(size, accept_ranges)
 
-        # Open a single fd once and share across threads. ``os.pwrite``
-        # writes at an absolute offset without using/modifying the fd's
-        # file pointer, so concurrent writes are safe.
+        # Unix pwrite uses absolute offsets without moving the shared file
+        # pointer. Platforms without it use a lock around seek + full write.
         fd, part_path = _open_unique_part(output_path.parent)
+        pwrite = getattr(os, "pwrite", None)
+        write_lock = threading.Lock()
         if size > 0:
             try:
                 os.ftruncate(fd, size)
@@ -179,6 +182,26 @@ class ParallelDownloader:
         start_ts = time.monotonic()
         last_report = [start_ts]
         report_lock = threading.Lock()
+
+        def write_chunk(chunk: bytes, offset: int) -> None:
+            if pwrite is not None:
+                written = 0
+                while written < len(chunk):
+                    count = pwrite(fd, chunk[written:], offset + written)
+                    if count <= 0:
+                        raise OSError("Short write while saving download")
+                    written += count
+            else:
+                # Keep the lock through short writes: another segment must
+                # not change the descriptor's position before this finishes.
+                with write_lock:
+                    os.lseek(fd, offset, os.SEEK_SET)
+                    written = 0
+                    while written < len(chunk):
+                        count = os.write(fd, chunk[written:])
+                        if count <= 0:
+                            raise OSError("Short write while saving download")
+                        written += count
 
         def maybe_report(force: bool = False) -> None:
             if progress is None:
@@ -264,12 +287,7 @@ class ParallelDownloader:
                             and received + len(chunk) > expected_length
                         ):
                             raise RuntimeError("Response length exceeds expected bytes")
-                        written = 0
-                        while written < len(chunk):
-                            count = os.pwrite(fd, chunk[written:], offset + written)
-                            if count <= 0:
-                                raise OSError("Short write while saving download")
-                            written += count
+                        write_chunk(chunk, offset)
                         offset += len(chunk)
                         received += len(chunk)
                         per_segment[idx].downloaded += len(chunk)

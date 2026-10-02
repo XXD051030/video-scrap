@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.downloader import VideoDownloader, _HlsSegment
+from src.downloader import VideoDownloader, _HlsFallbackError, _HlsSegment
 from src.parallel_downloader import ParallelDownloadResult
 from src.scraper import VideoItem
 
@@ -234,7 +234,9 @@ class DownloadNameReservationTests(unittest.TestCase):
         try:
             with mock.patch.object(
                 downloader, "_download_hls_parallel",
-                side_effect=RuntimeError("parallel failed"),
+                side_effect=_HlsFallbackError(
+                    "parallel failed", "https://example.test/video.m3u8"
+                ),
             ), mock.patch(
                 "src.downloader.yt_dlp.YoutubeDL", FailedWithFile
             ), mock.patch("src.downloader.shutil.which", return_value=None):
@@ -262,7 +264,7 @@ class DownloadNameReservationTests(unittest.TestCase):
             mock.patch.object(
                 downloader,
                 "_fetch_hls_manifest",
-                return_value=("https://example.test/list.m3u8", "#EXTM3U"),
+                return_value=("https://example.test/list.m3u8", "#EXTM3U", None),
             )
         )
         stack.enter_context(

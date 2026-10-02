@@ -153,6 +153,48 @@ class _HlsSegment:
     duration: float
     key: Optional[bytes]
     iv: Optional[bytes]
+    range_start: Optional[int] = None
+    range_length: Optional[int] = None
+
+
+class _HlsByteRangeError(RuntimeError):
+    """A ranged playlist cannot safely use an unvalidated fallback backend."""
+
+
+@dataclass
+class _HlsMasterContext:
+    url: str
+    text: str
+
+
+class _HlsFallbackError(RuntimeError):
+    """An inspected ordinary media playlist may use a fallback backend."""
+
+    def __init__(
+        self,
+        message: str,
+        manifest_url: str,
+        master_context: Optional[_HlsMasterContext] = None,
+    ) -> None:
+        super().__init__(message)
+        self.manifest_url = manifest_url
+        self.master_context = master_context
+
+
+def _is_hls_tag(line: str, tag: str) -> bool:
+    return bool(re.match(re.escape(tag) + r"(?=[:\s]|$)", line))
+
+
+def _hls_has_byte_ranges(text: str) -> bool:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if _is_hls_tag(line, "#EXT-X-BYTERANGE"):
+            return True
+        if _is_hls_tag(line, "#EXT-X-MAP") and re.search(
+            r"(?:^|[:,])\s*BYTERANGE(?=[=,\s]|$)", line
+        ):
+            return True
+    return False
 
 
 class VideoDownloader:
@@ -258,9 +300,23 @@ class VideoDownloader:
         if item.is_direct and item.is_hls:
             try:
                 return self._download_hls_parallel(item, on_progress)
-            except Exception:
+            except _HlsByteRangeError:
+                # yt-dlp's HTTP backend can accept a whole-file 200 or an
+                # incorrect 206 for a Range request. Do not publish those
+                # bytes by retrying a ranged playlist with that backend.
+                raise
+            except _HlsFallbackError as exc:
                 if self._cancelled:
                     raise
+                # Keep every backend on the same inspected media playlist.
+                # Reusing a master URL can select an unchecked ranged variant.
+                fallback_url = exc.manifest_url
+                if exc.master_context is not None:
+                    # Preserve an external audio rendition only after checking
+                    # every media choice a backend could make from the master.
+                    self._validate_hls_master_fallback(exc.master_context, item)
+                    fallback_url = exc.master_context.url
+                fallback_item = replace(item, url=fallback_url)
                 self._discard_staged_outputs()
                 if on_progress is not None:
                     on_progress(
@@ -270,7 +326,7 @@ class VideoDownloader:
                         )
                     )
                 try:
-                    return self._download_hls_ytdlp(item, on_progress)
+                    return self._download_hls_ytdlp(fallback_item, on_progress)
                 except Exception:
                     if self._cancelled:
                         raise
@@ -285,7 +341,7 @@ class VideoDownloader:
                                 message="Native HLS failed; retrying with ffmpeg...",
                             )
                         )
-                    return self._download_hls_ffmpeg(item, ffmpeg, on_progress)
+                    return self._download_hls_ffmpeg(fallback_item, ffmpeg, on_progress)
         if item.is_direct and not item.is_hls:
             return self._download_direct(item, on_progress)
 
@@ -396,10 +452,6 @@ class VideoDownloader:
         on_progress: Optional[ProgressHandler],
     ) -> Path:
         """Download HLS segments concurrently, then remux to mp4."""
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            raise RuntimeError("ffmpeg is required for HLS remuxing")
-
         title = safe_filename(item.title)
         output_path = self.output_dir / f"{title}.mp4"
         headers = build_request_headers(item.referer)
@@ -414,10 +466,49 @@ class VideoDownloader:
                 )
             )
 
-        manifest_url, manifest_text = self._fetch_hls_manifest(item.url, headers)
-        segments = self._parse_hls_segments(manifest_text, manifest_url, headers)
-        if not segments:
-            raise RuntimeError("HLS manifest did not contain media segments")
+        try:
+            manifest_url, manifest_text, master_context = self._fetch_hls_manifest(
+                item.url, headers
+            )
+        except _HlsByteRangeError:
+            raise
+        except Exception as exc:
+            # Until a media playlist has been inspected, another backend
+            # could fetch ranges and accept whole-file responses as segments.
+            raise _HlsByteRangeError(
+                f"Could not safely inspect the HLS media manifest: {exc}"
+            ) from exc
+        has_byte_ranges = _hls_has_byte_ranges(manifest_text)
+        try:
+            segments = self._parse_hls_segments(manifest_text, manifest_url, headers)
+            if not segments:
+                raise RuntimeError("HLS manifest did not contain media segments")
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                raise RuntimeError("ffmpeg is required for HLS remuxing")
+            return self._download_hls_segments_parallel(
+                item, on_progress, segments, headers, ffmpeg
+            )
+        except _HlsByteRangeError:
+            raise
+        except Exception as exc:
+            if has_byte_ranges:
+                raise _HlsByteRangeError(
+                    f"HLS byte-range download failed safely: {exc}"
+                ) from exc
+            raise _HlsFallbackError(str(exc), manifest_url, master_context) from exc
+
+    def _download_hls_segments_parallel(
+        self,
+        item: VideoItem,
+        on_progress: Optional[ProgressHandler],
+        segments: list[_HlsSegment],
+        headers: Dict[str, str],
+        ffmpeg: str,
+    ) -> Path:
+        """Keep the ordinary HLS transfer, cancellation and remux flow."""
+        title = safe_filename(item.title)
+        output_path = self.output_dir / f"{title}.mp4"
 
         total = len(segments)
         started = time.monotonic()
@@ -580,22 +671,131 @@ class VideoDownloader:
         self,
         url: str,
         headers: Dict[str, str],
-    ) -> tuple[str, str]:
-        resp = self._session.get(url, headers=headers, timeout=(10, 60), allow_redirects=True)
-        resp.raise_for_status()
-        text = resp.text
-        final_url = resp.url
+        *,
+        media_only: bool = False,
+    ) -> tuple[str, str, Optional[_HlsMasterContext]]:
+        with self._session.get(
+            url, headers=headers, timeout=(10, 60), allow_redirects=True
+        ) as resp:
+            resp.raise_for_status()
+            text = resp.text
+            final_url = resp.url
+        self._validate_hls_manifest_header(text)
+        if media_only:
+            self._validate_hls_media_manifest(text)
+            return final_url, text, None
         variant = self._pick_hls_variant(text, final_url)
-        resp.close()
         if variant is None:
-            return final_url, text
-        child = self._session.get(
-            variant, headers=headers, timeout=(10, 60), allow_redirects=True
+            self._validate_hls_media_manifest(text)
+            return final_url, text, None
+        master_context = (
+            _HlsMasterContext(final_url, text)
+            if self._hls_variant_has_external_audio(text, final_url, variant)
+            else None
         )
-        child.raise_for_status()
-        child_url, child_text = child.url, child.text
-        child.close()
-        return child_url, child_text
+        with self._session.get(
+            variant, headers=headers, timeout=(10, 60), allow_redirects=True
+        ) as child:
+            child.raise_for_status()
+            child_url, child_text = child.url, child.text
+        self._validate_hls_media_manifest(child_text)
+        return child_url, child_text, master_context
+
+    @staticmethod
+    def _hls_variant_has_external_audio(
+        text: str, manifest_url: str, variant_url: str
+    ) -> bool:
+        external_audio_groups = set()
+        lines = [line.strip() for line in text.splitlines()]
+        for line in lines:
+            if line.startswith("#EXT-X-MEDIA:"):
+                attrs = _parse_m3u8_attrs(line.split(":", 1)[1])
+                if attrs.get("TYPE") == "AUDIO" and attrs.get("URI"):
+                    external_audio_groups.add(attrs.get("GROUP-ID"))
+        stream_attrs: Dict[str, str] = {}
+        for line in lines:
+            if line.startswith("#EXT-X-STREAM-INF:"):
+                stream_attrs = _parse_m3u8_attrs(line.split(":", 1)[1])
+            elif line and not line.startswith("#"):
+                if (
+                    urljoin(manifest_url, line) == variant_url
+                    and stream_attrs.get("AUDIO") in external_audio_groups
+                ):
+                    return True
+                stream_attrs = {}
+        return False
+
+    def _validate_hls_master_fallback(
+        self, context: _HlsMasterContext, item: VideoItem
+    ) -> None:
+        headers = build_request_headers(item.referer)
+        headers["Accept"] = "*/*"
+        candidates: set[str] = set()
+        pending_stream = False
+        try:
+            for raw_line in context.text.splitlines():
+                line = raw_line.strip()
+                if _is_hls_tag(line, "#EXT-X-STREAM-INF"):
+                    if pending_stream or not line.startswith("#EXT-X-STREAM-INF:"):
+                        raise _HlsByteRangeError("Malformed HLS master variant reference")
+                    pending_stream = True
+                elif _is_hls_tag(line, "#EXT-X-MEDIA") or _is_hls_tag(
+                    line, "#EXT-X-I-FRAME-STREAM-INF"
+                ):
+                    attrs = _parse_m3u8_attrs(line.split(":", 1)[1] if ":" in line else "")
+                    uri = attrs.get("URI")
+                    if uri:
+                        candidates.add(urljoin(context.url, uri))
+                    elif _is_hls_tag(line, "#EXT-X-I-FRAME-STREAM-INF"):
+                        raise _HlsByteRangeError("Missing HLS I-frame playlist URI")
+                elif line and not line.startswith("#"):
+                    if not pending_stream:
+                        raise _HlsByteRangeError("Unclassified URI in the HLS master playlist")
+                    candidates.add(urljoin(context.url, line))
+                    pending_stream = False
+            if pending_stream or not candidates:
+                raise _HlsByteRangeError("HLS master does not identify all media candidates")
+            for candidate in sorted(candidates):
+                if self._cancelled:
+                    raise _HlsByteRangeError("Download cancelled")
+                _url, text, _context = self._fetch_hls_manifest(
+                    candidate, headers, media_only=True
+                )
+                if _hls_has_byte_ranges(text):
+                    raise _HlsByteRangeError(
+                        "HLS master fallback contains byte ranges in a media rendition"
+                    )
+        except _HlsByteRangeError:
+            raise
+        except Exception as exc:
+            raise _HlsByteRangeError(
+                f"Could not safely inspect every HLS master rendition: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _validate_hls_manifest_header(text: str) -> None:
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        if first_line != "#EXTM3U":
+            raise _HlsByteRangeError("The HLS response is not an EXTM3U playlist")
+
+    @classmethod
+    def _validate_hls_media_manifest(cls, text: str) -> None:
+        cls._validate_hls_manifest_header(text)
+        lines = [line.strip() for line in text.splitlines()]
+        master_tags = (
+            "#EXT-X-STREAM-INF", "#EXT-X-I-FRAME-STREAM-INF", "#EXT-X-MEDIA",
+            "#EXT-X-SESSION-DATA", "#EXT-X-SESSION-KEY",
+        )
+        if any(_is_hls_tag(line, tag) for line in lines for tag in master_tags):
+            raise _HlsByteRangeError(
+                "The selected HLS playlist is still a master playlist; "
+                "a media playlist could not be safely inspected"
+            )
+        if not any(
+            _is_hls_tag(line, "#EXTINF") or _is_hls_tag(line, "#EXT-X-TARGETDURATION")
+            for line in lines
+        ):
+            raise _HlsByteRangeError("The HLS response does not identify a media playlist")
 
     def _pick_hls_variant(self, text: str, manifest_url: str) -> Optional[str]:
         best_score = -1
@@ -623,6 +823,31 @@ class VideoDownloader:
         manifest_url: str,
         headers: Dict[str, str],
     ) -> list[_HlsSegment]:
+        lines = [line.strip() for line in text.splitlines()]
+        has_media_ranges = any(
+            _is_hls_tag(line, "#EXT-X-BYTERANGE") for line in lines
+        )
+        if _hls_has_byte_ranges(text) and any(
+            _is_hls_tag(line, "#EXT-X-MAP") for line in lines
+        ):
+            # This transfer path remuxes independent TS segments and does not
+            # prepend initialization sections. Do not silently omit a MAP or
+            # pass its ranges to a backend that accepts incorrect responses.
+            raise _HlsByteRangeError(
+                "HLS byte ranges with EXT-X-MAP initialization sections are not supported"
+            )
+        if has_media_ranges and any(
+            _is_hls_tag(line, "#EXT-X-I-FRAMES-ONLY") for line in lines
+        ) and any(
+            line.startswith("#EXT-X-KEY:")
+            and _parse_m3u8_attrs(line.split(":", 1)[1]).get("METHOD") == "AES-128"
+            for line in lines
+        ):
+            # Encrypted I-frame ranges require block-boundary expansion and
+            # recovering the IV from the preceding block (RFC 8216 6.3.6).
+            raise _HlsByteRangeError(
+                "AES-128 encrypted I-frame byte ranges are not supported"
+            )
         segments: list[_HlsSegment] = []
         key_cache: Dict[str, bytes] = {}
         media_sequence = 0
@@ -631,9 +856,11 @@ class VideoDownloader:
         key_method: Optional[str] = None
         key_uri: Optional[str] = None
         key_iv: Optional[str] = None
+        pending_range: Optional[tuple[int, Optional[int]]] = None
+        previous_range_url: Optional[str] = None
+        previous_range_end: Optional[int] = None
 
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
+        for line in lines:
             if not line:
                 continue
             if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
@@ -655,9 +882,52 @@ class VideoDownloader:
                 if key_method == "NONE":
                     key_uri = None
                     key_iv = None
+            elif _is_hls_tag(line, "#EXT-X-BYTERANGE"):
+                if pending_range is not None:
+                    raise _HlsByteRangeError(
+                        "HLS byte-range tag was not followed by a media URI"
+                    )
+                match = re.fullmatch(r"#EXT-X-BYTERANGE:([0-9]+)(?:@([0-9]+))?", line)
+                if match is None or int(match.group(1)) <= 0:
+                    raise _HlsByteRangeError(f"Invalid HLS byte-range tag: {line}")
+                pending_range = (
+                    int(match.group(1)),
+                    int(match.group(2)) if match.group(2) is not None else None,
+                )
             elif line.startswith("#"):
                 continue
             else:
+                segment_url = urljoin(manifest_url, line)
+                range_start: Optional[int] = None
+                range_length: Optional[int] = None
+                if pending_range is not None:
+                    range_length, range_start = pending_range
+                    if range_start is None:
+                        if (
+                            previous_range_url != segment_url
+                            or previous_range_end is None
+                        ):
+                            raise _HlsByteRangeError(
+                                "An implicit HLS byte-range offset requires a preceding "
+                                "ranged segment of the same media resource"
+                            )
+                        range_start = previous_range_end
+                    previous_range_url = segment_url
+                    previous_range_end = range_start + range_length
+                    pending_range = None
+                    if key_method not in {None, "NONE", "AES-128"}:
+                        raise _HlsByteRangeError(
+                            f"Unsupported encryption for HLS byte ranges: {key_method}"
+                        )
+                    if key_method == "AES-128" and not key_uri:
+                        raise _HlsByteRangeError(
+                            "AES-128 encrypted HLS byte ranges require a key URI"
+                        )
+                else:
+                    # An intervening whole-file segment cannot supply the
+                    # offset of a later implicit byte range (RFC 8216 4.3.2.2).
+                    previous_range_url = None
+                    previous_range_end = None
                 key: Optional[bytes] = None
                 iv: Optional[bytes] = None
                 if key_method == "AES-128" and key_uri:
@@ -677,13 +947,19 @@ class VideoDownloader:
                 segments.append(
                     _HlsSegment(
                         index=len(segments),
-                        url=urljoin(manifest_url, line),
+                        url=segment_url,
                         duration=pending_duration,
                         key=key,
                         iv=iv,
+                        range_start=range_start,
+                        range_length=range_length,
                     )
                 )
                 segment_number += 1
+        if pending_range is not None:
+            raise _HlsByteRangeError(
+                "HLS byte-range tag was not followed by a media URI"
+            )
         return segments
 
     def _download_hls_segment(
@@ -691,6 +967,22 @@ class VideoDownloader:
         segment: _HlsSegment,
         headers: Dict[str, str],
     ) -> bytes:
+        is_ranged = segment.range_start is not None or segment.range_length is not None
+        request_headers = headers
+        if is_ranged:
+            if (
+                segment.range_start is None
+                or segment.range_length is None
+                or segment.range_start < 0
+                or segment.range_length <= 0
+            ):
+                raise _HlsByteRangeError("Invalid HLS segment byte-range metadata")
+            request_headers = dict(headers)
+            request_headers["Range"] = (
+                f"bytes={segment.range_start}-"
+                f"{segment.range_start + segment.range_length - 1}"
+            )
+            request_headers["Accept-Encoding"] = "identity"
         last_error: Optional[Exception] = None
         for _attempt in range(1, 11):
             if self._cancelled:
@@ -701,24 +993,38 @@ class VideoDownloader:
                     self._lane_limiter.acquire(lambda: self._cancelled)
                     acquired = True
                 chunks: list[bytes] = []
+                received = 0
                 with self._session.get(
                     segment.url,
-                    headers=headers,
+                    headers=request_headers,
                     stream=True,
                     timeout=(10, 30),
                     allow_redirects=True,
                 ) as resp:
                     resp.raise_for_status()
+                    if is_ranged:
+                        self._validate_hls_range_response(resp, segment)
                     for chunk in resp.iter_content(chunk_size=256 * 1024):
                         if self._cancelled:
                             raise RuntimeError("Download cancelled")
                         if chunk:
+                            received += len(chunk)
+                            if is_ranged and received > segment.range_length:
+                                raise _HlsByteRangeError(
+                                    "HLS byte-range response contains too many bytes"
+                                )
                             chunks.append(chunk)
+                    if is_ranged and received != segment.range_length:
+                        raise _HlsByteRangeError(
+                            "HLS byte-range response is shorter than the requested range"
+                        )
                 data = b"".join(chunks)
                 if segment.key and segment.iv:
                     data = _aes_cbc_decrypt_bytes(data, segment.key, segment.iv)
                     data = _strip_pkcs7_padding(data)
                 return data
+            except _HlsByteRangeError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 if self._cancelled:
                     raise
@@ -726,7 +1032,37 @@ class VideoDownloader:
             finally:
                 if acquired and self._lane_limiter is not None:
                     self._lane_limiter.release()
-        raise RuntimeError(f"Failed to download HLS segment {segment.index}: {last_error}")
+        error_class = _HlsByteRangeError if is_ranged else RuntimeError
+        raise error_class(f"Failed to download HLS segment {segment.index}: {last_error}")
+
+    @staticmethod
+    def _validate_hls_range_response(resp: requests.Response, segment: _HlsSegment) -> None:
+        """Require exact, uncompressed bytes before accepting a ranged segment."""
+        if resp.status_code != 206:
+            raise _HlsByteRangeError(
+                f"HLS byte-range request expected HTTP 206, got {resp.status_code}"
+            )
+        encoding = resp.headers.get("Content-Encoding", "identity").strip().lower()
+        if encoding != "identity":
+            raise _HlsByteRangeError("Compressed HLS byte-range responses are not supported")
+        value = resp.headers.get("Content-Range", "")
+        match = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", value.strip())
+        if match is None:
+            raise _HlsByteRangeError(f"Invalid HLS Content-Range: {value!r}")
+        start, end = int(match.group(1)), int(match.group(2))
+        expected_end = segment.range_start + segment.range_length - 1
+        if (
+            start != segment.range_start
+            or end != expected_end
+            or (match.group(3) != "*" and int(match.group(3)) <= end)
+        ):
+            raise _HlsByteRangeError(f"Incorrect HLS Content-Range: {value!r}")
+        content_length = resp.headers.get("Content-Length")
+        if content_length is not None and (
+            re.fullmatch(r"[0-9]+", content_length.strip()) is None
+            or int(content_length) != segment.range_length
+        ):
+            raise _HlsByteRangeError("Incorrect HLS byte-range Content-Length")
 
     def _write_ffmpeg_concat_list(self, sources: list[Path], target: Path) -> None:
         with open(target, "w", encoding="utf-8") as file:

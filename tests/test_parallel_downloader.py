@@ -9,6 +9,7 @@ import errno
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -106,7 +107,7 @@ class FakeSession:
         range_header = headers.get("Range")
         with self._lock:
             self.requested_ranges.append(range_header)
-        if range_header is None and self.stream_barrier is not None:
+        if range_header != "bytes=0-1" and self.stream_barrier is not None:
             self.stream_barrier.wait(timeout=5)
 
         if self.supports_ranges and range_header is not None:
@@ -316,6 +317,7 @@ class ParallelDownloaderTests(unittest.TestCase):
                     self.assertEqual(output.read_bytes(), b"previous download")
                     self.assert_no_part_files(output.parent)
 
+    @unittest.skipUnless(hasattr(parallel_downloader.os, "pwrite"), "No os.pwrite")
     def test_short_disk_writes_are_retried(self) -> None:
         session = FakeSession(PAYLOAD, supports_ranges=True)
         downloader = self.make_downloader(session)
@@ -333,6 +335,126 @@ class ParallelDownloaderTests(unittest.TestCase):
                 downloader.close()
 
             self.assertEqual(result.path.read_bytes(), PAYLOAD)
+
+    def test_missing_pwrite_single_stream_preserves_binary_bytes(self) -> None:
+        session = FakeSession(PAYLOAD, supports_ranges=False)
+        downloader = self.make_downloader(session)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "single.bin"
+            try:
+                with mock.patch.object(
+                    parallel_downloader.os, "pwrite", None, create=True
+                ):
+                    del parallel_downloader.os.pwrite
+                    result = downloader.download("http://example.test/media", output)
+            finally:
+                downloader.close()
+
+            self.assertEqual(result.path.read_bytes(), PAYLOAD)
+            self.assertEqual(result.size, len(PAYLOAD))
+            self.assert_no_part_files(output.parent)
+
+    def test_missing_pwrite_concurrent_segments_retry_short_writes(self) -> None:
+        session = FakeSession(
+            PAYLOAD, supports_ranges=True, stream_barrier=threading.Barrier(4)
+        )
+        downloader = self.make_downloader(session)
+        original_seek = parallel_downloader.os.lseek
+        original_write = parallel_downloader.os.write
+        writes = []
+
+        def seek_then_yield(fd: int, offset: int, whence: int) -> int:
+            position = original_seek(fd, offset, whence)
+            # Let other workers run between seek and write. The downloader
+            # must protect the shared pointer through every partial write.
+            time.sleep(0.001)
+            return position
+
+        def write_part(fd: int, data: bytes) -> int:
+            writes.append(len(data))
+            count = original_write(fd, data[: max(1, len(data) // 2)])
+            time.sleep(0.0001)
+            return count
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "range.bin"
+            try:
+                with mock.patch.object(
+                    parallel_downloader.os, "pwrite", None, create=True
+                ), mock.patch.object(
+                    parallel_downloader.os, "lseek", seek_then_yield
+                ), mock.patch.object(
+                    parallel_downloader.os, "write", write_part
+                ):
+                    del parallel_downloader.os.pwrite
+                    result = downloader.download("http://example.test/media", output)
+            finally:
+                downloader.close()
+
+            self.assertEqual(result.path.read_bytes(), PAYLOAD)
+            self.assertEqual(result.size, len(PAYLOAD))
+            self.assertGreater(len(writes), len(PAYLOAD) // downloader.chunk_size)
+            self.assert_no_part_files(output.parent)
+
+    def test_missing_pwrite_write_failure_cleans_up_partial_file(self) -> None:
+        original_write = parallel_downloader.os.write
+        for failure in ("zero", "exception"):
+            with self.subTest(failure=failure):
+                session = FakeSession(PAYLOAD, supports_ranges=True)
+                downloader = self.make_downloader(session)
+                writes = []
+
+                def write_then_fail(fd: int, data: bytes) -> int:
+                    writes.append(fd)
+                    if len(writes) == 1:
+                        return original_write(fd, data[:1])
+                    if failure == "zero":
+                        return 0
+                    raise OSError(errno.EIO, "disk write failed")
+
+                with tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / "existing.bin"
+                    output.write_bytes(b"previous download")
+                    try:
+                        with mock.patch.object(
+                            parallel_downloader.os, "pwrite", None, create=True
+                        ), mock.patch.object(
+                            parallel_downloader.os, "write", write_then_fail
+                        ):
+                            del parallel_downloader.os.pwrite
+                            with self.assertRaises(OSError):
+                                downloader.download("http://example.test/media", output)
+                    finally:
+                        downloader.close()
+
+                    self.assertEqual(output.read_bytes(), b"previous download")
+                    self.assert_no_part_files(output.parent)
+                    self.assertTrue(writes)
+                    with self.assertRaises(OSError):
+                        parallel_downloader.os.fstat(writes[0])
+
+    def test_temporary_descriptor_uses_binary_flag_when_available(self) -> None:
+        original_open = parallel_downloader.os.open
+        binary_flag = getattr(parallel_downloader.os, "O_BINARY", 1 << 28)
+        native_binary = hasattr(parallel_downloader.os, "O_BINARY")
+        observed_flags = []
+
+        def record_open(path: str, flags: int, mode: int) -> int:
+            observed_flags.append(flags)
+            # Strip the simulated flag only on platforms without O_BINARY.
+            native_flags = flags if native_binary else flags & ~binary_flag
+            return original_open(path, native_flags, mode)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                parallel_downloader.os, "O_BINARY", binary_flag, create=True
+            ):
+                with mock.patch.object(parallel_downloader.os, "open", record_open):
+                    fd, part = parallel_downloader._open_unique_part(Path(directory))
+                    parallel_downloader.os.close(fd)
+            self.assertEqual(len(observed_flags), 1)
+            self.assertTrue(observed_flags[0] & binary_flag)
+            part.unlink()
 
     def test_short_single_stream_preserves_existing_file(self) -> None:
         session = FakeSession(
