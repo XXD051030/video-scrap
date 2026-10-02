@@ -32,6 +32,8 @@ TikTok, Vimeo, Instagram, etc.).
 - Quality picker (best / 1080p / 720p / 480p / audio only).
 - Automatic ``Referer`` header for sites that hot-link-protect their CDN.
 - Custom output folder, with progress bar and live log.
+- Black-and-white themes: charcoal dark mode by default, with **Light mode** /
+  **Dark mode** in the top-right toolbar. The last choice is saved across restarts.
 
 ## Requirements
 
@@ -80,6 +82,66 @@ them. Select the video you want from the list when a post has multiple
 videos, and use **Play** to preview it before downloading.
 
 Files are saved to `./downloads` by default.
+
+## macOS app
+
+The packaged app runs without a separate Python installation. It includes
+Qt WebEngine, the media player backend and FFmpeg. Open `Video Scraper.app`
+by double-clicking it, or copy it into Applications. The app saves downloads
+to `~/Downloads/Video Scraper` by default; use **Choose…** to change the folder.
+Source runs still use `./downloads`.
+
+To rebuild with the isolated build environment prepared for this project:
+
+```bash
+build/.venv/bin/python -m pip install -r requirements.txt -r requirements-build.txt
+build/.venv/bin/python scripts/build_macos.py
+```
+
+Outputs are `dist/Video Scraper.app`, a ZIP preserving the bundle's symbolic
+links, and `dist/build-info.json` with dependency versions and source hashes.
+Build logs are saved under `build/macos/build.log`. The current build targets
+Apple Silicon and macOS 13 or newer. It uses an ad-hoc signature; a Developer
+ID signature and notarization are not configured.
+For a fresh build, create `build/.venv` using a Python runtime compiled for
+the intended macOS version. The builder checks the deployment targets of
+Python, Qt, FFmpeg and the resulting bundle: a Python runtime compiled only
+for macOS 27 also makes the resulting app require macOS 27. This build uses
+Python 3.12.14 with a macOS 11 deployment target; Qt sets the final minimum
+to macOS 13. Minimum-version metadata has been checked; actual execution has
+been tested on the current macOS 27.0.1 host.
+
+The bundled offline check uses temporary settings, a local test server and
+generated sample media, without reading browser login information:
+
+```bash
+"dist/Video Scraper.app/Contents/MacOS/Video Scraper" --smoke-test /tmp/video-scraper-smoke.json
+```
+
+Packaging uses [PyInstaller](https://pyinstaller.org/en/stable/usage.html)
+and the FFmpeg executable supplied by
+[imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg).
+Third-party license texts are included in the app's Resources directory.
+
+## Windows app
+
+Build the Windows x64 version on Windows using 64-bit Python 3.12:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-build.txt
+.\.venv\Scripts\python.exe scripts\build_windows.py
+```
+
+The result is `dist/Video Scraper/Video Scraper.exe` with its dependency folder
+and `dist/VideoScraper-Windows-x64.zip`. Distribute the entire ZIP; keep the
+executable and `_internal` folder together. Both builds use the root `Logo.png`
+for the application icon. The Windows build script bundles FFmpeg and uses the
+same offline check as the macOS build. Windows execution has not yet been tested.
+
+See [the Windows step-by-step guide](WINDOWS_BUILD.md) for source copying,
+verification and troubleshooting. PyInstaller requires separate builds on
+each [target operating system](https://pyinstaller.org/en/stable/).
 
 ## Project layout
 

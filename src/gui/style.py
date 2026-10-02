@@ -1,14 +1,15 @@
 """Centralised theming: a Theme token set plus the global Qt stylesheet.
 
-Two themes ship today -- a warm graphite dark mode and a Claude-style
-warm-cream light mode. Everything visual flows from a ``Theme`` instance,
-so switching is just ``app.setStyleSheet(build_stylesheet(theme))`` plus a
-re-style of the handful of widgets that paint themselves inline.
+Two neutral themes ship today: charcoal dark mode and white light mode.
+Visuals flow from a ``Theme`` instance, including the Qt palette for
+controls that aren't fully painted by the stylesheet.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from PyQt6.QtGui import QColor, QPalette
 
 
 # Geometry is shared across themes.
@@ -63,59 +64,59 @@ class Theme:
 
 DARK = Theme(
     name="dark",
-    bg="#1f1e1d",
-    surface="#262624",
-    surface_alt="#2e2d2b",
-    border="#3a3937",
-    border_strong="#4a4845",
-    text="#eceae3",
-    text_muted="#a3a199",
-    text_dim="#6f6d66",
-    accent="#d97757",
-    accent_hover="#e08a6b",
-    accent_pressed="#c2664a",
-    accent_text="#ffffff",
-    accent_soft="rgba(217, 119, 87, 0.20)",
-    accent_disabled_bg="#4a3a33",
-    accent_disabled_text="#8a7a70",
-    button_bg="#2e2d2b",
-    button_hover="#36342f",
-    button_pressed="#211f1d",
+    bg="#111111",
+    surface="#1b1b1b",
+    surface_alt="#262626",
+    border="#343434",
+    border_strong="#484848",
+    text="#f5f5f5",
+    text_muted="#b3b3b3",
+    text_dim="#949494",
+    accent="#f0f0f0",
+    accent_hover="#ffffff",
+    accent_pressed="#d4d4d4",
+    accent_text="#111111",
+    accent_soft="rgba(240, 240, 240, 0.10)",
+    accent_disabled_bg="#303030",
+    accent_disabled_text="#858585",
+    button_bg="#262626",
+    button_hover="#333333",
+    button_pressed="#1a1a1a",
     success="#5fb87e",
     warning="#e2b23c",
     error="#e0685d",
     media_bg="#000000",
-    scrollbar="#4a4845",
-    scrollbar_hover="#5a5854",
+    scrollbar="#484848",
+    scrollbar_hover="#666666",
 )
 
 
 LIGHT = Theme(
     name="light",
-    bg="#f5f4ee",
+    bg="#f5f5f5",
     surface="#ffffff",
-    surface_alt="#efeee6",
-    border="#e3e1d7",
-    border_strong="#d2cfc3",
-    text="#23211e",
-    text_muted="#6b6a63",
-    text_dim="#95938b",
-    accent="#c96442",
-    accent_hover="#d97757",
-    accent_pressed="#b0573a",
+    surface_alt="#ededed",
+    border="#d8d8d8",
+    border_strong="#b8b8b8",
+    text="#181818",
+    text_muted="#555555",
+    text_dim="#6b6b6b",
+    accent="#181818",
+    accent_hover="#333333",
+    accent_pressed="#000000",
     accent_text="#ffffff",
-    accent_soft="rgba(201, 100, 66, 0.14)",
-    accent_disabled_bg="#ecd2c6",
-    accent_disabled_text="#b79c90",
+    accent_soft="rgba(24, 24, 24, 0.08)",
+    accent_disabled_bg="#dedede",
+    accent_disabled_text="#777777",
     button_bg="#ffffff",
-    button_hover="#f2f0e8",
-    button_pressed="#e8e6dc",
+    button_hover="#eeeeee",
+    button_pressed="#e2e2e2",
     success="#3e9b63",
     warning="#c8901f",
     error="#c9544b",
     media_bg="#000000",
-    scrollbar="#d2cfc3",
-    scrollbar_hover="#bbb8ac",
+    scrollbar="#b8b8b8",
+    scrollbar_hover="#949494",
 )
 
 
@@ -126,6 +127,43 @@ DEFAULT_THEME = DARK.name
 def get_theme(name: str) -> Theme:
     """Return the theme for ``name``, falling back to the default."""
     return THEMES.get(name, THEMES[DEFAULT_THEME])
+
+
+def build_palette(theme: Theme) -> QPalette:
+    """Keep unstyled Qt controls in sync with the chosen theme."""
+    palette = QPalette()
+    role = QPalette.ColorRole
+    colors = {
+        role.Window: theme.bg,
+        role.WindowText: theme.text,
+        role.Base: theme.surface,
+        role.AlternateBase: theme.surface_alt,
+        role.ToolTipBase: theme.surface_alt,
+        role.ToolTipText: theme.text,
+        role.Text: theme.text,
+        role.Button: theme.button_bg,
+        role.ButtonText: theme.text,
+        role.BrightText: theme.accent_text,
+        role.Link: theme.accent,
+        role.LinkVisited: theme.text_muted,
+        role.Highlight: theme.accent,
+        role.HighlightedText: theme.accent_text,
+        role.Accent: theme.accent,
+        role.PlaceholderText: theme.text_dim,
+        role.Light: theme.border_strong,
+        role.Midlight: theme.surface_alt,
+        role.Mid: theme.border,
+        role.Dark: theme.border,
+        role.Shadow: theme.media_bg,
+    }
+    for color_role, color in colors.items():
+        palette.setColor(color_role, QColor(color))
+    disabled = QPalette.ColorGroup.Disabled
+    for color_role in (role.WindowText, role.Text, role.ButtonText):
+        palette.setColor(disabled, color_role, QColor(theme.text_dim))
+    palette.setColor(disabled, role.Highlight, QColor(theme.accent_disabled_bg))
+    palette.setColor(disabled, role.HighlightedText, QColor(theme.accent_disabled_text))
+    return palette
 
 
 def build_stylesheet(theme: Theme) -> str:
@@ -175,6 +213,16 @@ def build_stylesheet(theme: Theme) -> str:
     QToolBar QToolButton:pressed {{
         background-color: {t.surface_alt};
     }}
+    QToolButton#ThemeToggle {{
+        background-color: {t.surface};
+        color: {t.text};
+        border: 1px solid {t.border};
+        padding: 6px 12px;
+    }}
+    QToolButton#ThemeToggle:hover {{
+        background-color: {t.button_hover};
+        border-color: {t.border_strong};
+    }}
 
     /* ---------- Labels ---------- */
     QLabel {{
@@ -221,7 +269,7 @@ def build_stylesheet(theme: Theme) -> str:
         border-radius: {RADIUS}px;
     }}
     QLabel#ThumbHint {{
-        color: {t.text_muted};
+        color: {DARK.text_muted};
         background-color: transparent;
         font-size: 14px;
     }}
@@ -420,11 +468,11 @@ def build_stylesheet(theme: Theme) -> str:
         border: 1px solid {t.border};
         border-radius: 6px;
         text-align: center;
-        color: {t.text_muted};
+        color: {t.text};
         font-size: 11px;
     }}
     QProgressBar::chunk {{
-        background-color: {t.accent};
+        background-color: {t.border_strong};
         border-radius: 6px;
     }}
     QFrame#DownloadRow {{

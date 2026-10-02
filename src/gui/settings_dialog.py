@@ -18,7 +18,6 @@ from ..settings import (
     PLAYBACK_BUFFER_MIN,
     SettingsStore,
 )
-from .style import get_theme
 
 
 class SettingsDialog(QDialog):
@@ -32,7 +31,6 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(420)
 
         current = store.get()
-        theme = get_theme(current.theme)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 18, 20, 16)
@@ -44,7 +42,7 @@ class SettingsDialog(QDialog):
             "but uses more temporary disk space."
         )
         intro.setWordWrap(True)
-        intro.setStyleSheet(f"color: {theme.text_muted};")
+        intro.setProperty("role", "muted")
         root.addWidget(intro)
 
         form = QFormLayout()
@@ -71,9 +69,7 @@ class SettingsDialog(QDialog):
             "folder and cleared when the app quits."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet(
-            f"color: {theme.text_dim}; font-size: 12px;"
-        )
+        hint.setProperty("role", "dim")
         root.addWidget(hint)
 
         root.addStretch(1)
@@ -92,6 +88,11 @@ class SettingsDialog(QDialog):
         if cancel is not None:
             cancel.setObjectName("Ghost")
             cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        # The button box may polish its buttons before we assign style names.
+        for button in (ok, cancel):
+            if button is not None:
+                button.style().unpolish(button)
+                button.style().polish(button)
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)

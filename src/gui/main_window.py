@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import List, Optional
 
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
@@ -36,7 +37,7 @@ from ..settings import SettingsStore
 from ..utils import format_bytes, is_valid_url
 from .preview_panel import PreviewPanel
 from .settings_dialog import SettingsDialog
-from .style import build_stylesheet, get_theme
+from .style import build_palette, build_stylesheet, get_theme
 from .video_list import VideoListWidget
 from .workers import DownloadWorker, ScrapeWorker
 
@@ -52,7 +53,11 @@ except Exception:  # noqa: BLE001
     InteractiveScrapeDialog = None  # type: ignore[assignment]
 
 
-DEFAULT_DOWNLOAD_DIR = Path.cwd() / "downloads"
+DEFAULT_DOWNLOAD_DIR = (
+    Path.home() / "Downloads" / "Video Scraper"
+    if getattr(sys, "frozen", False)
+    else Path.cwd() / "downloads"
+)
 MAX_ACTIVE_DOWNLOADS = 2
 DOWNLOAD_LANE_IDLE_BASE = 8
 DOWNLOAD_LANE_IDLE_MAX = 32
@@ -443,17 +448,16 @@ class MainWindow(QMainWindow):
         )
         toolbar.addWidget(spacer)
 
-        self.theme_action = QAction("☀", self)
+        self.theme_action = QAction("☀  Light mode", self)
         self.theme_action.triggered.connect(self._toggle_theme)
         toolbar.addAction(self.theme_action)
         theme_btn = toolbar.widgetForAction(self.theme_action)
         if theme_btn is not None:
+            theme_btn.setObjectName("ThemeToggle")
+            theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             theme_btn.setToolButtonStyle(
                 Qt.ToolButtonStyle.ToolButtonTextOnly
             )
-            font = theme_btn.font()
-            font.setPointSize(font.pointSize() + 3)
-            theme_btn.setFont(font)
 
     # ------------------------------------------------------------- helpers
 
@@ -1124,6 +1128,7 @@ class MainWindow(QMainWindow):
         self._theme = get_theme(name)
         app = QApplication.instance()
         if app is not None:
+            app.setPalette(build_palette(self._theme))
             app.setStyleSheet(build_stylesheet(self._theme))
         self.preview_panel.apply_theme(self._theme)
         self._update_theme_action_text()
@@ -1142,10 +1147,10 @@ class MainWindow(QMainWindow):
         if self.theme_action is None:
             return
         if self._theme_name == "dark":
-            self.theme_action.setText("☀")
+            self.theme_action.setText("☀  Light mode")
             self.theme_action.setToolTip("Switch to light theme")
         else:
-            self.theme_action.setText("☾")
+            self.theme_action.setText("☾  Dark mode")
             self.theme_action.setToolTip("Switch to dark theme")
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
