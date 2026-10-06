@@ -74,7 +74,7 @@ Select **audio only** under **Quality** to reveal the **Audio format** control:
 All download routes, including direct media links and HLS, apply the audio-only selection. If the source has no audio track, the task fails with a clear message instead of returning a video-only file. Sources without a separate audio stream may require the complete media to be downloaded first before extracting its audio. Intermediate media is temporary and is cleaned up after processing, cancellation, or failure; a forced process termination can leave temporary files behind.
 For an HLS master with separate audio, the app selects the default audio rendition from the selected video variant's audio group. It retains the default embedded track when that rendition has no separate URL. Audio segment downloads use the same byte-range checks as video downloads.
 
-Audio extraction and conversion require FFmpeg; the packaged app includes it. Each queued task keeps the format selected when you clicked **Download current**, even if you change the controls afterward. A processing message is shown while extraction or conversion runs.
+Audio extraction and conversion require FFmpeg; the packaged app includes it. Source runs use the FFmpeg discovery described below. Each queued task keeps the format selected when you clicked **Download current**, even if you change the controls afterward. A processing message is shown while extraction or conversion runs.
 Use the macOS package rebuilt on October 6, 2026, for this feature. Earlier version 0.2.0 packages lack these audio-format controls; rebuild on Windows to include the update there.
 
 Fullscreen mode retains playback, seek, volume, and mute controls. Fullscreen switching also works while paused and does not restart the video.
@@ -117,7 +117,7 @@ git pull --ff-only
 ## Run from Source
 
 Python 3.10 or newer is required; 64-bit Python 3.12 is recommended.
-Runtime dependencies are listed in `requirements.txt`.
+Runtime dependencies are listed in `requirements.txt`, including `imageio-ffmpeg==0.6.0`. Its platform-specific wheels include an FFmpeg executable, so a supported pip installation can run audio downloads without a separate FFmpeg installation.
 
 ### macOS / Linux
 
@@ -135,12 +135,31 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe main.py
 ```
 
-When running from source, HLS merging and some video/audio merging operations require the FFmpeg command-line tool.
-On macOS, install it with:
+### FFmpeg Discovery
+
+All audio-only downloads, HLS remuxing, and some yt-dlp video/audio merging operations require FFmpeg. The app first uses `ffmpeg` from the system `PATH`, then checks the application's bundled or local build executable, and finally tries the executable provided by `imageio-ffmpeg`. When using a fallback executable, the app also tells yt-dlp where to find it for merging.
+
+For an existing source checkout, update the runtime dependencies before launching again:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Use the Python executable from your virtual environment: `.venv/bin/python` on macOS/Linux or `.\.venv\Scripts\python.exe` in Windows PowerShell. Source runs do not require `requirements-build.txt` or a packaged application.
+
+If your platform has no compatible wheel, the supplied executable is unusable, or `imageio-ffmpeg` was installed without its binary, install FFmpeg separately and make `ffmpeg` available on `PATH`. On macOS, for example:
 
 ```bash
 brew install ffmpeg
 ```
+
+On Linux, use your distribution's FFmpeg package where needed. On Windows, add the directory containing `ffmpeg.exe` to `PATH` and restart the terminal before launching the app. You can check what the source app resolves with:
+
+```powershell
+.\.venv\Scripts\python.exe -c "from src.ffmpeg import resolve_ffmpeg; print(resolve_ffmpeg() or 'FFmpeg not found')"
+```
+
+The runtime does not download FFmpeg when a task starts. If no usable executable is found, the download reports the missing dependency instead of silently producing an incorrect file. `imageio-ffmpeg` supplies FFmpeg, not FFprobe; this app's audio extraction does not require FFprobe.
 
 The build scripts below bundle FFmpeg with the application. Packaged applications do not require a separate Python or FFmpeg installation.
 

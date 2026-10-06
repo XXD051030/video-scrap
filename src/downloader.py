@@ -29,6 +29,7 @@ except Exception:  # noqa: BLE001
     _CryptoAES = None
 
 from .net import build_session
+from .ffmpeg import resolve_ffmpeg
 from .parallel_downloader import ParallelDownloader, _publish_unique
 from .scraper import VideoItem, is_x_post_url
 from .utils import safe_filename
@@ -275,7 +276,7 @@ class VideoDownloader:
         if audio_only:
             if audio_format not in AUDIO_FORMATS:
                 raise ValueError(f"Unsupported audio format: {audio_format}")
-            if not shutil.which("ffmpeg"):
+            if not resolve_ffmpeg():
                 raise RuntimeError("FFmpeg is required for audio-only downloads")
         destination = self.output_dir
         final_progress: Optional[DownloadProgress] = None
@@ -379,7 +380,7 @@ class VideoDownloader:
         allow_cancelled: bool = False,
     ) -> Path:
         """Publish only audio, even when the source has no independent audio URL."""
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = resolve_ffmpeg()
         if not ffmpeg:
             raise RuntimeError("FFmpeg is required for audio-only downloads")
         if on_progress is not None:
@@ -476,7 +477,7 @@ class VideoDownloader:
                     if self._cancelled:
                         raise
                     self._discard_staged_outputs()
-                    ffmpeg = shutil.which("ffmpeg")
+                    ffmpeg = resolve_ffmpeg()
                     if not ffmpeg:
                         raise
                     if on_progress is not None:
@@ -563,6 +564,11 @@ class VideoDownloader:
             "socket_timeout": 60,
             "http_headers": http_headers,
         }
+        ffmpeg = resolve_ffmpeg()
+        # Keep yt-dlp's existing PATH/ffprobe discovery when the system tool
+        # is available; non-PATH fallback binaries need their exact location.
+        if ffmpeg and not shutil.which("ffmpeg"):
+            ydl_opts["ffmpeg_location"] = ffmpeg
 
         if is_x_item:
             ydl_opts["overwrites"] = False
@@ -637,7 +643,7 @@ class VideoDownloader:
             segments = self._parse_hls_segments(manifest_text, manifest_url, headers)
             if not segments:
                 raise RuntimeError("HLS manifest did not contain media segments")
-            ffmpeg = shutil.which("ffmpeg")
+            ffmpeg = resolve_ffmpeg()
             if not ffmpeg:
                 raise RuntimeError("ffmpeg is required for HLS remuxing")
             return self._download_hls_segments_parallel(
@@ -1391,6 +1397,9 @@ class VideoDownloader:
             "socket_timeout": 60,
             "http_headers": build_request_headers(item.referer),
         }
+        ffmpeg = resolve_ffmpeg()
+        if ffmpeg and not shutil.which("ffmpeg"):
+            ydl_opts["ffmpeg_location"] = ffmpeg
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             result = ydl.download([item.url])

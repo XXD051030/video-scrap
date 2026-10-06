@@ -185,7 +185,7 @@ other.ts
         old.write_bytes(b"older complete video")
         downloader = self.downloader()
         updates = []
-        with mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"), \
+        with mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"), \
                 mock.patch.object(downloader, "_remux_hls_segments", side_effect=self.remux), \
                 mock.patch("src.downloader.yt_dlp.YoutubeDL") as fallback:
             result = downloader.download(self.item(), on_progress=updates.append)
@@ -221,7 +221,7 @@ other.ts
             with self.subTest(name=name):
                 downloader = self.downloader(text, lambda _url, _kwargs: response)
                 with ExitStack() as stack:
-                    stack.enter_context(mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"))
+                    stack.enter_context(mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"))
                     fallback = stack.enter_context(mock.patch("src.downloader.yt_dlp.YoutubeDL"))
                     ffmpeg_fallback = stack.enter_context(mock.patch.object(downloader, "_download_hls_ffmpeg"))
                     remux = stack.enter_context(mock.patch.object(downloader, "_remux_hls_segments"))
@@ -270,7 +270,7 @@ blob.ts
             })
 
         downloader = self.downloader(text, respond)
-        with mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"), \
+        with mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"), \
                 mock.patch.object(downloader, "_remux_hls_segments", side_effect=self.remux):
             result = downloader.download(self.item())
         self.assertEqual(result.read_bytes(), b"".join(clear_segments))
@@ -295,7 +295,7 @@ blob.ts
                 release_second.set()
 
         try:
-            with mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"), \
+            with mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"), \
                     mock.patch.object(downloader, "_remux_hls_segments", side_effect=self.remux), \
                     mock.patch("src.downloader.yt_dlp.YoutubeDL") as fallback:
                 result = downloader.download(self.item(), on_progress=progress)
@@ -312,7 +312,7 @@ blob.ts
         for text in (RANGE_MANIFEST, '#EXTM3U\n#EXT-X-MAP:URI="blob.ts",BYTERANGE="2@0"\nwhole.ts'):
             with self.subTest(manifest=text):
                 downloader = self.downloader(text)
-                with mock.patch("src.downloader.shutil.which", return_value=None), \
+                with mock.patch("src.downloader.resolve_ffmpeg", return_value=None), \
                         mock.patch("src.downloader.yt_dlp.YoutubeDL") as fallback, \
                         mock.patch.object(downloader, "_download_hls_ffmpeg") as ffmpeg_fallback:
                     with self.assertRaises(_HlsByteRangeError):
@@ -335,7 +335,7 @@ blob.ts
                     return original_get(url, **kwargs)
 
                 with mock.patch.object(downloader._session, "get", side_effect=failed_get), \
-                        mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"), \
+                        mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"), \
                         mock.patch.object(downloader, "_download_hls_ytdlp") as fallback, \
                         mock.patch.object(downloader, "_download_hls_ffmpeg") as ffmpeg_fallback:
                     with self.assertRaises(_HlsByteRangeError):
@@ -354,7 +354,7 @@ blob.ts
         for child in children:
             with self.subTest(child=child):
                 downloader = self.downloader(master, lambda _url, _kwargs: FakeResponse(child.encode(), url=child_url))
-                with mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"), \
+                with mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"), \
                         mock.patch.object(downloader, "_download_hls_ytdlp") as fallback, \
                         mock.patch.object(downloader, "_download_hls_ffmpeg") as ffmpeg_fallback:
                     with self.assertRaises(_HlsByteRangeError):
@@ -371,7 +371,7 @@ blob.ts
             output.write_bytes(b"plain HLS fallback")
             return output
 
-        with mock.patch("src.downloader.shutil.which", return_value=None), \
+        with mock.patch("src.downloader.resolve_ffmpeg", return_value=None), \
                 mock.patch.object(downloader, "_download_hls_ytdlp", side_effect=fallback) as fallback_backend:
             result = downloader.download(self.item())
         self.assertEqual(result.read_bytes(), b"plain HLS fallback")
@@ -402,7 +402,7 @@ ranged.m3u8
                     return output
 
                 with ExitStack() as stack:
-                    stack.enter_context(mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"))
+                    stack.enter_context(mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"))
                     stack.enter_context(mock.patch.object(downloader, "_download_hls_segments_parallel", side_effect=RuntimeError("native failed")))
                     ytdlp = stack.enter_context(mock.patch.object(downloader, "_download_hls_ytdlp",
                         side_effect=finished if backend == "yt-dlp" else RuntimeError("yt-dlp failed")))
@@ -446,7 +446,7 @@ other.m3u8
             output.write_bytes(b"verified video with audio")
             return output
 
-        with mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"), \
+        with mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"), \
                 mock.patch.object(downloader, "_download_hls_segments_parallel", side_effect=RuntimeError("native failed")), \
                 mock.patch.object(downloader, "_download_hls_ytdlp", side_effect=RuntimeError("yt-dlp failed")) as ytdlp, \
                 mock.patch.object(downloader, "_download_hls_ffmpeg", side_effect=finished):
@@ -470,7 +470,7 @@ other.m3u8
                     return FakeResponse(text.encode(), url=url)
 
                 downloader = self.downloader(self.audio_master(), respond)
-                with mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"), \
+                with mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"), \
                         mock.patch.object(downloader, "_download_hls_segments_parallel", side_effect=RuntimeError("native failed")), \
                         mock.patch.object(downloader, "_download_hls_ytdlp") as ytdlp, \
                         mock.patch.object(downloader, "_download_hls_ffmpeg") as ffmpeg:
@@ -483,7 +483,7 @@ other.m3u8
 
     def test_range_network_failure_never_falls_back_or_publishes(self):
         downloader = self.downloader(respond=mock.Mock(side_effect=requests.ConnectionError("network down")))
-        with mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"), \
+        with mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"), \
                 mock.patch("src.downloader.yt_dlp.YoutubeDL") as fallback:
             with self.assertRaises(_HlsByteRangeError):
                 downloader.download(self.item())
@@ -497,7 +497,7 @@ other.m3u8
             target.write_bytes(b"incomplete output")
             raise RuntimeError("remux failed")
 
-        with mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"), \
+        with mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"), \
                 mock.patch.object(downloader, "_remux_hls_segments", side_effect=failed_remux), \
                 mock.patch("src.downloader.yt_dlp.YoutubeDL") as fallback:
             with self.assertRaises(_HlsByteRangeError):

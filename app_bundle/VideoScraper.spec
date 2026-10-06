@@ -22,7 +22,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[str(project / "app_bundle" / "runtime_hook.py")],
-    excludes=["tkinter", "PyQt5", "PySide2", "PySide6"],
+    # FFmpeg is already bundled in bin; imageio is only a source-run fallback.
+    excludes=["tkinter", "PyQt5", "PySide2", "PySide6", "imageio_ffmpeg"],
     noarchive=False,
     optimize=0,
 )

@@ -239,7 +239,7 @@ class DownloadNameReservationTests(unittest.TestCase):
                 ),
             ), mock.patch(
                 "src.downloader.yt_dlp.YoutubeDL", FailedWithFile
-            ), mock.patch("src.downloader.shutil.which", return_value=None):
+            ), mock.patch("src.downloader.resolve_ffmpeg", return_value=None):
                 with self.assertRaisesRegex(RuntimeError, "Native HLS download failed"):
                     downloader.download(item("Failed HLS", hls=True))
         finally:
@@ -296,7 +296,7 @@ class DownloadNameReservationTests(unittest.TestCase):
 
         try:
             with ExitStack() as stack:
-                stack.enter_context(mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"))
+                stack.enter_context(mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"))
                 self.patch_hls(
                     stack,
                     partial_job,
@@ -345,7 +345,7 @@ class DownloadNameReservationTests(unittest.TestCase):
 
         try:
             with ExitStack() as stack:
-                stack.enter_context(mock.patch("src.downloader.shutil.which", return_value="/fake/ffmpeg"))
+                stack.enter_context(mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"))
                 stack.enter_context(mock.patch("src.downloader.yt_dlp.YoutubeDL", FailedYoutubeDL))
                 stack.enter_context(
                     mock.patch.object(

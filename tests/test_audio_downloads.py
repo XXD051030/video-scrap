@@ -25,6 +25,7 @@ from urllib.parse import unquote, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.downloader import VideoDownloader, _HlsByteRangeError
+from src.ffmpeg import resolve_ffmpeg
 from src.scraper import VideoItem
 
 
@@ -196,12 +197,8 @@ class AudioDownloadTests(unittest.TestCase):
         self.output_tmp = tempfile.TemporaryDirectory(prefix="audio-test-downloads-")
         self.addCleanup(self.output_tmp.cleanup)
         self.output = Path(self.output_tmp.name)
-        original_which = shutil.which
         patcher = mock.patch(
-            "src.downloader.shutil.which",
-            side_effect=lambda program, *args, **kwargs: (
-                self.ffmpeg if program == "ffmpeg" else original_which(program, *args, **kwargs)
-            ),
+            "src.downloader.resolve_ffmpeg", return_value=self.ffmpeg,
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -473,12 +470,65 @@ class AudioDownloadTests(unittest.TestCase):
     def test_missing_ffmpeg_fails_before_transfer_and_leaves_no_files(self) -> None:
         with self.requests_lock:
             count = len(self.requests_seen)
-        with mock.patch("src.downloader.shutil.which", return_value=None):
+        with mock.patch("src.downloader.resolve_ffmpeg", return_value=None):
             with self.assertRaisesRegex(RuntimeError, "FFmpeg"):
                 self.downloader().download(self.item(), "audio only", audio_format="mp3")
         with self.requests_lock:
             self.assertEqual(len(self.requests_seen), count)
         self.assert_clean()
+
+    def test_source_audio_uses_imageio_without_path_or_build_assets(self) -> None:
+        """Exercise real discovery and conversion, not an injected tool path."""
+        from yt_dlp import YoutubeDL
+        from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
+
+        results = []
+        captured: list[dict] = []
+        website = VideoItem(title="Source audio", url="https://example.test/watch/1",
+                            source_url="https://example.test/watch/1")
+        with tempfile.TemporaryDirectory(prefix="audio-source-checkout-") as project:
+            with mock.patch("src.downloader.resolve_ffmpeg", resolve_ffmpeg), \
+                    mock.patch("src.ffmpeg.shutil.which", return_value=None), \
+                    mock.patch("src.ffmpeg.__file__", str(Path(project) / "src" / "ffmpeg.py")), \
+                    mock.patch("src.downloader.yt_dlp.YoutubeDL",
+                               self.fake_ydl(self.fixtures / "av.mp4", captured)):
+                binary = resolve_ffmpeg()
+                self.assertIsNotNone(binary)
+                # yt-dlp must support the provider's versioned filename too.
+                with YoutubeDL({"quiet": True, "ffmpeg_location": binary}) as ydl:
+                    processor = FFmpegPostProcessor(ydl)
+                    self.assertTrue(processor.available)
+                    self.assertEqual(processor.executable, binary)
+                for source in (self.item(), self.item("av.m3u8"), website):
+                    for format_name, codec in (("original", "aac"), ("mp3", "mp3"), ("m4a", "aac")):
+                        with self.subTest(source=source.url, audio_format=format_name):
+                            result = self.downloader().download(
+                                source, "audio only", audio_format=format_name,
+                            )
+                            results.append(result)
+                            self.assert_audio(result, codec)
+                hls = self.item("av.m3u8")
+                native = self.downloader()._download_hls_ytdlp(hls, None)
+                self.assertEqual(native.read_bytes(), (self.fixtures / "av.mp4").read_bytes())
+                results.append(native)
+                self.assertEqual(len(captured), 4)
+                self.assertTrue(all(options["ffmpeg_location"] == binary for options in captured))
+        self.assert_clean(*results)
+
+    def test_system_ffmpeg_keeps_ytdlp_default_tool_discovery(self) -> None:
+        captured: list[dict] = []
+        source = self.fixtures / "av.mp4"
+        item = VideoItem(title="System tools", url="https://example.test/watch/4",
+                         source_url="https://example.test/watch/4")
+        with mock.patch("src.downloader.shutil.which", return_value=self.ffmpeg), \
+                mock.patch("src.downloader.yt_dlp.YoutubeDL", self.fake_ydl(source, captured)):
+            result = self.downloader().download(item)
+            native = self.downloader()._download_hls_ytdlp(self.item("av.m3u8"), None)
+        self.assertEqual(result.read_bytes(), source.read_bytes())
+        self.assertEqual(native.read_bytes(), source.read_bytes())
+        self.assertEqual(len(captured), 2)
+        self.assertTrue(all("ffmpeg_location" not in options for options in captured))
+        self.assert_clean(result, native)
 
     def test_conversion_cancellation_never_publishes_partial_audio(self) -> None:
         downloader = self.downloader()

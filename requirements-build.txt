@@ -1,3 +1,3 @@
-# Build tools are separate from application runtime dependencies.
+# Packaging tools and the pinned FFmpeg binary provider.
 pyinstaller==6.22.3
 imageio-ffmpeg==0.6.0
