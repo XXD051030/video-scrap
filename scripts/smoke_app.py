@@ -220,6 +220,25 @@ def _run_smoke_test(report_path: str) -> int:
 
         check("preferences_dialog", preferences)
 
+        def about():
+            from src.gui.about_dialog import AboutDialog, GITHUB_URL
+
+            dialog = AboutDialog(window)
+            dialog.show()
+            app.processEvents()
+            assert not dialog.logo_label.pixmap().isNull()
+            assert dialog.logo_label.isVisible()
+            assert dialog.github_button.toolTip() == GITHUB_URL
+            assert dialog.github_button.isVisible()
+            assert dialog.version_label.text().startswith("Version ")
+            dialog.close_button.click()
+            assert not dialog.isVisible()
+            dialog.deleteLater()
+            app.processEvents()
+            return {"logo_loaded": True, "github_url": GITHUB_URL, "close_button": True}
+
+        check("about_dialog", about)
+
         def empty_fullscreen():
             panel = window.preview_panel
             panel.show_video(None)
@@ -251,6 +270,16 @@ def _run_smoke_test(report_path: str) -> int:
                        "-hls_list_size", "0", "-hls_flags", "single_file",
                        "-hls_segment_filename", str(root / "media.ts"),
                        str(root / "sample.m3u8"))
+            run_ffmpeg("-i", str(root / "sample.mp4"), "-map", "0:a:0", "-c", "copy",
+                       "-hls_time", "1", "-hls_list_size", "0", "-hls_flags", "single_file",
+                       "-hls_segment_filename", str(root / "audio.ts"),
+                       str(root / "sample-audio.m3u8"))
+            (root / "master-audio.m3u8").write_text(
+                '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="sound",NAME="Original",'
+                'DEFAULT=YES,AUTOSELECT=YES,URI="sample-audio.m3u8"\n'
+                '#EXT-X-STREAM-INF:BANDWIDTH=200000,RESOLUTION=160x90,AUDIO="sound"\n'
+                'missing-video.m3u8\n', encoding="utf-8"
+            )
             manifest = (root / "sample.m3u8").read_text()
             assert manifest.count("#EXT-X-BYTERANGE:") >= 2
             (root / "index.html").write_text(
@@ -288,6 +317,50 @@ def _run_smoke_test(report_path: str) -> int:
             return {"ranges": ranges, "decoded": True}
 
         check("hls_byte_range_download", hls_download)
+
+        def audio_downloads():
+            window.quality_combo.setCurrentText("audio only")
+            window.show()
+            app.processEvents()
+            assert window.audio_format_combo.isVisible()
+            assert window.audio_format_combo.currentData() == "original"
+            results = []
+            hls = VideoItem("Smoke HLS audio", base + "/sample.m3u8", base,
+                            ext="m3u8", is_direct=True, is_hls=True)
+            external_audio = VideoItem("Smoke separate audio", base + "/master-audio.m3u8", base,
+                                       ext="m3u8", is_direct=True, is_hls=True)
+            for item in (direct, hls, external_audio):
+                for audio_format, extension, codec in (
+                    ("original", ".m4a", "aac"),
+                    ("mp3", ".mp3", "mp3"),
+                    ("m4a", ".m4a", "aac"),
+                ):
+                    downloaded = downloader.download(
+                        item, quality="audio only", audio_format=audio_format
+                    )
+                    assert downloaded.suffix == extension
+                    probe = subprocess.run(
+                        [report["ffmpeg"], "-hide_banner", "-nostdin", "-i", str(downloaded)],
+                        capture_output=True, text=True, errors="replace", timeout=30,
+                    )
+                    assert probe.returncode == 1
+                    streams = [line for line in probe.stderr.splitlines()
+                               if re.match(r"\s*Stream #", line)]
+                    assert len(streams) == 1 and f"Audio: {codec}" in streams[0]
+                    run_ffmpeg("-xerror", "-i", str(downloaded), "-f", "null", "-")
+                    route = ("hls_external_audio" if item is external_audio
+                             else "hls" if item.is_hls else "direct")
+                    results.append({"route": route,
+                                    "format": audio_format, "codec": codec,
+                                    "audio_only": True, "decoded": True})
+            assert not list((root / "downloads").glob(".video-scrap-job-*"))
+            window.quality_combo.setCurrentText("best")
+            app.processEvents()
+            assert window.audio_format_row.isHidden()
+            window.hide()
+            return results
+
+        check("audio_only_downloads", audio_downloads)
 
         def preview():
             panel = window.preview_panel

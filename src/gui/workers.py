@@ -114,11 +114,13 @@ class DownloadWorker(QThread):
         parallel_connections: int = 8,
         lane_limiter: Optional[DownloadLaneLimiter] = None,
         parent: Optional[QObject] = None,
+        audio_format: str = "original",
     ) -> None:
         super().__init__(parent)
         self.items = items
         self.output_dir = output_dir
         self.quality = quality
+        self.audio_format = audio_format
         self.parallel_connections = parallel_connections
         self.lane_limiter = lane_limiter
         self._cancelled = False
@@ -152,6 +154,7 @@ class DownloadWorker(QThread):
                         item,
                         quality=self.quality,
                         on_progress=on_progress,
+                        audio_format=self.audio_format,
                     )
                     if not self._cancelled or final_path.exists():
                         self.item_finished.emit(index, str(final_path))

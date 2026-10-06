@@ -202,7 +202,7 @@ def build_stylesheet(theme: Theme) -> str:
         border: 1px solid {t.border};
         border-radius: {RADIUS}px;
     }}
-    QLabel[role="preferencesTitle"] {{
+    QLabel[role="preferencesTitle"], QLabel[role="aboutTitle"] {{
         font-size: 18px;
         font-weight: 600;
     }}

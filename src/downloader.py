@@ -42,6 +42,29 @@ QUALITY_FORMATS: Dict[str, str] = {
     "audio only": "bestaudio/best",
 }
 
+AUDIO_FORMATS = ("original", "mp3", "m4a")
+
+
+def _audio_output_format(codec: str, audio_format: str) -> tuple[str, list[str]]:
+    """Choose an audio container without silently recompressing original audio."""
+    if audio_format == "mp3":
+        return "mp3", (["-c:a", "copy"] if codec == "mp3"
+                       else ["-c:a", "libmp3lame", "-q:a", "2"])
+    if audio_format == "m4a":
+        return "m4a", (["-c:a", "copy"] if codec == "aac"
+                       else ["-c:a", "aac", "-b:a", "192k"])
+    extensions = {
+        "aac": "m4a", "alac": "m4a", "mp3": "mp3", "opus": "opus",
+        "vorbis": "ogg", "flac": "flac", "ac3": "ac3", "eac3": "eac3",
+        "dts": "dts", "wmav1": "wma", "wmav2": "wma",
+    }
+    # WAV supports these PCM representations. Uncommon codecs use Matroska;
+    # if it cannot hold the source codec, fail rather than change its quality.
+    wav_codecs = {"pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le",
+                  "pcm_f32le", "pcm_f64le", "pcm_alaw", "pcm_mulaw"}
+    extension = "wav" if codec in wav_codecs else extensions.get(codec, "mka")
+    return extension, ["-c:a", "copy"]
+
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -245,8 +268,15 @@ class VideoDownloader:
         item: VideoItem,
         quality: str = "best",
         on_progress: Optional[ProgressHandler] = None,
+        audio_format: str = "original",
     ) -> Path:
         """Keep each task's backend files private until its result is ready."""
+        audio_only = quality == "audio only"
+        if audio_only:
+            if audio_format not in AUDIO_FORMATS:
+                raise ValueError(f"Unsupported audio format: {audio_format}")
+            if not shutil.which("ffmpeg"):
+                raise RuntimeError("FFmpeg is required for audio-only downloads")
         destination = self.output_dir
         final_progress: Optional[DownloadProgress] = None
         with tempfile.TemporaryDirectory(
@@ -263,13 +293,36 @@ class VideoDownloader:
 
             try:
                 staged = self._download_to_stage(
-                    item, quality, relay if on_progress is not None else None
+                    item, quality, relay if on_progress is not None or audio_only else None
                 )
                 if (
                     not staged.is_file()
                     or staged.resolve().parent != self.output_dir.resolve()
                 ):
                     raise RuntimeError("Download did not produce a finished file")
+                if audio_only:
+                    keep_partial = bool(
+                        final_progress is not None
+                        and final_progress.status == "partial"
+                        and self._partial_on_cancel
+                    )
+                    staged = self._extract_audio(
+                        staged, audio_format, on_progress, allow_cancelled=keep_partial
+                    )
+                    if self._cancelled and not keep_partial:
+                        raise RuntimeError("Download cancelled")
+                    size = staged.stat().st_size
+                    final_progress = DownloadProgress(
+                        status="partial" if keep_partial else "completed",
+                        downloaded_bytes=size,
+                        total_bytes=size,
+                        filename=str(staged),
+                        message=(
+                            f"{final_progress.message}; audio saved ({audio_format})"
+                            if keep_partial and final_progress is not None
+                            else f"Audio saved ({audio_format})"
+                        ),
+                    )
                 published = _publish_unique(staged, destination / staged.name)
             finally:
                 self.output_dir = destination
@@ -277,6 +330,96 @@ class VideoDownloader:
         if on_progress is not None and final_progress is not None:
             on_progress(replace(final_progress, filename=str(published)))
         return published
+
+    def _run_audio_ffmpeg(
+        self, command: list[str], *, allow_cancelled: bool = False
+    ) -> tuple[int, str]:
+        """Keep probing and conversion cancellable, including on Windows."""
+        if self._cancelled and not allow_cancelled:
+            raise RuntimeError("Download cancelled")
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self._ffmpeg_proc = proc
+        try:
+            while True:
+                if self._cancelled and not allow_cancelled:
+                    raise RuntimeError("Download cancelled")
+                try:
+                    _stdout, stderr = proc.communicate(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            if self._cancelled and not allow_cancelled:
+                raise RuntimeError("Download cancelled")
+            return proc.returncode, stderr or ""
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+            if self._ffmpeg_proc is proc:
+                self._ffmpeg_proc = None
+
+    def _extract_audio(
+        self,
+        source: Path,
+        audio_format: str,
+        on_progress: Optional[ProgressHandler],
+        *,
+        allow_cancelled: bool = False,
+    ) -> Path:
+        """Publish only audio, even when the source has no independent audio URL."""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("FFmpeg is required for audio-only downloads")
+        if on_progress is not None:
+            on_progress(DownloadProgress(
+                status="finished", filename=str(source),
+                message=("Extracting original audio..." if audio_format == "original"
+                         else f"Preparing {audio_format.upper()} audio..."),
+            ))
+        # The bundled tool is FFmpeg, not FFprobe. Input inspection reads the
+        # stream headers and exits without decoding the complete media file.
+        code, probe = self._run_audio_ffmpeg(
+            [ffmpeg, "-hide_banner", "-nostdin", "-i", str(source)],
+            allow_cancelled=allow_cancelled,
+        )
+        match = re.search(
+            r"^\s*Stream #\d+:\d+(?:\[[^\]\r\n]+\])?"
+            r"(?:\([^\)\r\n]+\))?: Audio:\s+([a-zA-Z0-9_]+)",
+            probe, re.MULTILINE,
+        )
+        if code != 1 or match is None:
+            raise RuntimeError("No readable audio track was found in the downloaded media")
+        extension, codec_args = _audio_output_format(match.group(1).lower(), audio_format)
+        target = source.with_suffix(f".{extension}")
+        # Never give FFmpeg the same input/output path. Replacement happens
+        # only after success and is confined to this task's private directory.
+        with tempfile.TemporaryDirectory(prefix=".audio-", dir=source.parent) as directory:
+            converted = Path(directory) / target.name
+            code, stderr = self._run_audio_ffmpeg(
+                [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
+                 "-i", str(source), "-map", "0:a:0", "-vn", "-sn", "-dn",
+                 *codec_args, str(converted)],
+                allow_cancelled=allow_cancelled,
+            )
+            if code or not converted.is_file() or converted.stat().st_size == 0:
+                detail = "\n".join(stderr.splitlines()[-8:])
+                raise RuntimeError(f"Audio extraction failed: {detail or 'FFmpeg produced no audio file'}")
+            if self._cancelled and not allow_cancelled:
+                raise RuntimeError("Download cancelled")
+            converted.replace(target)
+        return target
 
     def _discard_staged_outputs(self) -> None:
         """Remove an unsuccessful HLS backend's files before trying another."""
@@ -299,6 +442,8 @@ class VideoDownloader:
         # through it. Only single-file direct URLs use the parallel path.
         if item.is_direct and item.is_hls:
             try:
+                if quality == "audio only":
+                    return self._download_hls_parallel(item, on_progress, audio_only=True)
                 return self._download_hls_parallel(item, on_progress)
             except _HlsByteRangeError:
                 # yt-dlp's HTTP backend can accept a whole-file 200 or an
@@ -366,6 +511,8 @@ class VideoDownloader:
             final_path["path"] = filename
 
         def hook(data: Dict) -> None:
+            if quality == "audio only" and self._cancelled:
+                raise RuntimeError("Download cancelled")
             status = data.get("status", "")
             if status == "downloading":
                 progress = DownloadProgress(
@@ -450,6 +597,8 @@ class VideoDownloader:
         self,
         item: VideoItem,
         on_progress: Optional[ProgressHandler],
+        *,
+        audio_only: bool = False,
     ) -> Path:
         """Download HLS segments concurrently, then remux to mp4."""
         title = safe_filename(item.title)
@@ -467,9 +616,14 @@ class VideoDownloader:
             )
 
         try:
-            manifest_url, manifest_text, master_context = self._fetch_hls_manifest(
-                item.url, headers
-            )
+            if audio_only:
+                manifest_url, manifest_text, master_context = self._fetch_hls_manifest(
+                    item.url, headers, audio_only=True
+                )
+            else:
+                manifest_url, manifest_text, master_context = self._fetch_hls_manifest(
+                    item.url, headers
+                )
         except _HlsByteRangeError:
             raise
         except Exception as exc:
@@ -673,6 +827,7 @@ class VideoDownloader:
         headers: Dict[str, str],
         *,
         media_only: bool = False,
+        audio_only: bool = False,
     ) -> tuple[str, str, Optional[_HlsMasterContext]]:
         with self._session.get(
             url, headers=headers, timeout=(10, 60), allow_redirects=True
@@ -688,9 +843,18 @@ class VideoDownloader:
         if variant is None:
             self._validate_hls_media_manifest(text)
             return final_url, text, None
+        audio_variant = None
+        if audio_only:
+            audio_variant = self._pick_hls_audio_rendition(text, final_url, variant)
+            if audio_variant is not None:
+                # Inspect and download this audio playlist with the same range
+                # validation as ordinary HLS. Fallbacks must stay on it, rather
+                # than revisit the master and select unchecked media choices.
+                variant = audio_variant
         master_context = (
             _HlsMasterContext(final_url, text)
-            if self._hls_variant_has_external_audio(text, final_url, variant)
+            if audio_variant is None
+            and self._hls_variant_has_external_audio(text, final_url, variant)
             else None
         )
         with self._session.get(
@@ -700,6 +864,40 @@ class VideoDownloader:
             child_url, child_text = child.url, child.text
         self._validate_hls_media_manifest(child_text)
         return child_url, child_text, master_context
+
+    @staticmethod
+    def _pick_hls_audio_rendition(
+        text: str, manifest_url: str, variant_url: str
+    ) -> Optional[str]:
+        group = None
+        group_score = -1
+        stream_attrs: Dict[str, str] = {}
+        renditions = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if line.startswith("#EXT-X-MEDIA:"):
+                attrs = _parse_m3u8_attrs(line.split(":", 1)[1])
+                if attrs.get("TYPE") == "AUDIO":
+                    renditions.append(attrs)
+            elif line.startswith("#EXT-X-STREAM-INF:"):
+                stream_attrs = _parse_m3u8_attrs(line.split(":", 1)[1])
+            elif line and not line.startswith("#"):
+                if urljoin(manifest_url, line) == variant_url:
+                    bandwidth = int(stream_attrs.get("BANDWIDTH") or 0)
+                    if bandwidth > group_score:
+                        group, group_score = stream_attrs.get("AUDIO"), bandwidth
+                stream_attrs = {}
+        candidates = [attrs for attrs in renditions
+                      if group is not None and attrs.get("GROUP-ID") == group]
+        if not candidates:
+            return None
+        selected = max(candidates, key=lambda attrs: (
+            attrs.get("DEFAULT") == "YES", attrs.get("AUTOSELECT") == "YES"
+        ))
+        # A default rendition without URI is already in the video stream.
+        # Do not switch to a different language just because it has a URL.
+        uri = selected.get("URI")
+        return urljoin(manifest_url, uri) if uri else None
 
     @staticmethod
     def _hls_variant_has_external_audio(

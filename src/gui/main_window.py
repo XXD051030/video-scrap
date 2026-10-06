@@ -35,6 +35,7 @@ from ..media_proxy import MediaProxyServer
 from ..scraper import VideoItem, build_items_from_urls, is_x_post_url
 from ..settings import SettingsStore
 from ..utils import format_bytes, is_valid_url
+from .about_dialog import AboutDialog
 from .icons import IconComboBox, make_icon
 from .preview_panel import PreviewPanel
 from .settings_dialog import SettingsDialog
@@ -315,6 +316,27 @@ class MainWindow(QMainWindow):
         self._ui_icon_bindings.append((self.download_button, "download", True))
         quality_row.addWidget(self.download_button)
         layout.addLayout(quality_row)
+
+        self.audio_format_row = QWidget()
+        audio_row = QHBoxLayout(self.audio_format_row)
+        audio_row.setContentsMargins(0, 0, 0, 0)
+        audio_row.setSpacing(8)
+        self.audio_format_label = QLabel("Audio format")
+        self.audio_format_label.setProperty("role", "section")
+        audio_row.addWidget(self.audio_format_label)
+        self.audio_format_combo = IconComboBox()
+        for label, value in (("Original audio", "original"), ("MP3", "mp3"), ("M4A", "m4a")):
+            self.audio_format_combo.addItem(label, value)
+        self.audio_format_combo.setMinimumWidth(165)
+        self.audio_format_combo.setToolTip(
+            "Original audio keeps the source audio encoding. MP3 or M4A "
+            "may require conversion."
+        )
+        audio_row.addWidget(self.audio_format_combo)
+        audio_row.addStretch(1)
+        self.audio_format_row.hide()
+        layout.addWidget(self.audio_format_row)
+        self.quality_combo.currentTextChanged.connect(self._on_quality_changed)
 
         path_row = QHBoxLayout()
         path_row.setSpacing(8)
@@ -826,6 +848,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- download
 
+    def _on_quality_changed(self, quality: str) -> None:
+        self.audio_format_row.setVisible(quality == "audio only")
+        self._fit_content_minimum()
+        QTimer.singleShot(0, self._fit_content_minimum)
+
     def choose_output_dir(self) -> None:
         directory = QFileDialog.getExistingDirectory(
             self, "Choose download folder", str(self.output_dir)
@@ -852,6 +879,7 @@ class MainWindow(QMainWindow):
         self._download_tasks[task_id] = {
             "item": item,
             "quality": quality,
+            "audio_format": self.audio_format_combo.currentData(),
             "output_dir": self.output_dir,
             "failed": False,
         }
@@ -909,6 +937,7 @@ class MainWindow(QMainWindow):
                 parallel_connections=DOWNLOAD_LANE_IDLE_MAX,
                 lane_limiter=self._lane_limiter,
                 parent=self,
+                audio_format=task.get("audio_format", "original"),
             )
             self.download_workers[task_id] = worker
             task["worker"] = worker
@@ -1096,8 +1125,10 @@ class MainWindow(QMainWindow):
             )
         elif progress.status == "finished":
             if task is not None:
-                task["progress_pct"] = 100
-            self._set_download_row(task_id, status="Post-processing", value=100)
+                task["progress_pct"] = None
+            self._set_download_row(
+                task_id, status=progress.message or "Post-processing", indeterminate=True
+            )
         elif progress.status == "completed":
             if task is not None:
                 task["progress_pct"] = 100
@@ -1198,13 +1229,8 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.output_dir)))
 
     def _show_about(self) -> None:
-        QMessageBox.information(
-            self,
-            "About Video Scraper",
-            "Video Scraper\n\n"
-            "Scrape videos from any webpage, preview, and download.\n"
-            "Built with PyQt6 + yt-dlp.",
-        )
+        dialog = AboutDialog(self)
+        dialog.exec()
 
     def _open_preferences(self) -> None:
         dialog = SettingsDialog(self.settings_store, self)
