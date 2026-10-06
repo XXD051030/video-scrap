@@ -6,17 +6,17 @@ from pathlib import Path
 import sys
 from typing import List, Optional
 
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon, QKeySequence
+from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -24,8 +24,8 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStatusBar,
-    QStyle,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -35,6 +35,7 @@ from ..media_proxy import MediaProxyServer
 from ..scraper import VideoItem, build_items_from_urls, is_x_post_url
 from ..settings import SettingsStore
 from ..utils import format_bytes, is_valid_url
+from .icons import IconComboBox, make_icon
 from .preview_panel import PreviewPanel
 from .settings_dialog import SettingsDialog
 from .style import build_palette, build_stylesheet, get_theme
@@ -73,6 +74,38 @@ def _make_card(parent: Optional[QWidget] = None) -> QFrame:
     return card
 
 
+class _ElidedPathLabel(QLabel):
+    """Keep the complete folder path while fitting the available row width."""
+
+    def __init__(self, text: str, parent=None) -> None:
+        self._full_text = text
+        super().__init__(parent)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 (Qt API)
+        self._full_text = text
+        self.setToolTip(text)
+        self._update_elision()
+
+    def _update_elision(self) -> None:
+        super().setText(self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideMiddle,
+            max(0, self.contentsRect().width()),
+        ))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().resizeEvent(event)
+        self._update_elision()
+
+    def changeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange):
+            self._update_elision()
+
+
 class MainWindow(QMainWindow):
     """Top-level window that wires the GUI together."""
 
@@ -85,7 +118,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Video Scraper")
         self.resize(1320, 820)
         self.setMinimumSize(1024, 640)
-        self.setUnifiedTitleAndToolBarOnMac(True)
+        self.setUnifiedTitleAndToolBarOnMac(False)
 
         self.scrape_worker: Optional[ScrapeWorker] = None
         self.download_workers: dict[int, DownloadWorker] = {}
@@ -110,6 +143,7 @@ class MainWindow(QMainWindow):
         self._logs_expanded: bool = False
         self._download_failed_count: int = 0
         self._closing: bool = False
+        self._ui_icon_bindings: list[tuple[object, str, bool]] = []
         self.output_dir: Path = DEFAULT_DOWNLOAD_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -149,15 +183,14 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(10)
 
-        icon_label = QLabel()
-        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView)
-        icon_label.setPixmap(icon.pixmap(18, 18))
-        layout.addWidget(icon_label)
+        self.url_icon_label = QLabel()
+        self.url_icon_label.setFixedSize(20, 20)
+        layout.addWidget(self.url_icon_label)
 
         self.url_input = QLineEdit()
         self.url_input.setObjectName("UrlInput")
         self.url_input.setPlaceholderText(
-            "Paste a page URL (YouTube, Bilibili, Twitter, generic webpage...)"
+            "Paste a webpage or X post link"
         )
         self.url_input.setClearButtonEnabled(True)
         self.url_input.returnPressed.connect(self.start_scrape)
@@ -165,7 +198,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.url_input, stretch=1)
 
         self.x_auth_label = QLabel("X session")
-        self.x_auth_combo = QComboBox()
+        self.x_auth_combo = IconComboBox()
         self.x_auth_combo.addItem("Public", None)
         for label, browser in (
             ("Chrome", "chrome"),
@@ -187,8 +220,10 @@ class MainWindow(QMainWindow):
         self.scrape_button = QPushButton("Scrape")
         self.scrape_button.setObjectName("Primary")
         self.scrape_button.setMinimumWidth(110)
+        self.scrape_button.setFixedHeight(38)
         self.scrape_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scrape_button.clicked.connect(self.start_scrape)
+        self._ui_icon_bindings.append((self.scrape_button, "search", True))
         layout.addWidget(self.scrape_button)
         return card
 
@@ -242,56 +277,64 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right_card)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([480, 820])
+        splitter.setSizes([377, 923])
         return splitter
 
     def _build_download_controls(self) -> QWidget:
         wrap = QWidget()
-        layout = QHBoxLayout(wrap)
-        layout.setContentsMargins(2, 6, 2, 0)
+        wrap.setObjectName("DownloadControls")
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(2, 8, 2, 0)
         layout.setSpacing(10)
+
+        separator = QFrame()
+        separator.setObjectName("HSep")
+        separator.setFixedHeight(1)
+        layout.addWidget(separator)
+        quality_row = QHBoxLayout()
+        quality_row.setSpacing(8)
 
         quality_label = QLabel("Quality")
         quality_label.setProperty("role", "section")
-        layout.addWidget(quality_label)
+        quality_row.addWidget(quality_label)
 
-        self.quality_combo = QComboBox()
+        self.quality_combo = IconComboBox()
         for label in QUALITY_FORMATS.keys():
             self.quality_combo.addItem(label)
         self.quality_combo.setCurrentText("best")
         self.quality_combo.setMinimumWidth(120)
-        layout.addWidget(self.quality_combo)
-
-        sep = QFrame()
-        sep.setObjectName("VSep")
-        sep.setFrameShape(QFrame.Shape.NoFrame)
-        sep.setFixedSize(1, 24)
-        layout.addWidget(sep)
-
-        save_label = QLabel("Save to")
-        save_label.setProperty("role", "section")
-        layout.addWidget(save_label)
-
-        self.path_label = QLabel(self._truncate_path(self.output_dir))
-        self.path_label.setProperty("role", "path")
-        self.path_label.setToolTip(str(self.output_dir))
-        self.path_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
-        )
-        layout.addWidget(self.path_label, stretch=1)
-
-        self.choose_dir_button = QPushButton("Choose…")
-        self.choose_dir_button.setObjectName("Ghost")
-        self.choose_dir_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.choose_dir_button.clicked.connect(self.choose_output_dir)
-        layout.addWidget(self.choose_dir_button)
+        quality_row.addWidget(self.quality_combo)
+        quality_row.addStretch(1)
 
         self.download_button = QPushButton("Download current")
         self.download_button.setObjectName("Primary")
         self.download_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.download_button.setMinimumWidth(170)
+        self.download_button.setFixedHeight(38)
         self.download_button.clicked.connect(self.start_download)
-        layout.addWidget(self.download_button)
+        self._ui_icon_bindings.append((self.download_button, "download", True))
+        quality_row.addWidget(self.download_button)
+        layout.addLayout(quality_row)
+
+        path_row = QHBoxLayout()
+        path_row.setSpacing(8)
+
+        save_label = QLabel("Save to")
+        save_label.setProperty("role", "section")
+        path_row.addWidget(save_label)
+
+        self.path_label = _ElidedPathLabel(str(self.output_dir))
+        self.path_label.setProperty("role", "path")
+        self.path_label.setToolTip(str(self.output_dir))
+        path_row.addWidget(self.path_label, stretch=1)
+
+        self.choose_dir_button = QPushButton("Choose…")
+        self.choose_dir_button.setObjectName("Ghost")
+        self.choose_dir_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.choose_dir_button.clicked.connect(self.choose_output_dir)
+        self._ui_icon_bindings.append((self.choose_dir_button, "folder", False))
+        path_row.addWidget(self.choose_dir_button)
+        layout.addLayout(path_row)
         return wrap
 
     def _build_progress_row(self) -> QWidget:
@@ -359,7 +402,7 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        self.logs_toggle_button = QPushButton("Logs ▾")
+        self.logs_toggle_button = QPushButton("Logs")
         self.logs_toggle_button.setObjectName("Link")
         self.logs_toggle_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.logs_toggle_button.clicked.connect(self._toggle_logs)
@@ -384,63 +427,69 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         toolbar = QToolBar("Main toolbar")
+        self.main_toolbar = toolbar
+        toolbar.setObjectName("MainToolbar")
         toolbar.setMovable(False)
-        toolbar.setIconSize(QSize(20, 20))
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        toolbar.setFloatable(False)
+        toolbar.setAllowedAreas(Qt.ToolBarArea.TopToolBarArea)
+        toolbar.setIconSize(QSize(18, 18))
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
 
-        open_dir_action = QAction(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon),
-            "Open downloads folder",
-            self,
-        )
+        self.browser_scrape_action = None
+        if InteractiveScrapeDialog is not None:
+            self.browser_scrape_action = QAction("Browser scrape", self)
+            self.browser_scrape_action.setToolTip("Scrape with browser (solve CAPTCHA / login)")
+            self.browser_scrape_action.triggered.connect(self._start_interactive_from_toolbar)
+            toolbar.addAction(self.browser_scrape_action)
+            self._ui_icon_bindings.append((self.browser_scrape_action, "globe", False))
+
+        open_dir_action = QAction("Downloads", self)
+        self.open_dir_action = open_dir_action
+        open_dir_action.setToolTip("Open downloads folder")
         open_dir_action.triggered.connect(self._open_output_folder)
         toolbar.addAction(open_dir_action)
+        self._ui_icon_bindings.append((open_dir_action, "folder-open", False))
 
-        self.stop_downloads_action = QAction(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop),
-            "Stop all downloads",
-            self,
-        )
+        self.stop_downloads_action = QAction("Stop downloads", self)
         self.stop_downloads_action.setToolTip(
             "Stop all downloads and merge available HLS segments"
         )
         self.stop_downloads_action.setEnabled(False)
         self.stop_downloads_action.triggered.connect(self.stop_all_downloads)
         toolbar.addAction(self.stop_downloads_action)
+        self._ui_icon_bindings.append((self.stop_downloads_action, "stop", False))
 
-        if InteractiveScrapeDialog is not None:
-            interactive_action = QAction(
-                self.style().standardIcon(
-                    QStyle.StandardPixmap.SP_BrowserReload
-                ),
-                "Scrape with browser (solve CAPTCHA / login)",
-                self,
-            )
-            interactive_action.triggered.connect(
-                self._start_interactive_from_toolbar
-            )
-            toolbar.addAction(interactive_action)
-
-        prefs_action = QAction(
-            self.style().standardIcon(
-                QStyle.StandardPixmap.SP_FileDialogDetailedView
-            ),
-            "Preferences",
-            self,
-        )
+        self.more_menu = QMenu(self)
+        self.more_menu.setObjectName("MoreMenu")
+        self.more_menu.setMinimumWidth(230)
+        prefs_action = QAction("Preferences", self)
+        self.prefs_action = prefs_action
         prefs_action.setShortcut(QKeySequence("Ctrl+,"))
         prefs_action.triggered.connect(self._open_preferences)
-        toolbar.addAction(prefs_action)
+        self.more_menu.addAction(prefs_action)
+        self.addAction(prefs_action)
+        self._ui_icon_bindings.append((prefs_action, "settings", False))
+        self.more_menu.addSeparator()
 
-        about_action = QAction(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation),
-            "About",
-            self,
-        )
+        about_action = QAction("About", self)
+        self.about_action = about_action
         about_action.setShortcut(QKeySequence.StandardKey.HelpContents)
         about_action.triggered.connect(self._show_about)
-        toolbar.addAction(about_action)
+        self.more_menu.addAction(about_action)
+        self.addAction(about_action)
+        self._ui_icon_bindings.append((about_action, "about", False))
+
+        self.more_button = QToolButton()
+        self.more_button.setObjectName("MoreButton")
+        self.more_button.setText("More")
+        self.more_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.more_button.setMenu(self.more_menu)
+        self.more_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.more_button.setIconSize(QSize(18, 18))
+        toolbar.addWidget(self.more_button)
+        self._ui_icon_bindings.append((self.more_button, "more", False))
 
         spacer = QWidget()
         spacer.setSizePolicy(
@@ -448,7 +497,7 @@ class MainWindow(QMainWindow):
         )
         toolbar.addWidget(spacer)
 
-        self.theme_action = QAction("☀  Light mode", self)
+        self.theme_action = QAction("Light mode", self)
         self.theme_action.triggered.connect(self._toggle_theme)
         toolbar.addAction(self.theme_action)
         theme_btn = toolbar.widgetForAction(self.theme_action)
@@ -456,8 +505,24 @@ class MainWindow(QMainWindow):
             theme_btn.setObjectName("ThemeToggle")
             theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             theme_btn.setToolButtonStyle(
-                Qt.ToolButtonStyle.ToolButtonTextOnly
+                Qt.ToolButtonStyle.ToolButtonTextBesideIcon
             )
+        for action in toolbar.actions():
+            button = toolbar.widgetForAction(action)
+            if isinstance(button, QToolButton):
+                button.setFixedHeight(34)
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _refresh_ui_icons(self) -> None:
+        for control, icon_name, primary in self._ui_icon_bindings:
+            color = self._theme.accent_text if primary else self._theme.text
+            control.setIcon(make_icon(icon_name, color))
+        self.url_icon_label.setPixmap(make_icon("link", self._theme.text_muted).pixmap(
+            QSize(18, 18), self.devicePixelRatioF()
+        ))
+        self.logs_toggle_button.setIcon(make_icon(
+            "chevron-up" if self._logs_expanded else "chevron-down", self._theme.text_muted
+        ))
 
     # ------------------------------------------------------------- helpers
 
@@ -479,8 +544,31 @@ class MainWindow(QMainWindow):
     def _toggle_logs(self) -> None:
         self._logs_expanded = not self._logs_expanded
         self.log_view.setVisible(self._logs_expanded)
-        arrow = "▴" if self._logs_expanded else "▾"
-        self.logs_toggle_button.setText(f"Logs {arrow}")
+        self.logs_toggle_button.setIcon(make_icon(
+            "chevron-up" if self._logs_expanded else "chevron-down", self._theme.text_muted
+        ))
+        self._fit_content_minimum()
+
+        # Qt finishes propagating visibility changes on the next event turn.
+        QTimer.singleShot(0, self._fit_content_minimum)
+
+    def _fit_content_minimum(self) -> None:
+        """Account for wrapped captions as well as the expanded log area."""
+        if self._closing:
+            return
+        self.centralWidget().layout().activate()
+        self.layout().invalidate()
+        self.layout().activate()
+        info = self.preview_panel.info_host
+        wrapped_extra = max(
+            0, info.heightForWidth(info.width()) - info.minimumSizeHint().height()
+        )
+        self.setMinimumHeight(max(640, self.minimumSizeHint().height() + wrapped_extra))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().resizeEvent(event)
+        if hasattr(self, "preview_panel") and not self._closing:
+            QTimer.singleShot(0, self._fit_content_minimum)
 
     def _update_video_count_badge(self, count: int) -> None:
         self.count_badge.setText(str(count))
@@ -734,6 +822,7 @@ class MainWindow(QMainWindow):
 
     def _on_video_selected(self, video: Optional[VideoItem]) -> None:
         self.preview_panel.show_video(video)
+        self._fit_content_minimum()
 
     # ------------------------------------------------------------- download
 
@@ -743,7 +832,7 @@ class MainWindow(QMainWindow):
         )
         if directory:
             self.output_dir = Path(directory)
-            self.path_label.setText(self._truncate_path(self.output_dir))
+            self.path_label.setText(str(self.output_dir))
             self.path_label.setToolTip(str(self.output_dir))
 
     def start_download(self) -> None:
@@ -1131,6 +1220,7 @@ class MainWindow(QMainWindow):
             app.setPalette(build_palette(self._theme))
             app.setStyleSheet(build_stylesheet(self._theme))
         self.preview_panel.apply_theme(self._theme)
+        self._refresh_ui_icons()
         self._update_theme_action_text()
         if persist:
             settings = self.settings_store.get()
@@ -1147,10 +1237,12 @@ class MainWindow(QMainWindow):
         if self.theme_action is None:
             return
         if self._theme_name == "dark":
-            self.theme_action.setText("☀  Light mode")
+            self.theme_action.setText("Light mode")
+            self.theme_action.setIcon(make_icon("sun", self._theme.text))
             self.theme_action.setToolTip("Switch to light theme")
         else:
-            self.theme_action.setText("☾  Dark mode")
+            self.theme_action.setText("Dark mode")
+            self.theme_action.setIcon(make_icon("moon", self._theme.text))
             self.theme_action.setToolTip("Switch to dark theme")
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)

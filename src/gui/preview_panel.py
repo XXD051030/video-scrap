@@ -6,8 +6,8 @@ from typing import Optional
 
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import QUrl, Qt, pyqtSignal
-from PyQt6.QtGui import QMouseEvent, QPixmap
+from PyQt6.QtCore import QEvent, QSize, QUrl, Qt, pyqtSignal
+from PyQt6.QtGui import QKeySequence, QMouseEvent, QPixmap, QShortcut
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 from ..media_proxy import MediaProxyServer
 from ..scraper import VideoItem
 from ..utils import format_duration
+from .icons import make_icon
 from .style import DARK, Theme
 from .workers import ThumbnailWorker
 
@@ -88,6 +89,16 @@ class ClickableSlider(QSlider):
         )
 
 
+class _FullscreenWindow(QWidget):
+    """A temporary host; closing it restores the embedded player."""
+
+    exit_requested = pyqtSignal()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        event.ignore()
+        self.exit_requested.emit()
+
+
 class PreviewPanel(QWidget):
     """Display details and an embedded media player for a selected video."""
 
@@ -101,25 +112,38 @@ class PreviewPanel(QWidget):
         parent=None,
     ) -> None:
         super().__init__(parent)
+        self.setObjectName("PreviewPanel")
         self._current: Optional[VideoItem] = None
         self._thumb_worker: Optional[ThumbnailWorker] = None
+        self._thumbnail_pixmap: Optional[QPixmap] = None
         self._proxy = proxy
-        self._accent = (theme or DARK).accent
+        self._theme = theme or DARK
+        self._accent = self._theme.accent
         self._active_proxy_url: Optional[str] = None
         self._pending_playable_url: Optional[str] = None
         self._pending_playable_headers: dict[str, str] = {}
         self._pending_is_hls = False
         self._source_loaded = False
+        self._fullscreen_window: Optional[_FullscreenWindow] = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(12)
+
+        # Move this whole presentation container into fullscreen, retaining
+        # the same video output and controls rather than loading another player.
+        self.player_host = QWidget()
+        self.player_host.setObjectName("PlayerHost")
+        player_layout = QVBoxLayout(self.player_host)
+        player_layout.setContentsMargins(0, 0, 0, 0)
+        player_layout.setSpacing(10)
+        layout.addWidget(self.player_host, stretch=1)
 
         # Stack the thumbnail and the video widget so they share the same
         # screen real estate. Whichever one is on top is what the user sees.
         self.media_stack_host = QWidget()
         self.media_stack_host.setObjectName("MediaStage")
-        self.media_stack_host.setMinimumSize(360, 260)
+        self.media_stack_host.setMinimumSize(360, 100)
         self.media_stack_host.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -127,12 +151,12 @@ class PreviewPanel(QWidget):
         self.media_stack.setStackingMode(QStackedLayout.StackingMode.StackOne)
         self.media_stack.setContentsMargins(0, 0, 0, 0)
 
-        self.thumbnail_label = QLabel("◐  Select a video to preview")
+        self.thumbnail_label = QLabel("Select a video to preview")
         self.thumbnail_label.setObjectName("ThumbHint")
         self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumbnail_label.setFrameShape(QFrame.Shape.NoFrame)
         self.thumbnail_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
         )
 
         self.video_widget = QVideoWidget()
@@ -145,7 +169,10 @@ class PreviewPanel(QWidget):
         self.media_stack.addWidget(self.video_widget)
         self.media_stack.setCurrentIndex(0)
 
-        layout.addWidget(self.media_stack_host, stretch=1)
+        player_layout.addWidget(self.media_stack_host, stretch=1)
+        self.media_stack_host.installEventFilter(self)
+        self.thumbnail_label.installEventFilter(self)
+        self.video_widget.installEventFilter(self)
 
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
@@ -153,45 +180,90 @@ class PreviewPanel(QWidget):
         self.player.setVideoOutput(self.video_widget)
         self.audio_output.setVolume(0.6)
 
-        controls = QHBoxLayout()
-        controls.setSpacing(8)
-        self.play_button = QPushButton("▶  Play")
-        self.play_button.setObjectName("Primary")
-        self.play_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.play_button.setMinimumWidth(90)
-        self.play_button.clicked.connect(self._toggle_play)
-        controls.addWidget(self.play_button)
-
-        self.stop_button = QPushButton("◼  Stop")
-        self.stop_button.setObjectName("Ghost")
-        self.stop_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.stop_button.clicked.connect(self._stop)
-        controls.addWidget(self.stop_button)
-
+        # A dedicated seek row gives scrubbing the width of the video stage.
+        seek_controls = QHBoxLayout()
+        seek_controls.setSpacing(12)
         self.position_slider = ClickableSlider(Qt.Orientation.Horizontal)
+        self.position_slider.setObjectName("SeekSlider")
+        self.position_slider.setAccessibleName("Playback position")
         self.position_slider.setRange(0, 0)
         self.position_slider.sliderMoved.connect(self.player.setPosition)
-        controls.addWidget(self.position_slider, stretch=1)
+        seek_controls.addWidget(self.position_slider, stretch=1)
 
         self.time_label = QLabel("00:00 / 00:00")
         self.time_label.setObjectName("TimeLabel")
-        controls.addWidget(self.time_label)
-        layout.addLayout(controls)
+        seek_controls.addWidget(self.time_label)
+        player_layout.addLayout(seek_controls)
+
+        # Keep playback on the left, audio and fullscreen on the right.
+        self.controls_host = QWidget()
+        self.controls_host.setObjectName("PlayerControls")
+        controls = QHBoxLayout(self.controls_host)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(8)
+        self.play_button = QPushButton("Play")
+        self._prepare_control_button(self.play_button)
+        self.play_button.setMinimumWidth(80)
+        self.play_button.clicked.connect(self._toggle_play)
+        controls.addWidget(self.play_button)
+
+        self.stop_button = QPushButton("Stop")
+        self._prepare_control_button(self.stop_button)
+        self.stop_button.clicked.connect(self._stop)
+        controls.addWidget(self.stop_button)
+        controls.addStretch(1)
+
+        self.mute_button = QPushButton("Mute")
+        self._prepare_control_button(self.mute_button)
+        self.mute_button.setCheckable(True)
+        self.mute_button.setToolTip("Mute preview audio only")
+        self.mute_button.toggled.connect(self.audio_output.setMuted)
+        controls.addWidget(self.mute_button)
+
+        self.volume_slider = ClickableSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setObjectName("VolumeSlider")
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(60)
+        self.volume_slider.setMinimumWidth(80)
+        self.volume_slider.setMaximumWidth(100)
+        self.volume_slider.setAccessibleName("Preview volume")
+        self.volume_slider.setToolTip("Preview volume (does not change system volume)")
+        self.volume_slider.valueChanged.connect(self._set_volume)
+        controls.addWidget(self.volume_slider)
+        self.volume_label = QLabel("60%")
+        self.volume_label.setObjectName("TimeLabel")
+        self.volume_label.setMinimumWidth(36)
+        controls.addWidget(self.volume_label)
+
+        self.fullscreen_button = QPushButton("Full screen")
+        self._prepare_control_button(self.fullscreen_button)
+        self.fullscreen_button.setToolTip("Full screen; press Escape to return")
+        self.fullscreen_button.clicked.connect(self._toggle_fullscreen)
+        controls.addWidget(self.fullscreen_button)
+        player_layout.addWidget(self.controls_host)
+        self.audio_output.volumeChanged.connect(self._on_volume_changed)
+        self.audio_output.mutedChanged.connect(self._on_muted_changed)
 
         # Info block under the controls.
-        info = QVBoxLayout()
-        info.setSpacing(4)
-        info.setContentsMargins(2, 4, 2, 0)
+        self.info_host = QWidget()
+        self.info_host.setObjectName("MediaInfo")
+        info = QVBoxLayout(self.info_host)
+        info.setSpacing(5)
+        info.setContentsMargins(0, 2, 0, 0)
 
         self.title_label = QLabel("")
         self.title_label.setWordWrap(True)
+        self.title_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.title_label.setProperty("role", "title")
-        self.title_label.setStyleSheet("font-size: 15px; font-weight: 600;")
+        self.title_label.setStyleSheet("font-size: 14px; font-weight: 600;")
         info.addWidget(self.title_label)
 
         self.meta_label = QLabel("")
         self.meta_label.setProperty("role", "muted")
         self.meta_label.setWordWrap(True)
+        self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.meta_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         info.addWidget(self.meta_label)
 
         self.url_label = QLabel("")
@@ -202,7 +274,7 @@ class PreviewPanel(QWidget):
         )
         self.url_label.setWordWrap(False)
         info.addWidget(self.url_label)
-        layout.addLayout(info)
+        layout.addWidget(self.info_host)
 
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
@@ -210,14 +282,37 @@ class PreviewPanel(QWidget):
         self.player.mediaStatusChanged.connect(self._on_media_status_changed)
         self.player.errorOccurred.connect(self._on_player_error)
 
+        self._refresh_control_icons()
+        self._limit_metadata_height()
         self._set_controls_enabled(False)
         self._show_thumbnail_view()
+
+    @staticmethod
+    def _prepare_control_button(button: QPushButton) -> None:
+        button.setObjectName("PlayerControl")
+        button.setProperty("role", "player")
+        button.setFixedHeight(34)
+        button.setIconSize(QSize(18, 18))
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _refresh_control_icons(self) -> None:
+        color = self._theme.text
+        playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        self.play_button.setIcon(make_icon("pause" if playing else "play", color))
+        self.stop_button.setIcon(make_icon("stop", color))
+        self.mute_button.setIcon(make_icon(
+            "volume-muted" if self.audio_output.isMuted() else "volume", color
+        ))
+        self.fullscreen_button.setIcon(make_icon(
+            "exit-fullscreen" if self.is_fullscreen() else "fullscreen", color
+        ))
 
     def show_video(self, video: Optional[VideoItem]) -> None:
         self._stop()
         self.player.setSource(QUrl())
         self._release_proxy_url()
         self._stop_thumb_worker()
+        self._thumbnail_pixmap = None
         self._current = video
         self._pending_playable_url = None
         self._pending_playable_headers = {}
@@ -227,36 +322,41 @@ class PreviewPanel(QWidget):
 
         if video is None:
             self.title_label.setText("")
+            self.title_label.setToolTip("")
             self.meta_label.setText("")
+            self.meta_label.setToolTip("")
             self.url_label.setText("")
             self.url_label.setToolTip("")
-            self.thumbnail_label.setText("◐  Select a video to preview")
             self.thumbnail_label.setPixmap(QPixmap())
+            self.thumbnail_label.setText("Select a video to preview")
             self._set_controls_enabled(False)
             self.player.setSource(QUrl())
             return
 
         self.title_label.setText(video.title)
-        meta_parts = [
-            f"Duration: {format_duration(video.duration)}",
-            f"Resolution: {video.resolution}",
-        ]
+        self.title_label.setToolTip(video.title)
+        meta_parts = []
+        if video.duration is not None:
+            meta_parts.append(format_duration(video.duration))
+        if video.width and video.height:
+            meta_parts.append(video.resolution)
         if video.ext:
-            meta_parts.append(f"Format: {video.ext}")
+            meta_parts.append(video.ext.upper())
         if video.uploader:
-            meta_parts.append(f"Uploader: {video.uploader}")
+            meta_parts.append(video.uploader)
         if video.is_hls:
-            meta_parts.append("Source: HLS stream")
+            meta_parts.append("HLS stream")
         elif video.is_direct:
-            meta_parts.append("Source: direct link")
+            meta_parts.append("Direct link")
         else:
-            meta_parts.append("Source: yt-dlp extractor")
-        self.meta_label.setText("  •  ".join(meta_parts))
+            meta_parts.append("yt-dlp extractor")
+        self.meta_label.setText("  ·  ".join(meta_parts))
+        self.meta_label.setToolTip(self.meta_label.text())
 
         self._render_url_label(video)
 
-        self.thumbnail_label.setText("Loading thumbnail...")
         self.thumbnail_label.setPixmap(QPixmap())
+        self.thumbnail_label.setText("Loading thumbnail...")
 
         if video.thumbnail:
             self._thumb_worker = ThumbnailWorker(
@@ -303,15 +403,108 @@ class PreviewPanel(QWidget):
         return self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
 
     def shutdown(self) -> None:
+        self._exit_fullscreen()
         self.release_stream()
         self._stop_thumb_worker()
 
+    def is_fullscreen(self) -> bool:
+        return self._fullscreen_window is not None
+
+    def activation_window(self) -> QWidget:
+        """Return the visible player window when activating an existing app."""
+        return self._fullscreen_window or self.window()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        self._exit_fullscreen()
+        super().closeEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 (Qt API)
+        if watched is self.media_stack_host and event.type() == QEvent.Type.Resize:
+            self._resize_thumbnail()
+        if (
+            watched in (self.media_stack_host, self.thumbnail_label, self.video_widget)
+            and event.type() == QEvent.Type.MouseButtonDblClick
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._toggle_fullscreen()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _toggle_fullscreen(self) -> None:
+        if self.is_fullscreen():
+            self._exit_fullscreen()
+            return
+        window = _FullscreenWindow(self, Qt.WindowType.Window)
+        window.setWindowTitle("Video preview — Escape to return")
+        window.setWindowIcon(self.window().windowIcon())
+        window.exit_requested.connect(self._exit_fullscreen)
+        window_layout = QVBoxLayout(window)
+        window_layout.setContentsMargins(12, 12, 12, 12)
+        window_layout.addWidget(self.player_host)
+        shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), window)
+        shortcut.activated.connect(self._exit_fullscreen)
+        # Keep an explicit reference for the lifetime of the fullscreen host.
+        window.escape_shortcut = shortcut
+        self._fullscreen_window = window
+        self.fullscreen_button.setText("Exit full screen")
+        self._refresh_control_icons()
+        screen = self.window().screen()
+        if screen is not None:
+            window.move(screen.availableGeometry().topLeft())
+        window.showFullScreen()
+        self.player_host.show()
+        self.fullscreen_button.setFocus()
+
+    def _exit_fullscreen(self) -> None:
+        window = self._fullscreen_window
+        if window is None:
+            return
+        self._fullscreen_window = None
+        window.hide()
+        window.layout().removeWidget(self.player_host)
+        self.layout().insertWidget(0, self.player_host, stretch=1)
+        self.player_host.show()
+        self.fullscreen_button.setText("Full screen")
+        self._refresh_control_icons()
+        self._focus_player_control()
+        window.deleteLater()
+
+    def _focus_player_control(self) -> None:
+        self.fullscreen_button.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _set_volume(self, value: int) -> None:
+        self.audio_output.setVolume(value / 100)
+        if value > 0 and self.audio_output.isMuted():
+            self.audio_output.setMuted(False)
+
+    def _on_volume_changed(self, volume: float) -> None:
+        value = round(volume * 100)
+        was_blocked = self.volume_slider.blockSignals(True)
+        self.volume_slider.setValue(value)
+        self.volume_slider.blockSignals(was_blocked)
+        self.volume_label.setText(f"{value}%")
+
+    def _on_muted_changed(self, muted: bool) -> None:
+        was_blocked = self.mute_button.blockSignals(True)
+        self.mute_button.setChecked(muted)
+        self.mute_button.blockSignals(was_blocked)
+        self.mute_button.setText("Unmute" if muted else "Mute")
+        self._refresh_control_icons()
+
     def apply_theme(self, theme: Theme) -> None:
-        """Re-tint the one piece of theme-dependent inline content (the URL
-        link colour); everything else repaints from the global stylesheet."""
+        """Retint icons and the source link alongside the global stylesheet."""
+        self._theme = theme
         self._accent = theme.accent
+        self._refresh_control_icons()
+        self._limit_metadata_height()
         if self._current is not None:
             self._render_url_label(self._current)
+
+    def _limit_metadata_height(self) -> None:
+        """Bound long captions while keeping their full contents in tooltips."""
+        for label in (self.title_label, self.meta_label):
+            label.ensurePolished()
+            label.setMaximumHeight(label.fontMetrics().lineSpacing() * 2 + 2)
 
     def _render_url_label(self, video: VideoItem) -> None:
         host = urlparse(video.url).netloc or video.url
@@ -455,13 +648,18 @@ class PreviewPanel(QWidget):
     def _apply_thumbnail(self, _index: int, data: bytes) -> None:
         pixmap = QPixmap()
         if not pixmap.loadFromData(data):
+            self._thumbnail_pixmap = None
             self.thumbnail_label.setText("(Failed to load thumbnail)")
             return
-        target_w = max(320, self.media_stack_host.width() - 8)
-        target_h = max(180, self.media_stack_host.height() - 8)
-        pixmap = pixmap.scaled(
-            target_w,
-            target_h,
+        self._thumbnail_pixmap = pixmap
+        self._resize_thumbnail()
+
+    def _resize_thumbnail(self) -> None:
+        if self._thumbnail_pixmap is None:
+            return
+        pixmap = self._thumbnail_pixmap.scaled(
+            max(1, self.media_stack_host.width() - 8),
+            max(1, self.media_stack_host.height() - 8),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
@@ -469,6 +667,7 @@ class PreviewPanel(QWidget):
         self.thumbnail_label.setPixmap(pixmap)
 
     def _on_thumb_failed(self, _index: int, message: str) -> None:
+        self._thumbnail_pixmap = None
         self.thumbnail_label.setText(f"(Thumbnail error: {message})")
 
     def _stop_thumb_worker(self) -> None:
@@ -531,18 +730,19 @@ class PreviewPanel(QWidget):
 
     def _on_playback_state_changed(self, state) -> None:
         if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.play_button.setText("❚❚  Pause")
+            self.play_button.setText("Pause")
             self._show_video_view()
             self.playback_activity_changed.emit(True)
         elif state == QMediaPlayer.PlaybackState.PausedState:
-            self.play_button.setText("▶  Play")
+            self.play_button.setText("Play")
             self.playback_activity_changed.emit(False)
             # Keep the video frame visible while paused.
         else:
             # Stopped - back to thumbnail.
-            self.play_button.setText("▶  Play")
+            self.play_button.setText("Play")
             self._show_thumbnail_view()
             self.playback_activity_changed.emit(False)
+        self._refresh_control_icons()
 
     def _on_media_status_changed(self, status) -> None:
         # When media is loading or buffering, switch to the video surface
@@ -556,6 +756,15 @@ class PreviewPanel(QWidget):
             self._show_thumbnail_view()
 
     def _show_thumbnail_view(self) -> None:
+        # Reparenting the native video surface can leave keyboard focus in its
+        # internal window container. Move it to an existing control before
+        # changing pages: QStackedLayout would otherwise focus the incoming
+        # QLabel and lazily construct a text control during player teardown.
+        focused = self.player_host.window().focusWidget()
+        if focused is self.video_widget or (
+            focused is not None and self.video_widget.isAncestorOf(focused)
+        ):
+            self._focus_player_control()
         self.media_stack.setCurrentIndex(0)
 
     def _show_video_view(self) -> None:
@@ -567,6 +776,7 @@ class PreviewPanel(QWidget):
         message = error_string or str(error)
         if self._current is not None and self._is_x_video(self._current):
             message += " X media links can expire; paste the post link again to refresh it."
+            self._thumbnail_pixmap = None
             self.thumbnail_label.setPixmap(QPixmap())
             self.thumbnail_label.setText("X preview failed. Re-scan the post and try again.")
         self.player_message.emit(f"Player error: {message}")

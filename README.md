@@ -7,13 +7,16 @@ The interface uses PyQt6, with extraction handled by yt-dlp, HTML parsing, and Q
 
 ## Current Status
 
-As of October 3, 2026 (UTC+08:00):
+As of October 6, 2026 (UTC+08:00):
 
 | Component | Status |
 | --- | --- |
 | Webpage video extraction, preview, and downloads | Implemented |
 | X / Twitter posts, individual video selection, playback, and downloads | Implemented |
 | Dark and light themes with saved preferences | Implemented |
+| Sectioned layout, monochrome icons, and More menu | Included and checked in the macOS app; latest Windows build not verified here |
+| Fullscreen preview, volume, and mute controls | Included and checked in the macOS app; latest Windows build not verified here |
+| Single-instance startup with existing-window activation | Included and checked in the macOS app; latest Windows build not verified here |
 | Application icon | Uses `Logo.png` from the repository root |
 | macOS Apple Silicon application | `.app` and ZIP built; application checks passed |
 | Windows x64 application | ZIP built; startup, playback, and downloads tested on Windows |
@@ -21,18 +24,25 @@ As of October 3, 2026 (UTC+08:00):
 The macOS application has been checked for startup, theme switching and persistence, exact byte matching for direct downloads, HLS byte-range downloading and merging, playback, and embedded webpage JavaScript.
 All 90 tests across the existing 11 test scripts passed on macOS with Python 3.12.14.
 Windows startup, playback, and downloads have been tested. Automated Windows regression and smoke-test reports have not been collected.
+The macOS app was rebuilt as version 0.2.0 on October 5, 2026, with the revised interface, Preferences dialog, fullscreen, volume, and single-instance startup. All 10 packaged application checks passed. A Windows ZIP is also present locally, but its source revision and validation of the new features have not been verified here.
+The source update passed 12 single-instance checks, 9 preview-control checks, 5 desktop layout checks, and 9 Preferences dialog checks. The existing X preview and settings checks also passed. Native macOS playback checks confirm video frames continue through fullscreen transitions.
 
 ## Features
 
 - Paste a webpage link to search for videos on the page.
 - Paste an `x.com` or `twitter.com` post link. Posts containing multiple videos show a separate entry for each video.
 - Preview videos in the app and view thumbnails, duration, resolution, and source information.
+- Use **Full screen** or double-click the preview to enlarge it, including before selecting a video. The empty preview displays a selection prompt. Press **Esc** or **Exit full screen** to return; playback and the current position are preserved.
+- A toolbar with monochrome icons and text, a **More** menu for **Preferences / About**, a separate seek row, and two rows for quality, download, and folder controls.
+- Compact video thumbnails and a wider preview area. Long titles and metadata are limited to two visible lines, with full text in tooltips; folder paths adapt to the available width. Small windows expand when necessary to keep controls visible.
+- Adjust the preview volume from 0 to 100%, or use **Mute / Unmute**. These controls affect the app's player, not the system volume. Volume starts at 60% each time the app opens.
+- Repeated launches activate the existing window, including a minimized or fullscreen window, instead of opening another copy for the same user.
 - Select one video and download the current selection.
 - Choose best, 1080p, 720p, 480p, or audio only. Available formats depend on the source.
 - Download progress, logs, and a custom output folder.
 - Parallel downloads for direct links, HLS segment downloads, and FFmpeg merging.
 - HTTP byte-range validation to prevent incorrect response data from being written to segment files. Downloads with the same name use separate temporary files and avoid overwriting existing completed files.
-- Adjustable playback buffer in **Preferences**: 60 seconds by default, configurable from 0 to 300 seconds. Set it to 0 to disable read-ahead.
+- Adjustable playback buffer in **More → Preferences**: 60 seconds by default, configurable from 0 to 300 seconds. Set it to 0 to disable read-ahead.
 - Black-and-white themes: dark mode by default, with **Light mode / Dark mode** in the top-right toolbar. The choice is saved across restarts.
 - A browser extraction entry in the toolbar for pages requiring manual verification or login.
 
@@ -45,6 +55,9 @@ Extraction tries yt-dlp, HTML scanning, page script decoding, and WebEngine rend
 3. Click **Play** to preview it in the app.
 4. Choose a quality setting and use **Choose…** to select the output folder if needed.
 5. Click **Download current** to download the selected video.
+
+Fullscreen mode retains playback, seek, volume, and mute controls. Fullscreen switching also works while paused and does not restart the video.
+Close all older app windows before using a rebuilt version: older binaries do not participate in single-instance protection.
 
 ### X / Twitter Login
 
@@ -178,7 +191,8 @@ PyInstaller requires separate builds on each [target operating system](https://p
 ## Offline Application Checks
 
 The checks use temporary settings, a local test webpage, and generated sample videos. They do not read browser login information.
-They verify downloaded bytes, HLS merging, playback, webpage JavaScript, themes, and settings persistence.
+They verify downloaded bytes, HLS merging, playback through fullscreen transitions, volume and mute, webpage JavaScript, themes, and settings persistence.
+The playback check briefly opens the app and fullscreen preview using a generated sample video.
 
 ### macOS
 
@@ -236,6 +250,7 @@ video-scrap/
 │   ├── parallel_downloader.py      # Parallel direct downloads and file publishing
 │   ├── media_proxy.py              # Playback proxy and cache
 │   ├── settings.py                 # Persistent settings
+│   ├── single_instance.py          # Process lock and existing-window activation
 │   ├── js_decoder.py
 │   ├── net.py
 │   ├── utils.py

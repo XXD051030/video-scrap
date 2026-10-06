@@ -14,7 +14,7 @@ from PyQt6.QtGui import QColor, QPalette
 
 # Geometry is shared across themes.
 RADIUS = 10
-RADIUS_SM = 7
+RADIUS_SM = 8
 
 
 @dataclass(frozen=True)
@@ -82,9 +82,9 @@ DARK = Theme(
     button_bg="#262626",
     button_hover="#333333",
     button_pressed="#1a1a1a",
-    success="#5fb87e",
-    warning="#e2b23c",
-    error="#e0685d",
+    success="#b3b3b3",
+    warning="#b3b3b3",
+    error="#f5f5f5",
     media_bg="#000000",
     scrollbar="#484848",
     scrollbar_hover="#666666",
@@ -111,9 +111,9 @@ LIGHT = Theme(
     button_bg="#ffffff",
     button_hover="#eeeeee",
     button_pressed="#e2e2e2",
-    success="#3e9b63",
-    warning="#c8901f",
-    error="#c9544b",
+    success="#555555",
+    warning="#555555",
+    error="#181818",
     media_bg="#000000",
     scrollbar="#b8b8b8",
     scrollbar_hover="#949494",
@@ -192,36 +192,105 @@ def build_stylesheet(theme: Theme) -> str:
         border: 1px solid {t.border};
         border-radius: {RADIUS}px;
     }}
+    QWidget#PreviewPanel, QWidget#PlayerHost, QWidget#PlayerControls,
+    QWidget#MediaInfo, QWidget#DownloadControls {{
+        background-color: transparent;
+        border: 0;
+    }}
+    QFrame#PreferencesCard {{
+        background-color: {t.surface};
+        border: 1px solid {t.border};
+        border-radius: {RADIUS}px;
+    }}
+    QLabel[role="preferencesTitle"] {{
+        font-size: 18px;
+        font-weight: 600;
+    }}
 
     /* ---------- Toolbar ---------- */
     QToolBar {{
         background-color: {t.bg};
         border: 0;
-        padding: 4px 8px;
-        spacing: 4px;
+        border-bottom: 1px solid {t.border};
+        padding: 6px 14px;
+        spacing: 6px;
     }}
     QToolBar QToolButton {{
         background-color: transparent;
         color: {t.text_muted};
-        padding: 6px 10px;
+        border: 1px solid transparent;
+        padding: 6px 11px;
         border-radius: {RADIUS_SM}px;
+        min-height: 20px;
     }}
     QToolBar QToolButton:hover {{
         background-color: {t.surface};
         color: {t.text};
+        border-color: {t.border};
     }}
     QToolBar QToolButton:pressed {{
         background-color: {t.surface_alt};
+    }}
+    QToolBar QToolButton:focus {{
+        border-color: {t.border_strong};
+    }}
+    QToolBar QToolButton:disabled {{
+        background-color: transparent;
+        color: {t.text_dim};
+        border-color: transparent;
+    }}
+    QToolBar::separator {{
+        background-color: {t.border};
+        width: 1px;
+        margin: 7px 4px;
     }}
     QToolButton#ThemeToggle {{
         background-color: {t.surface};
         color: {t.text};
         border: 1px solid {t.border};
-        padding: 6px 12px;
+        padding: 6px 11px;
     }}
     QToolButton#ThemeToggle:hover {{
         background-color: {t.button_hover};
         border-color: {t.border_strong};
+    }}
+    QToolButton#MoreButton {{
+        padding-right: 22px;
+    }}
+    QToolButton#MoreButton::menu-indicator {{
+        subcontrol-origin: padding;
+        subcontrol-position: right center;
+        right: 8px;
+        width: 9px;
+        height: 6px;
+    }}
+
+    /* ---------- Popup menus ---------- */
+    QMenu {{
+        background-color: {t.surface};
+        color: {t.text};
+        border: 1px solid {t.border_strong};
+        border-radius: {RADIUS_SM}px;
+        padding: 5px;
+        min-width: 230px;
+    }}
+    QMenu::item {{
+        background-color: transparent;
+        color: {t.text};
+        padding: 10px 24px 10px 34px;
+        border-radius: 5px;
+    }}
+    QMenu::item:selected {{
+        background-color: {t.surface_alt};
+        color: {t.text};
+    }}
+    QMenu::item:disabled {{
+        color: {t.text_dim};
+    }}
+    QMenu::separator {{
+        background-color: {t.border};
+        height: 1px;
+        margin: 5px 9px;
     }}
 
     /* ---------- Labels ---------- */
@@ -245,8 +314,6 @@ def build_stylesheet(theme: Theme) -> str:
         font-size: 12px;
         font-weight: 600;
         color: {t.text_muted};
-        text-transform: uppercase;
-        letter-spacing: 1px;
     }}
     QLabel[role="badge"] {{
         background-color: {t.accent_soft};
@@ -257,7 +324,7 @@ def build_stylesheet(theme: Theme) -> str:
         font-weight: 600;
     }}
     QLabel[role="path"] {{
-        color: {t.accent};
+        color: {t.text_muted};
         font-family: "SF Mono", Menlo, Consolas, monospace;
         font-size: 12px;
     }}
@@ -286,6 +353,12 @@ def build_stylesheet(theme: Theme) -> str:
         background-color: {t.border};
         border: 0;
     }}
+    QFrame#HSep {{
+        background-color: {t.border};
+        border: 0;
+        min-height: 1px;
+        max-height: 1px;
+    }}
 
     /* ---------- Inputs ---------- */
     QLineEdit, QComboBox, QPlainTextEdit, QSpinBox, QDoubleSpinBox {{
@@ -312,16 +385,41 @@ def build_stylesheet(theme: Theme) -> str:
         border: 1px solid {t.accent};
         background-color: {t.surface_alt};
     }}
-    QComboBox::drop-down {{
+    QComboBox[lineArrow="true"]::drop-down {{
         border: 0;
-        width: 22px;
+        border-left: 1px solid {t.border};
+        width: 26px;
+        subcontrol-origin: padding;
+        subcontrol-position: top right;
+        border-top-right-radius: {RADIUS_SM}px;
+        border-bottom-right-radius: {RADIUS_SM}px;
+    }}
+    QComboBox[lineArrow="true"]::down-arrow {{
+        image: none;
+    }}
+    QComboBox {{
+        padding-right: 30px;
+    }}
+    QComboBox:hover {{
+        border-color: {t.border_strong};
+    }}
+    QComboBox:disabled {{
+        color: {t.text_dim};
+        background-color: {t.surface};
     }}
     QComboBox QAbstractItemView {{
         background-color: {t.surface};
-        border: 1px solid {t.border};
-        selection-background-color: {t.accent};
-        selection-color: {t.accent_text};
+        color: {t.text};
+        border: 1px solid {t.border_strong};
+        border-radius: {RADIUS_SM}px;
+        padding: 4px;
+        selection-background-color: {t.surface_alt};
+        selection-color: {t.text};
         outline: 0;
+    }}
+    QComboBox QAbstractItemView::item {{
+        padding: 8px 10px;
+        min-height: 18px;
     }}
     QSpinBox::up-button, QDoubleSpinBox::up-button,
     QSpinBox::down-button, QDoubleSpinBox::down-button {{
@@ -359,6 +457,21 @@ def build_stylesheet(theme: Theme) -> str:
         width: 0;
         height: 0;
     }}
+    QSpinBox[lineArrow="true"]::up-button,
+    QSpinBox[lineArrow="true"]::down-button {{
+        background-color: transparent;
+        width: 24px;
+        border-left: 1px solid {t.border};
+        subcontrol-origin: padding;
+        right: 1px;
+    }}
+    QSpinBox[lineArrow="true"]::up-arrow,
+    QSpinBox[lineArrow="true"]::down-arrow {{
+        image: none;
+        border: 0;
+        width: 0;
+        height: 0;
+    }}
 
     /* ---------- Buttons ---------- */
     QPushButton {{
@@ -376,6 +489,9 @@ def build_stylesheet(theme: Theme) -> str:
     QPushButton:pressed {{
         background-color: {t.button_pressed};
     }}
+    QPushButton:focus {{
+        border-color: {t.accent};
+    }}
     QPushButton:disabled {{
         color: {t.text_dim};
         background-color: {t.surface};
@@ -387,6 +503,7 @@ def build_stylesheet(theme: Theme) -> str:
         color: {t.accent_text};
         border: 1px solid {t.accent};
         font-weight: 600;
+        min-height: 22px;
     }}
     QPushButton#Primary:hover {{
         background-color: {t.accent_hover};
@@ -395,6 +512,10 @@ def build_stylesheet(theme: Theme) -> str:
     QPushButton#Primary:pressed {{
         background-color: {t.accent_pressed};
         border-color: {t.accent_pressed};
+    }}
+    QPushButton#Primary:focus {{
+        border: 2px solid {t.border_strong};
+        padding: 6px 13px;
     }}
     QPushButton#Primary:disabled {{
         background-color: {t.accent_disabled_bg};
@@ -415,6 +536,9 @@ def build_stylesheet(theme: Theme) -> str:
     QPushButton#Link:disabled {{
         color: {t.text_dim};
     }}
+    QPushButton#Link:focus {{
+        background-color: {t.surface_alt};
+    }}
 
     QPushButton#Ghost {{
         background-color: transparent;
@@ -425,14 +549,48 @@ def build_stylesheet(theme: Theme) -> str:
         background-color: {t.surface_alt};
         border-color: {t.border_strong};
     }}
+    QPushButton#Ghost:disabled {{
+        background-color: {t.surface};
+        color: {t.text_dim};
+        border-color: {t.border};
+    }}
+    QPushButton#PlayerControl {{
+        background-color: {t.surface_alt};
+        color: {t.text};
+        border: 1px solid {t.border};
+        padding: 7px 10px;
+        min-height: 18px;
+    }}
+    QPushButton#PlayerControl:hover {{
+        background-color: {t.button_hover};
+        border-color: {t.border_strong};
+    }}
+    QPushButton#PlayerControl:pressed {{
+        background-color: {t.button_pressed};
+    }}
+    QPushButton#PlayerControl:checked {{
+        background-color: {t.accent_soft};
+        color: {t.text};
+        border-color: {t.text_muted};
+    }}
+    QPushButton#PlayerControl:focus {{
+        border-color: {t.accent};
+    }}
+    QPushButton#PlayerControl:disabled {{
+        background-color: {t.surface};
+        color: {t.text_dim};
+        border-color: {t.border};
+    }}
 
     /* ---------- List ---------- */
     QListWidget#VideoList {{
         background-color: {t.surface};
-        border: 1px solid {t.border};
-        border-radius: {RADIUS_SM}px;
-        padding: 4px;
+        border: 0;
+        padding: 0;
         outline: 0;
+    }}
+    QListWidget#VideoList QWidget {{
+        background-color: transparent;
     }}
     QListWidget#VideoList::item {{
         background-color: transparent;
@@ -492,6 +650,9 @@ def build_stylesheet(theme: Theme) -> str:
     }}
 
     /* ---------- Slider (preview seek bar) ---------- */
+    QSlider {{
+        background-color: transparent;
+    }}
     QSlider::groove:horizontal {{
         height: 4px;
         background: {t.surface_alt};
@@ -514,12 +675,26 @@ def build_stylesheet(theme: Theme) -> str:
     QSlider::handle:horizontal:hover {{
         background: {t.accent_hover};
     }}
+    QSlider::groove:horizontal:disabled,
+    QSlider::sub-page:horizontal:disabled,
+    QSlider::add-page:horizontal:disabled {{
+        background: {t.border};
+    }}
+    QSlider::handle:horizontal:disabled {{
+        background: {t.text_dim};
+    }}
+    QSlider::handle:horizontal:focus {{
+        border: 1px solid {t.text_muted};
+    }}
 
     /* ---------- Logs ---------- */
     QPlainTextEdit#Logs {{
         background-color: {t.surface};
         border: 1px solid {t.border};
         border-radius: {RADIUS_SM}px;
+        padding: 7px 10px;
+        min-height: 124px;
+        max-height: 124px;
         font-family: "SF Mono", Menlo, Consolas, monospace;
         font-size: 12px;
         color: {t.text_muted};

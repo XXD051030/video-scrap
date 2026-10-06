@@ -190,10 +190,61 @@ def _run_smoke_test(report_path: str) -> int:
 
         check("themes", themes)
 
+        def preferences():
+            from PyQt6.QtWidgets import QDialogButtonBox
+            from src.gui.settings_dialog import SettingsDialog
+
+            initial = window.settings_store.get()
+            cancelled = SettingsDialog(window.settings_store, window)
+            cancelled.show()
+            app.processEvents()
+            cancelled.buffer_spin.setValue(0)
+            cancelled.buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
+            assert window.settings_store.get() == initial
+            cancelled.deleteLater()
+
+            saved = SettingsDialog(window.settings_store, window)
+            saved.show()
+            app.processEvents()
+            assert saved.save_button.height() == 38
+            assert not saved.save_button.icon().isNull()
+            saved.buffer_spin.setValue(85)
+            saved.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+            current = window.settings_store.get()
+            assert current.playback_buffer_seconds == 85 and current.theme == initial.theme
+            assert settings_module.AppSettings.load() == current
+            saved.deleteLater()
+            window.settings_store.update(initial)
+            app.processEvents()
+            return "Preferences Save persists buffer; Cancel preserves values; theme retained"
+
+        check("preferences_dialog", preferences)
+
+        def empty_fullscreen():
+            panel = window.preview_panel
+            panel.show_video(None)
+            window.show()
+            assert panel.fullscreen_button.isEnabled()
+            assert panel.player.source().isEmpty()
+            assert panel.thumbnail_label.text() == "Select a video to preview"
+            assert not panel.play_button.isEnabled()
+            assert window.prefs_action in window.actions()
+            assert window.about_action in window.more_menu.actions()
+            for fullscreen in (True, False):
+                panel.fullscreen_button.click()
+                app.processEvents()
+                assert panel.is_fullscreen() == fullscreen
+                assert panel.player.source().isEmpty()
+                assert panel.fullscreen_button.isEnabled()
+            window.hide()
+            return "Fullscreen works without a link or media; More menu actions retained"
+
+        check("empty_preview_fullscreen", empty_fullscreen)
+
         def fixtures():
             run_ffmpeg("-f", "lavfi", "-i", "testsrc2=size=160x90:rate=15",
                        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
-                       "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                       "-t", "8", "-c:v", "libx264", "-pix_fmt", "yuv420p",
                        "-g", "15", "-c:a", "aac", "-movflags", "+faststart",
                        str(root / "sample.mp4"))
             run_ffmpeg("-i", str(root / "sample.mp4"), "-c", "copy", "-hls_time", "1",
@@ -206,7 +257,7 @@ def _run_smoke_test(report_path: str) -> int:
                 "<!doctype html><title>Offline smoke</title>"
                 "<script>window.smokeReady = 6 * 7;</script>", encoding="utf-8"
             )
-            return "2 second H.264/AAC sample; multi-segment byte-range HLS"
+            return "8 second H.264/AAC sample; multi-segment byte-range HLS"
 
         check("media_fixtures", fixtures)
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -240,15 +291,67 @@ def _run_smoke_test(report_path: str) -> int:
 
         def preview():
             panel = window.preview_panel
+            from PyQt6.QtMultimedia import QMediaPlayer
+
+            frames = []
+
+            def record_frame(frame):
+                if frame.isValid():
+                    frames.append(frame.startTime())
+
+            panel.video_widget.videoSink().videoFrameChanged.connect(record_frame)
             panel.audio_output.setMuted(True)
             panel.show_video(direct)
+            window.show()
             panel.play_button.click()
-            wait_until(lambda: panel.player.position() > 0,
+            wait_until(lambda: panel.player.position() > 0 and bool(frames),
                        f"Playback did not advance: {panel.player.errorString()}")
             result = {"position_ms": panel.player.position(),
                       "proxy_url": panel.player.source().toString()}
             assert result["proxy_url"].startswith(window.media_proxy.base_url)
+
+            player, audio = panel.player, panel.audio_output
+            source = player.source()
+            for fullscreen in (True, False):
+                before_position, before_frames = player.position(), len(frames)
+                panel.fullscreen_button.click()
+                assert panel.is_fullscreen() == fullscreen
+                assert panel.player is player and panel.audio_output is audio
+                assert player.source() == source
+                assert player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                wait_until(
+                    lambda: player.position() > before_position + 120
+                    and len(frames) > before_frames,
+                    "Playback or video frames stopped after fullscreen switch",
+                )
+
+            panel.play_button.click()
+            assert player.playbackState() == QMediaPlayer.PlaybackState.PausedState
+            paused_position = player.position()
+            for fullscreen in (True, False):
+                panel.fullscreen_button.click()
+                app.processEvents()
+                assert panel.is_fullscreen() == fullscreen
+                assert player.playbackState() == QMediaPlayer.PlaybackState.PausedState
+                assert player.source() == source and player.position() == paused_position
+
+            initial_volume = audio.volume()
+            panel.volume_slider.setValue(25)
+            assert abs(audio.volume() - 0.25) < 0.001
+            assert not audio.isMuted()
+            panel.mute_button.click()
+            assert audio.isMuted() and abs(audio.volume() - 0.25) < 0.001
+            panel.mute_button.click()
+            assert not audio.isMuted()
+            # Keep the offline fixture silent and restore the default level.
+            audio.setMuted(True)
+            panel.volume_slider.setValue(round(initial_volume * 100))
+            audio.setMuted(True)
+            result.update({"fullscreen_playback": True, "fullscreen_paused": True,
+                           "video_frames": len(frames), "volume_and_mute": True})
             panel.release_stream()
+            panel.video_widget.videoSink().videoFrameChanged.disconnect(record_frame)
+            window.hide()
             return result
 
         check("qt_multimedia_proxy_playback", preview)

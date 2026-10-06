@@ -49,10 +49,10 @@ app = BUNDLE(
     name="Video Scraper.app",
     icon=str(assets / "Logo.icns"),
     bundle_identifier="local.videoscraper.app",
-    version="0.1.0",
+    version="0.2.0",
     info_plist={
         "CFBundleDisplayName": "Video Scraper",
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleShortVersionString": "0.2.0",
         "LSMinimumSystemVersion": os.environ["VIDEO_SCRAPER_MINIMUM_MACOS"],
         "NSHighResolutionCapable": True,
         "NSDownloadsFolderUsageDescription": "Save the videos you select to your Downloads folder.",

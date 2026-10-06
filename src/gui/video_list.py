@@ -25,7 +25,7 @@ class VideoListWidget(QListWidget):
 
     selection_changed = pyqtSignal(object)
 
-    THUMB_SIZE = QSize(176, 99)
+    THUMB_SIZE = QSize(80, 45)
     THUMB_CONCURRENCY = 6
 
     def __init__(self, parent=None) -> None:
