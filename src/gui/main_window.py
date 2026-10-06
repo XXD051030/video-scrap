@@ -305,21 +305,14 @@ class MainWindow(QMainWindow):
         self.quality_combo.setCurrentText("best")
         self.quality_combo.setMinimumWidth(120)
         quality_row.addWidget(self.quality_combo)
-        quality_row.addStretch(1)
-
-        self.download_button = QPushButton("Download current")
-        self.download_button.setObjectName("Primary")
-        self.download_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.download_button.setMinimumWidth(170)
-        self.download_button.setFixedHeight(38)
-        self.download_button.clicked.connect(self.start_download)
-        self._ui_icon_bindings.append((self.download_button, "download", True))
-        quality_row.addWidget(self.download_button)
-        layout.addLayout(quality_row)
 
         self.audio_format_row = QWidget()
+        self.audio_format_row.setObjectName("AudioFormatControls")
+        self.audio_format_row.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred
+        )
         audio_row = QHBoxLayout(self.audio_format_row)
-        audio_row.setContentsMargins(0, 0, 0, 0)
+        audio_row.setContentsMargins(8, 0, 0, 0)
         audio_row.setSpacing(8)
         self.audio_format_label = QLabel("Audio format")
         self.audio_format_label.setProperty("role", "section")
@@ -333,9 +326,19 @@ class MainWindow(QMainWindow):
             "may require conversion."
         )
         audio_row.addWidget(self.audio_format_combo)
-        audio_row.addStretch(1)
         self.audio_format_row.hide()
-        layout.addWidget(self.audio_format_row)
+        quality_row.addWidget(self.audio_format_row)
+        quality_row.addStretch(1)
+
+        self.download_button = QPushButton("Download current")
+        self.download_button.setObjectName("Primary")
+        self.download_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.download_button.setMinimumWidth(170)
+        self.download_button.setFixedHeight(38)
+        self.download_button.clicked.connect(self.start_download)
+        self._ui_icon_bindings.append((self.download_button, "download", True))
+        quality_row.addWidget(self.download_button)
+        layout.addLayout(quality_row)
         self.quality_combo.currentTextChanged.connect(self._on_quality_changed)
 
         path_row = QHBoxLayout()

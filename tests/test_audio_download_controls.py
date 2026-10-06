@@ -120,6 +120,7 @@ def test_audio_controls_fit_minimum_window_with_long_metadata_and_paths():
                     window.logs_toggle_button.click()
                 window.resize(window.minimumWidth(), 640)
                 _flush()
+                assert window.minimumWidth() == 1024 and window.width() == 1024
                 controls = (
                     window.quality_combo, window.audio_format_label,
                     window.audio_format_combo, window.download_button,
@@ -136,10 +137,15 @@ def test_audio_controls_fit_minimum_window_with_long_metadata_and_paths():
                 quality = _rect_in_window(window.quality_combo, window)
                 audio = _rect_in_window(window.audio_format_combo, window)
                 path = _rect_in_window(window.path_label, window)
-                assert quality.bottom() < audio.top() < path.top()
+                download = _rect_in_window(window.download_button, window)
+                audio_label = _rect_in_window(window.audio_format_label, window)
+                assert quality.right() < audio_label.left() < audio.left()
+                assert audio.right() < download.left()
+                assert abs(quality.center().y() - audio.center().y()) <= 1
+                assert abs(audio.center().y() - download.center().y()) <= 1
                 assert audio.bottom() < path.top()
-                assert not _rect_in_window(window.audio_format_label, window).intersects(audio)
-                assert not quality.intersects(_rect_in_window(window.download_button, window))
+                assert not audio_label.intersects(audio)
+                assert not quality.intersects(download)
                 assert window.preview_panel.media_stack_host.height() >= 100
                 stage = _rect_in_window(window.preview_panel.media_stack_host, window)
                 seek = _rect_in_window(window.preview_panel.position_slider, window)

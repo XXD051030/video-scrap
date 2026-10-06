@@ -193,7 +193,7 @@ def build_stylesheet(theme: Theme) -> str:
         border-radius: {RADIUS}px;
     }}
     QWidget#PreviewPanel, QWidget#PlayerHost, QWidget#PlayerControls,
-    QWidget#MediaInfo, QWidget#DownloadControls {{
+    QWidget#MediaInfo, QWidget#DownloadControls, QWidget#AudioFormatControls {{
         background-color: transparent;
         border: 0;
     }}
