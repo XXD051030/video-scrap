@@ -7,51 +7,21 @@ The interface uses PyQt6, with extraction handled by yt-dlp, HTML parsing, and Q
 
 ## Current Status
 
-As of October 6, 2026 (UTC+08:00):
+Current version: **0.2.1**, targeting macOS Apple Silicon and Windows x64. The macOS build passed all 12 packaged checks; the FFmpeg fix passed 72 source checks. Windows runtime testing for 0.2.1 is pending.
 
-| Component | Status |
-| --- | --- |
-| Webpage video extraction, preview, and downloads | Implemented |
-| X / Twitter posts, individual video selection, playback, and downloads | Implemented |
-| Audio-only downloads with Original audio / MP3 / M4A selection | Included and checked in the rebuilt macOS app; latest Windows build not verified here |
-| About dialog with application logo and GitHub project link | Included and checked in the rebuilt macOS app; latest Windows build not verified here |
-| Dark and light themes with saved preferences | Implemented |
-| Sectioned layout, monochrome icons, and More menu | Included and checked in the macOS app; latest Windows build not verified here |
-| Fullscreen preview, volume, and mute controls | Included and checked in the macOS app; latest Windows build not verified here |
-| Single-instance startup with existing-window activation | Included and checked in the macOS app; latest Windows build not verified here |
-| Application icon | Uses `Logo.png` from the repository root |
-| macOS Apple Silicon application | `.app` and ZIP built; application checks passed |
-| Windows x64 application | ZIP built; startup, playback, and downloads tested on Windows |
-
-The macOS application has been checked for startup, theme switching and persistence, exact byte matching for direct downloads, HLS byte-range downloading and merging, playback, and embedded webpage JavaScript.
-All 90 tests across the existing 11 test scripts passed on macOS with Python 3.12.14.
-Windows startup, playback, and downloads have been tested. Automated Windows regression and smoke-test reports have not been collected.
-The macOS app was rebuilt as version 0.2.0 on October 5, 2026, with the revised interface, Preferences dialog, fullscreen, volume, and single-instance startup. All 10 packaged application checks passed. A Windows ZIP is also present locally, but its source revision and validation of the new features have not been verified here.
-The source update passed 12 single-instance checks, 9 preview-control checks, 5 desktop layout checks, and 9 Preferences dialog checks. The existing X preview and settings checks also passed. Native macOS playback checks confirm video frames continue through fullscreen transitions.
-The audio-download update was rebuilt for macOS on October 6, 2026. All 11 packaged checks passed, including Original audio / MP3 / M4A output from direct links, HLS, and separate HLS audio renditions. The source update passed 14 real-media audio checks, 6 audio UI/worker checks, and the existing 18 HLS byte-range, 10 download-name, 4 X-download, and 5 desktop layout checks. The new Windows audio feature has not been built or tested here.
-The About dialog update was rebuilt for macOS on October 6, 2026. All 12 packaged checks passed, including the bundled logo and About controls. The dialog displays the application name, version, and GitHub project link without implementation details.
+See [GitHub Releases](https://github.com/XXD051030/video-scrap/releases) for published packages and release notes.
 
 ## Features
 
-- Paste a webpage link to search for videos on the page.
-- Paste an `x.com` or `twitter.com` post link. Posts containing multiple videos show a separate entry for each video.
-- Preview videos in the app and view thumbnails, duration, resolution, and source information.
-- Use **Full screen** or double-click the preview to enlarge it, including before selecting a video. The empty preview displays a selection prompt. Press **Esc** or **Exit full screen** to return; playback and the current position are preserved.
-- A toolbar with monochrome icons and text, a **More** menu for **Preferences / About**, a separate seek row, and two rows for quality, download, and folder controls.
-- **More → About** displays the application logo and version. Use **GitHub project** to open the project homepage in your browser.
-- Compact video thumbnails and a wider preview area. Long titles and metadata are limited to two visible lines, with full text in tooltips; folder paths adapt to the available width. Small windows expand when necessary to keep controls visible.
-- Adjust the preview volume from 0 to 100%, or use **Mute / Unmute**. These controls affect the app's player, not the system volume. Volume starts at 60% each time the app opens.
-- Repeated launches activate the existing window, including a minimized or fullscreen window, instead of opening another copy for the same user.
-- Select one video and download the current selection.
-- Choose best, 1080p, 720p, 480p, or audio only. Audio-only downloads offer **Original audio**, **MP3**, or **M4A**; available source formats depend on the source.
-- Download progress, logs, and a custom output folder.
-- Parallel downloads for direct links, HLS segment downloads, and FFmpeg merging.
-- HTTP byte-range validation to prevent incorrect response data from being written to segment files. Downloads with the same name use separate temporary files and avoid overwriting existing completed files.
-- Adjustable playback buffer in **More → Preferences**: 60 seconds by default, configurable from 0 to 300 seconds. Set it to 0 to disable read-ahead.
-- Black-and-white themes: dark mode by default, with **Light mode / Dark mode** in the top-right toolbar. The choice is saved across restarts.
-- A browser extraction entry in the toolbar for pages requiring manual verification or login.
-
-Extraction tries yt-dlp, HTML scanning, page script decoding, and WebEngine rendering through the existing workflow.
+- Discover videos from webpages and `x.com` / `twitter.com` posts, including individual videos in multi-video posts.
+- Preview videos with thumbnails, duration, resolution, and source information.
+- Open **Full screen** or double-click the preview; use **Esc** to return without losing playback position. Fullscreen also works before selecting a video.
+- Adjust player volume from 0–100% or mute independently of system volume; each launch starts at 60%.
+- Choose best, 1080p, 720p, 480p, or audio only, with progress, logs, and a custom download folder.
+- Download direct media in parallel and merge HLS segments, with byte-range validation and protection against filename conflicts.
+- Switch between saved dark and light themes. **More** contains **Preferences** and **About**, including the logo, version, and GitHub link.
+- Configure playback read-ahead in **Preferences**: 60 seconds by default, 0–300 seconds available; 0 disables it.
+- Repeated launches activate the existing window. **Browser scrape** supports pages requiring manual verification or login.
 
 ## Usage
 
@@ -67,24 +37,17 @@ Select **audio only** under **Quality** to reveal the **Audio format** control:
 
 | Format | Output behavior |
 | --- | --- |
-| Original audio (default) | Extracts the audio without recompressing it. The source codec determines the appropriate container and extension, such as Opus (`.opus`), M4A, or MP3. |
-| MP3 | Produces an audio-only `.mp3` file. Conversion may reduce quality when the source uses another codec. |
-| M4A | Produces an audio-only `.m4a` file using AAC. Existing compatible AAC can be copied; other codecs require conversion, which may reduce quality. |
+| Original audio (default) | Preserves the source audio encoding. Its codec determines the extension, such as `.opus`, `.m4a`, or `.mp3`. |
+| MP3 | Saves `.mp3`; converts when the source is not MP3. |
+| M4A | Saves AAC audio in `.m4a`; copies compatible AAC or converts other codecs. |
 
-All download routes, including direct media links and HLS, apply the audio-only selection. If the source has no audio track, the task fails with a clear message instead of returning a video-only file. Sources without a separate audio stream may require the complete media to be downloaded first before extracting its audio. Intermediate media is temporary and is cleaned up after processing, cancellation, or failure; a forced process termination can leave temporary files behind.
-For an HLS master with separate audio, the app selects the default audio rendition from the selected video variant's audio group. It retains the default embedded track when that rendition has no separate URL. Audio segment downloads use the same byte-range checks as video downloads.
+Conversion may reduce quality. Direct links and HLS support all three options; each queued task keeps its selected format. Sources without a separate audio stream may require the full media download first. Missing audio tracks produce an error.
 
-Audio extraction and conversion require FFmpeg; the packaged app includes it. Source runs use the FFmpeg discovery described below. Each queued task keeps the format selected when you clicked **Download current**, even if you change the controls afterward. A processing message is shown while extraction or conversion runs.
-Use the macOS package rebuilt on October 6, 2026, for this feature. Earlier version 0.2.0 packages lack these audio-format controls; rebuild on Windows to include the update there.
-
-Fullscreen mode retains playback, seek, volume, and mute controls. Fullscreen switching also works while paused and does not restart the video.
-Close all older app windows before using a rebuilt version: older binaries do not participate in single-instance protection.
+FFmpeg is required and included in packaged apps. Temporary media is cleaned up after processing, cancellation, or failure; forced termination can leave files behind. Close older app windows before launching an updated version.
 
 ### X / Twitter Login
 
-If a post requires login, first sign in to X in a supported browser, select that browser under **X session**, and scrape again.
-The app reads the session only when you select the browser. It does not request or save your X password, or export cookies to a file.
-Access to restricted posts depends on whether the account has permission to view them.
+For posts requiring login, sign in to X in a supported browser, select it under **X session**, and scrape again. The app reads that session without saving your password or exporting cookies. Your account must have permission to view the post.
 
 ### File Locations
 
@@ -116,8 +79,7 @@ git pull --ff-only
 
 ## Run from Source
 
-Python 3.10 or newer is required; 64-bit Python 3.12 is recommended.
-Runtime dependencies are listed in `requirements.txt`, including `imageio-ffmpeg==0.6.0`. Its platform-specific wheels include an FFmpeg executable, so a supported pip installation can run audio downloads without a separate FFmpeg installation.
+Python 3.10+ is required; 64-bit Python 3.12 is recommended. `requirements.txt` includes `imageio-ffmpeg`, which supplies FFmpeg on supported platforms.
 
 ### macOS / Linux
 
@@ -137,31 +99,23 @@ py -3.12 -m venv .venv
 
 ### FFmpeg Discovery
 
-All audio-only downloads, HLS remuxing, and some yt-dlp video/audio merging operations require FFmpeg. The app first uses `ffmpeg` from the system `PATH`, then checks the application's bundled or local build executable, and finally tries the executable provided by `imageio-ffmpeg`. When using a fallback executable, the app also tells yt-dlp where to find it for merging.
+Audio downloads, HLS remuxing, and some video merges require FFmpeg. Discovery checks system `PATH`, bundled/local build assets, then `imageio-ffmpeg`; fallback paths are also provided to yt-dlp. No executable is downloaded at runtime.
 
-For an existing source checkout, update the runtime dependencies before launching again:
+After pulling source updates, reinstall `requirements.txt` using your virtual environment's Python. Build dependencies are only needed for packaging.
 
-```bash
-python -m pip install -r requirements.txt
-```
-
-Use the Python executable from your virtual environment: `.venv/bin/python` on macOS/Linux or `.\.venv\Scripts\python.exe` in Windows PowerShell. Source runs do not require `requirements-build.txt` or a packaged application.
-
-If your platform has no compatible wheel, the supplied executable is unusable, or `imageio-ffmpeg` was installed without its binary, install FFmpeg separately and make `ffmpeg` available on `PATH`. On macOS, for example:
+If the included binary is unavailable or incompatible, install system FFmpeg. On macOS:
 
 ```bash
 brew install ffmpeg
 ```
 
-On Linux, use your distribution's FFmpeg package where needed. On Windows, add the directory containing `ffmpeg.exe` to `PATH` and restart the terminal before launching the app. You can check what the source app resolves with:
+On Linux, use your distribution's FFmpeg package. On Windows, add the folder containing `ffmpeg.exe` to `PATH` and restart the terminal. Check discovery with:
 
 ```powershell
 .\.venv\Scripts\python.exe -c "from src.ffmpeg import resolve_ffmpeg; print(resolve_ffmpeg() or 'FFmpeg not found')"
 ```
 
-The runtime does not download FFmpeg when a task starts. If no usable executable is found, the download reports the missing dependency instead of silently producing an incorrect file. `imageio-ffmpeg` supplies FFmpeg, not FFprobe; this app's audio extraction does not require FFprobe.
-
-The build scripts below bundle FFmpeg with the application. Packaged applications do not require a separate Python or FFmpeg installation.
+Packaged apps include Python and FFmpeg. Audio extraction does not require FFprobe.
 
 ## Build the macOS Application
 
@@ -190,12 +144,9 @@ Double-click the `.app` to run it, or move it to Applications.
 
 ### System Requirements and Validation Scope
 
-The current application binaries require macOS 13 or newer. Actual execution was tested on macOS 27.0.1.
-The build uses Python 3.12.14 with a macOS 11 deployment target; Qt raises the final minimum requirement to macOS 13.
+The current package requires macOS 13+ and was tested on macOS 27.0.1. The builder checks the minimum requirements of Python, Qt, FFmpeg, and the completed app; using a newer-only Python runtime can raise the minimum OS version.
 
-The builder reads the deployment requirements of Python, Qt, FFmpeg, and the binaries in the completed application.
-If Python was compiled only for macOS 27, rebuilding with that runtime also produces an application requiring macOS 27.
-The current application uses ad-hoc signing. Developer ID signing and notarization are not configured.
+The app uses ad-hoc signing; Developer ID signing and notarization are not configured.
 
 ## Build the Windows Application
 
@@ -224,15 +175,11 @@ dist/
 Double-click `Video Scraper.exe` to run it. To use it on another computer, send the complete ZIP and extract it before launching.
 The `.exe` and `_internal/` folder must remain together in the same application directory. Copying only the `.exe` is insufficient.
 
-A Windows x64 ZIP has been produced and tested for startup, playback, and downloads. An automated Windows smoke-test report has not been collected. Code signing is not configured.
-See the [Windows build guide (Chinese)](WINDOWS_BUILD.md) for detailed instructions and troubleshooting.
-PyInstaller requires separate builds on each [target operating system](https://pyinstaller.org/en/stable/); macOS cannot directly produce the Windows build.
+Code signing is not configured. See the [Windows build guide (Chinese)](WINDOWS_BUILD.md) for troubleshooting. Each package must be built on its target OS; macOS cannot directly produce the Windows build.
 
 ## Offline Application Checks
 
-The checks use temporary settings, a local test webpage, and generated sample videos. They do not read browser login information.
-They verify downloaded bytes, HLS merging, audio-only extraction and conversion (including separate HLS audio renditions), playback through fullscreen transitions, volume and mute, webpage JavaScript, themes, and settings persistence.
-The playback check briefly opens the app and fullscreen preview using a generated sample video.
+Checks use temporary settings and local sample media without browser credentials. They cover downloads, HLS, audio formats, playback/fullscreen, volume, themes, About, and embedded webpages. The playback check briefly opens the app.
 
 ### macOS
 
@@ -260,9 +207,10 @@ With the project build environment and FFmpeg installed, run:
 ```bash
 python tests/test_audio_downloads.py
 python tests/test_audio_download_controls.py
+python tests/test_ffmpeg_resolver.py
 ```
 
-These checks generate temporary media and use localhost instead of external websites. They verify pure audio output, unchanged compressed packets for Original audio, HLS audio selection and range failures, cancellation and cleanup, concurrent filenames, queued format selection, and control layout. They do not establish Windows compatibility when run on macOS.
+These checks cover audio output, packet preservation, HLS ranges, cancellation, cleanup, filenames, queued formats, controls, and FFmpeg discovery. Running them on macOS does not establish Windows compatibility.
 
 ## Logs and Build Records
 
@@ -279,39 +227,18 @@ Third-party license texts are bundled in the `third-party/` resource directory.
 
 ## Project Layout
 
-```text
-video-scrap/
-├── main.py                         # Application entry point
-├── Logo.png                        # Shared macOS / Windows icon
-├── requirements.txt                # Runtime dependencies
-├── requirements-build.txt          # Build tools
-├── README.md
-├── WINDOWS_BUILD.md
-├── app_bundle/
-│   ├── VideoScraper.spec            # macOS configuration
-│   ├── VideoScraper-Windows.spec    # Windows configuration
-│   └── runtime_hook.py             # Exposes the bundled FFmpeg executable
-├── scripts/
-│   ├── build_macos.py
-│   ├── build_windows.py
-│   └── smoke_app.py                # Offline application checks
-├── src/
-│   ├── scraper.py                  # Webpage / X video extraction
-│   ├── downloader.py               # Downloads and HLS merging
-│   ├── parallel_downloader.py      # Parallel direct downloads and file publishing
-│   ├── media_proxy.py              # Playback proxy and cache
-│   ├── settings.py                 # Persistent settings
-│   ├── single_instance.py          # Process lock and existing-window activation
-│   ├── js_decoder.py
-│   ├── net.py
-│   ├── utils.py
-│   └── gui/                        # Interface, player, browser, and background tasks
-└── tests/                          # Existing regression tests
-```
+| Path | Purpose |
+| --- | --- |
+| `main.py` | Application entry point |
+| `src/` | Extraction, downloads, playback/cache, settings, and GUI |
+| `app_bundle/` | macOS/Windows PyInstaller configurations and runtime hook |
+| `scripts/` | Build scripts and packaged application checks |
+| `tests/` | Regression checks |
+| `Logo.png` | Shared application icon |
 
 ## Known Limitations
 
 - Extraction, playback, and downloads depend on the media formats provided by the source, account permissions, and network conditions.
 - Some yt-dlp sources provide streams that cannot be previewed directly in Qt, although downloading may still work.
 - The current HLS implementation does not support some combinations of initialization segments and byte ranges, or special encrypted range formats. It reports an error rather than continuing when it cannot handle them safely.
-- macOS test results do not establish Windows compatibility. Windows validation currently covers startup, playback, and downloads; automated regression and smoke-test results have not been collected on Windows.
+- Earlier Windows builds were tested for startup, playback, and downloads; automated Windows regression and smoke-test reports have not been collected for 0.2.1.
