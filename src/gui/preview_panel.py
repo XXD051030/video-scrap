@@ -577,6 +577,9 @@ class PreviewPanel(QWidget):
             if is_x_video:
                 self.player_message.emit("X preview unavailable: media proxy is not running.")
                 return None
+            if video.hls_png_wrapped:
+                self.player_message.emit("Preview unavailable: media proxy is not running.")
+                return None
             return playable_url
         if not is_x_video and not (
             video.referer or self._pending_playable_headers or self._pending_is_hls
@@ -595,6 +598,8 @@ class PreviewPanel(QWidget):
                 variant_options = {}
                 if self._pending_hls_variant_url:
                     variant_options["hls_variant_url"] = self._pending_hls_variant_url
+                if video.hls_png_wrapped:
+                    variant_options["hls_png_wrapped"] = True
                 local = self._proxy.register(
                     playable_url,
                     referer=video.referer,
@@ -605,6 +610,9 @@ class PreviewPanel(QWidget):
         except Exception as exc:  # noqa: BLE001
             if is_x_video:
                 self.player_message.emit(f"X preview setup failed: {exc}")
+                return None
+            if video.hls_png_wrapped:
+                self.player_message.emit(f"Preview setup failed: {exc}")
                 return None
             return playable_url
         self._active_proxy_url = local

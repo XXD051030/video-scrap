@@ -6,11 +6,13 @@ import json
 import mimetypes
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import traceback
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -143,8 +145,8 @@ def _run_smoke_test(report_path: str) -> int:
                 end = min(int(match[2]) if match[2] else end, end)
                 status = 206
             self.send_response(status)
-            self.send_header("Content-Type", mimetypes.guess_type(path.name)[0]
-                             or "application/octet-stream")
+            self.send_header("Content-Type", "image/png" if path.name == "wrapped-smoke"
+                             else mimetypes.guess_type(path.name)[0] or "application/octet-stream")
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(end - start + 1))
             if status == 206:
@@ -533,6 +535,129 @@ def _run_smoke_test(report_path: str) -> int:
                 app.processEvents()
 
         check("qt_multimedia_hls_master_preview", hls_master_preview)
+
+        def wrapped_hls_preview():
+            panel = window.preview_panel
+            from PyQt6.QtMultimedia import QMediaPlayer
+
+            def png_envelope(payload, compressed):
+                def chunk(kind, data=b""):
+                    crc = zlib.crc32(data, zlib.crc32(kind)) & 0xFFFFFFFF
+                    return (struct.pack(">I", len(data)) + kind + data
+                            + struct.pack(">I", crc))
+
+                tagged = b"\x01" + zlib.compress(payload) if compressed else b"\x00" + payload
+                return b"\x89PNG\r\n\x1a\n" + chunk(b"roUd", tagged) + chunk(b"IEND")
+
+            run_ffmpeg(
+                "-i", str(root / "sample.mp4"), "-c", "copy", "-hls_time", "1",
+                "-hls_list_size", "0",
+                "-hls_segment_filename", str(root / "wrapped-source-%03d.ts"),
+                str(root / "wrapped-source.m3u8"),
+            )
+            expected_segments = {}
+            lines = []
+            for line in (root / "wrapped-source.m3u8").read_text().splitlines():
+                if line and not line.startswith("#"):
+                    payload = (root / line).read_bytes()
+                    name = line.replace("wrapped-source-", "wrapped-segment-").replace(".ts", ".png")
+                    expected_segments[base + "/" + name] = payload
+                    (root / name).write_bytes(png_envelope(payload, len(expected_segments) % 2 == 1))
+                    line = "/" + name
+                lines.append(line)
+            api = root / "api" / "hls" / "wrapped-smoke"
+            api.parent.mkdir(parents=True, exist_ok=True)
+            api.write_bytes(png_envelope(("\n".join(lines) + "\n").encode(), True))
+            item = VideoItem(
+                "Smoke PNG-wrapped HLS", base + "/api/hls/wrapped-smoke", base,
+                ext="m3u8", is_direct=True, is_hls=True, referer=base,
+                hls_png_wrapped=True, duration=8, width=160, height=90,
+            )
+            initial_settings = window.settings_store.get()
+            initial_muted = panel.audio_output.isMuted()
+            initial_visible = window.isVisible()
+            initial_tokens = set(window.media_proxy._entries)
+            initial_prefetchers = set(window.media_proxy._hls_prefetchers)
+            frames, errors = [], []
+            owned_entries = []
+            result = None
+
+            def record_frame(frame):
+                if frame.isValid():
+                    frames.append(frame.startTime())
+
+            def record_error(_error, message):
+                errors.append(message)
+
+            panel.video_widget.videoSink().videoFrameChanged.connect(record_frame)
+            panel.player.errorOccurred.connect(record_error)
+            request_start = len(requests_seen)
+            try:
+                window.settings_store.update(settings_module.AppSettings(
+                    playback_buffer_seconds=190, theme=initial_settings.theme,
+                ))
+                panel.audio_output.setMuted(True)
+                panel.show_video(item)
+                assert panel.player.source().isEmpty(), "Selecting wrapped HLS must remain lazy"
+                window.show()
+                app.processEvents()
+                panel._toggle_play()
+                wait_until(
+                    lambda: panel.player.position() >= 500 and bool(frames)
+                    and panel.player.hasVideo() and panel.player.hasAudio(),
+                    "PNG-wrapped HLS playback did not advance with video and audio",
+                )
+                assert not errors, errors
+                assert panel.player.error() == QMediaPlayer.Error.NoError, panel.player.errorString()
+                entry = window.media_proxy._lookup(panel.player.source().toString())
+                assert entry is not None and entry.hls_png_wrapped and entry.force_manifest
+                assert window.media_proxy.buffer_seconds() == 190
+                wait_until(
+                    lambda: bool(entry.hls_segment_entries)
+                    and all(segment.total_size is not None
+                            and segment.cached_run_end(0) == segment.total_size
+                            for segment in entry.hls_segment_entries),
+                    "PNG-wrapped media was not cached as decoded segment bytes",
+                )
+                owned_entries = [entry, *entry.children]
+                decoded = []
+                for segment in entry.hls_segment_entries:
+                    assert segment.hls_png_wrapped
+                    if segment.total_size is not None and segment.cached_run_end(0) == segment.total_size:
+                        cached = segment.cache_path.read_bytes()
+                        assert cached == expected_segments[segment.upstream]
+                        assert cached.startswith(b"\x47") and not cached.startswith(b"\x89PNG")
+                        decoded.append(segment.upstream.rsplit("/", 1)[-1])
+                assert len(decoded) == len(expected_segments)
+                names = {name for name, _header in requests_seen[request_start:]}
+                assert "wrapped-smoke" in names
+                assert any(name.startswith("wrapped-segment-") for name in names)
+                assert all(header is None for _name, header in requests_seen[request_start:])
+                result = {
+                    "position_ms": panel.player.position(), "video_frames": len(frames),
+                    "has_video": panel.player.hasVideo(), "has_audio": panel.player.hasAudio(),
+                    "buffer_seconds": window.media_proxy.buffer_seconds(),
+                    "extensionless_manifest": True, "compressed_and_plain_envelopes": True,
+                    "decoded_cached_segments": sorted(decoded), "player_errors": errors,
+                }
+            finally:
+                panel.release_stream()
+                panel.video_widget.videoSink().videoFrameChanged.disconnect(record_frame)
+                panel.player.errorOccurred.disconnect(record_error)
+                panel.audio_output.setMuted(initial_muted)
+                window.settings_store.update(initial_settings)
+                window.setVisible(initial_visible)
+                app.processEvents()
+            wait_until(
+                lambda: set(window.media_proxy._entries) == initial_tokens
+                and set(window.media_proxy._hls_prefetchers) == initial_prefetchers
+                and all(entry.closed and not entry.cache_path.exists() for entry in owned_entries),
+                "PNG-wrapped HLS entries or cache files leaked after stream release",
+            )
+            result["unregister_removed_entries_and_cache"] = True
+            return result
+
+        check("qt_multimedia_wrapped_hls_preview", wrapped_hls_preview)
         profile = QWebEngineProfile()
         assert profile.isOffTheRecord()
         page = QWebEnginePage(profile)

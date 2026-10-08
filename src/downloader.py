@@ -8,6 +8,7 @@ GUI thread can stay responsive.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -16,7 +17,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Iterator, Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -270,6 +271,46 @@ class VideoDownloader:
         quality: str = "best",
         on_progress: Optional[ProgressHandler] = None,
         audio_format: str = "original",
+    ) -> Path:
+        """Normalize explicitly wrapped HLS before using the existing backends."""
+        with self._download_source(item) as source:
+            return self._download_with_stage(
+                source, quality, on_progress, audio_format
+            )
+
+    @contextmanager
+    def _download_source(self, item: VideoItem) -> Iterator[VideoItem]:
+        """Keep a wrapped-HLS proxy alive through transfer, audio and publishing."""
+        if not item.hls_png_wrapped:
+            yield item
+            return
+        if not item.is_direct or not item.is_hls:
+            raise ValueError("PNG-wrapped media must be a direct HLS source")
+
+        # A separate proxy isolates this task from preview changes. Disabling
+        # its prefetch preserves the downloader's existing connection budget;
+        # it only normalizes the objects the current backend actually requests.
+        from .media_proxy import MediaProxyServer
+
+        proxy = MediaProxyServer(buffer_seconds=0)
+        try:
+            proxy.start()
+            local_url = proxy.register(
+                item.url,
+                referer=item.referer,
+                is_hls=True,
+                hls_png_wrapped=True,
+            )
+            yield replace(item, url=local_url, hls_png_wrapped=False)
+        finally:
+            proxy.stop()
+
+    def _download_with_stage(
+        self,
+        item: VideoItem,
+        quality: str,
+        on_progress: Optional[ProgressHandler],
+        audio_format: str,
     ) -> Path:
         """Keep each task's backend files private until its result is ready."""
         audio_only = quality == "audio only"

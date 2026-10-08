@@ -50,6 +50,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 import requests
 
 from .net import build_session
+from .hls_payload import MAX_HLS_PAYLOAD_BYTES, decode_hls_payload
 
 
 M3U8_CONTENT_TYPES = {
@@ -365,6 +366,8 @@ class _Entry:
         # doesn't look like one (e.g. a .jpg-disguised m3u8 + signed token).
         self.force_manifest = False
         self.hls_variant_url: Optional[str] = None
+        self.hls_png_wrapped = False
+        self._wrapped_fetch_lock = threading.Lock()
         # The media extension chosen for this entry's proxy URL, kept stable
         # across manifest re-fetches so reused children don't revert to .bin.
         self.proxy_ext = "bin"
@@ -663,6 +666,7 @@ class _HlsPrefetcher(threading.Thread):
         get_buffer_seconds: Callable[[], int],
         session: requests.Session,
         on_status: Optional[Callable[[str], None]] = None,
+        fetch_wrapped: Optional[Callable[[_Entry], None]] = None,
     ) -> None:
         super().__init__(
             name=f"HlsPre[{manifest_entry.cache_path.name}]",
@@ -672,6 +676,7 @@ class _HlsPrefetcher(threading.Thread):
         self.get_buffer_seconds = get_buffer_seconds
         self.session = session
         self.on_status = on_status
+        self.fetch_wrapped = fetch_wrapped
         # Suppress repeated chatter for the same player position.
         self._last_announced_anchor: Optional[int] = None
 
@@ -756,6 +761,10 @@ class _HlsPrefetcher(threading.Thread):
     def _fetch_segment(self, segment: _Entry) -> None:
         if segment.closed or segment.cached_run_end(0) > 0:
             return
+        if segment.hls_png_wrapped:
+            if self.fetch_wrapped is not None:
+                self.fetch_wrapped(segment)
+            return
         headers = dict(segment.headers)
         headers["Accept-Encoding"] = "identity"
         try:
@@ -807,6 +816,7 @@ class MediaProxyServer:
         self,
         settings_store=None,
         on_status: Optional[Callable[[str], None]] = None,
+        buffer_seconds: Optional[int] = None,
     ) -> None:
         self._entries: Dict[str, _Entry] = {}
         self._token_by_entry: Dict[int, str] = {}
@@ -837,6 +847,8 @@ class MediaProxyServer:
             settings_store.subscribe(
                 self._on_settings_changed, fire_initial=False
             )
+        if buffer_seconds is not None:
+            self._buffer_seconds = max(0, int(buffer_seconds))
 
     @property
     def port(self) -> int:
@@ -953,6 +965,7 @@ class MediaProxyServer:
         is_hls: bool = False,
         cookiejar: Optional[CookieJar] = None,
         hls_variant_url: Optional[str] = None,
+        hls_png_wrapped: bool = False,
     ) -> str:
         if not upstream:
             raise ValueError("upstream URL required")
@@ -983,7 +996,11 @@ class MediaProxyServer:
         )
         entry.force_manifest = is_hls
         entry.hls_variant_url = hls_variant_url
+        entry.hls_png_wrapped = hls_png_wrapped
         with self._lock:
+            if parent is not None and parent.closed:
+                entry.close()
+                raise RuntimeError("Cannot register media under a closed manifest")
             self._entries[token] = entry
             self._token_by_entry[id(entry)] = token
             if parent is not None:
@@ -992,7 +1009,7 @@ class MediaProxyServer:
         # Top-level entries (no parent) get a dedicated sequential
         # prefetcher. HLS segment entries are children of the manifest
         # and are filled in bulk by the manifest's _HlsPrefetcher.
-        if parent is None:
+        if parent is None and not hls_png_wrapped:
             prefetcher = _Prefetcher(
                 entry,
                 get_buffer_bytes=self.buffer_bytes,
@@ -1040,10 +1057,10 @@ class MediaProxyServer:
             self._dispose_entry(entry)
 
     def _dispose_entry(self, entry: _Entry) -> None:
-        # Recursively clean up children first - their token entries need
-        # to be removed from the map too. Snapshot under the lock so a
-        # concurrent manifest rewrite can't slip a new child past us.
+        # Close the parent under the registration lock before taking the
+        # snapshot, so an in-flight rewrite cannot add children after it.
         with self._lock:
+            entry.close()
             children = list(entry.children)
             entry.children.clear()
             for child in children:
@@ -1054,7 +1071,6 @@ class MediaProxyServer:
                     self._hls_prefetchers.pop(child_token, None)
         for child in children:
             self._dispose_entry(child)
-        entry.close()
 
     def _lookup(self, path: str) -> Optional[_Entry]:
         clean = urlparse(path).path
@@ -1085,6 +1101,28 @@ class MediaProxyServer:
 
         # Track HLS player progress as soon as we see a segment request.
         self._note_player_segment(entry)
+
+        if entry.hls_png_wrapped:
+            if self._likely_manifest(entry):
+                self._serve_wrapped_manifest(request, entry, body=body)
+                return
+            try:
+                self._ensure_wrapped_cache(entry)
+            except Exception as exc:  # noqa: BLE001
+                self._emit(f"Player wrapped-media error: {exc}")
+                self._send_manifest_error(request, 502, str(exc), body=body)
+                return
+            if not body:
+                request.send_response(200)
+                request.send_header("Content-Type", self._guess_content_type(entry))
+                request.send_header("Content-Length", str(entry.total_size))
+                request.send_header("Accept-Ranges", "bytes")
+                request.end_headers()
+            else:
+                # The cache now holds logical media bytes. The existing range
+                # path can serve them without probing or ranging the PNG.
+                self._serve_range(request, entry)
+            return
 
         # M3U8 manifests must be fetched fresh and rewritten so their
         # internal segment URLs come back through us.
@@ -1117,6 +1155,81 @@ class MediaProxyServer:
         return path.endswith(".m3u8") or path.endswith(".mpd")
 
     # ----- manifest --------------------------------------------------------
+
+    def _fetch_wrapped_payload(self, entry: _Entry) -> Tuple[bytes, str]:
+        """Fetch a full envelope; upstream byte offsets are not media offsets."""
+        headers = dict(entry.headers)
+        headers.pop("Range", None)
+        headers["Accept-Encoding"] = "identity"
+        max_wire_bytes = MAX_HLS_PAYLOAD_BYTES + 1024 * 1024
+        with self._session.get(
+            entry.upstream, headers=headers, stream=True, timeout=(10, 30),
+            allow_redirects=True, **entry.cookie_kwargs,
+        ) as response:
+            if response.status_code != 200:
+                raise ValueError(f"Wrapped media returned HTTP {response.status_code}")
+            length = _parse_content_length(response.headers.get("Content-Length"))
+            if length is not None and length > max_wire_bytes:
+                raise ValueError("Wrapped HLS response exceeds the size limit")
+            chunks = []
+            received = 0
+            for chunk in response.iter_content(CHUNK_SIZE):
+                if entry.closed:
+                    raise RuntimeError("Wrapped media request cancelled")
+                received += len(chunk)
+                if received > max_wire_bytes:
+                    raise ValueError("Wrapped HLS response exceeds the size limit")
+                chunks.append(chunk)
+            payload = decode_hls_payload(b"".join(chunks))
+            if not payload or len(payload) > MAX_HLS_PAYLOAD_BYTES:
+                raise ValueError("Empty or oversized wrapped HLS payload")
+            return payload, response.url or entry.upstream
+
+    def _ensure_wrapped_cache(self, entry: _Entry) -> None:
+        # Player and prefetch requests share a single complete, validated
+        # fetch. Failed/partial envelopes never enter the sparse byte cache.
+        with entry._wrapped_fetch_lock:
+            if entry.closed:
+                raise RuntimeError("Wrapped media request cancelled")
+            if entry.total_size is not None and entry.cached_run_end(0) >= entry.total_size:
+                return
+            payload, _ = self._fetch_wrapped_payload(entry)
+            if entry.closed:
+                raise RuntimeError("Wrapped media request cancelled")
+            entry.write_at(0, payload)
+            entry.total_size = len(payload)
+
+    def _serve_wrapped_manifest(
+        self, request: BaseHTTPRequestHandler, entry: _Entry, *, body: bool,
+    ) -> None:
+        try:
+            payload, final_url = self._fetch_wrapped_payload(entry)
+            text = payload.decode("utf-8-sig")
+            if not text.lstrip().startswith("#EXTM3U"):
+                raise ValueError("Wrapped player response is not an HLS manifest")
+            if entry.closed:
+                raise RuntimeError("Wrapped manifest request cancelled")
+            rewritten, segments, durations = self._rewrite_m3u8(text, final_url, entry)
+            for idx, segment in enumerate(segments):
+                segment.hls_index = idx
+            entry.hls_segment_entries = segments
+            entry.hls_segment_durations = durations
+            result = rewritten.encode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            self._emit(f"Player wrapped-manifest error: {exc}")
+            self._send_manifest_error(request, 502, str(exc), body=body)
+            return
+        request.send_response(200)
+        request.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        request.send_header("Content-Length", str(len(result)))
+        request.send_header("Cache-Control", "no-store")
+        request.end_headers()
+        if body:
+            try:
+                request.wfile.write(result)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            self._ensure_hls_prefetcher(entry)
 
     def _serve_manifest(
         self, request: BaseHTTPRequestHandler, entry: _Entry
@@ -1204,6 +1317,8 @@ class MediaProxyServer:
         if token is None:
             return
         with self._lock:
+            if manifest_entry.closed or self._entries.get(token) is not manifest_entry:
+                return
             existing = self._hls_prefetchers.get(token)
             if existing is not None:
                 # Manifest re-fetched; just nudge the existing worker so
@@ -1215,6 +1330,7 @@ class MediaProxyServer:
                 get_buffer_seconds=self.buffer_seconds,
                 session=self._session,
                 on_status=self._on_status,
+                fetch_wrapped=self._ensure_wrapped_cache,
             )
             self._hls_prefetchers[token] = worker
         worker.start()
@@ -1222,12 +1338,15 @@ class MediaProxyServer:
     @staticmethod
     def _send_manifest_error(
         request: BaseHTTPRequestHandler, status: int, message: str,
+        *, body: bool = True,
     ) -> None:
         payload = message.encode("utf-8")
         request.send_response(status)
         request.send_header("Content-Type", "text/plain; charset=utf-8")
         request.send_header("Content-Length", str(len(payload)))
         request.end_headers()
+        if not body:
+            return
         try:
             request.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError):
@@ -1660,6 +1779,7 @@ class MediaProxyServer:
         segment_entries: List[_Entry] = []
         segment_durations: List[float] = []
         pending_duration: Optional[float] = None
+        pending_variant = False
 
         for raw_line in text.splitlines():
             line = raw_line.rstrip("\r")
@@ -1668,6 +1788,10 @@ class MediaProxyServer:
                 out_lines.append(line)
                 continue
             if stripped.startswith("#"):
+                if stripped.startswith("#EXT-X-STREAM-INF:"):
+                    pending_variant = True
+                elif stripped.upper().startswith("#EXTINF:"):
+                    pending_variant = False
                 if stripped.upper().startswith("#EXTINF:"):
                     pending_duration = None
                 m = _EXTINF_RE.match(stripped)
@@ -1677,20 +1801,25 @@ class MediaProxyServer:
                         pending_duration = duration if math.isfinite(duration) else None
                     except ValueError:
                         pending_duration = None
+                manifest_uri = manifest_entry.hls_png_wrapped and stripped.startswith(
+                    ("#EXT-X-MEDIA:", "#EXT-X-I-FRAME-STREAM-INF:")
+                )
                 rewritten = _M3U8_URI_ATTR_RE.sub(
-                    lambda mm: f'URI="{self._wrap_relative(mm.group(1), manifest_url, manifest_entry)[0]}"',
+                    lambda mm: f'URI="{self._wrap_relative(mm.group(1), manifest_url, manifest_entry, is_manifest=manifest_uri)[0]}"',
                     line,
                 )
                 out_lines.append(rewritten)
             else:
                 wrapped, child_entry = self._wrap_relative(
-                    stripped, manifest_url, manifest_entry
+                    stripped, manifest_url, manifest_entry,
+                    is_manifest=manifest_entry.hls_png_wrapped and pending_variant,
                 )
                 out_lines.append(wrapped)
                 if child_entry is not None and pending_duration is not None:
                     segment_entries.append(child_entry)
                     segment_durations.append(pending_duration)
                 pending_duration = None
+                pending_variant = False
         return "\n".join(out_lines) + "\n", segment_entries, segment_durations
 
     def _wrap_relative(
@@ -1698,6 +1827,7 @@ class MediaProxyServer:
         url: str,
         base_url: str,
         manifest_entry: _Entry,
+        *, is_manifest: bool = False,
     ) -> Tuple[str, Optional[_Entry]]:
         if not url:
             return url, None
@@ -1713,6 +1843,9 @@ class MediaProxyServer:
         with self._lock:
             existing = manifest_entry.hls_child_by_upstream.get(absolute)
         if existing is not None and not existing.closed:
+            if is_manifest:
+                existing.force_manifest = True
+                existing.proxy_ext = "m3u8"
             existing_token = self._token_for(existing)
             if existing_token is not None:
                 return (
@@ -1737,6 +1870,8 @@ class MediaProxyServer:
             extra_headers=child_headers,
             parent=manifest_entry,
             cookiejar=manifest_entry.cookiejar,
+            is_hls=is_manifest,
+            hls_png_wrapped=manifest_entry.hls_png_wrapped,
         )
         leaf = local.rsplit("/", 1)[-1]
         token = leaf.rsplit(".", 1)[0]

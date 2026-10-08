@@ -299,6 +299,99 @@ def _extract_next_data_ev_hls(html: str) -> Optional[Tuple[str, Optional[str]]]:
     return video_url, (title if isinstance(title, str) else None)
 
 
+# TanStack Start streams the same player blob as JS object literals instead
+# of __NEXT_DATA__ JSON. Read only that data; never evaluate page scripts.
+_JSON_STRING_LITERAL = r'"(?:[^"\\]|\\.)*"'
+_JS_SINGLE_STRING_LITERAL = r"'(?:[^'\\]|\\.)*'"
+_TSR_EV_TOKENS = re.compile(
+    rf"(?P<ev>(?<![\w$])(?:ev|\"ev\"|'ev')\s*:\s*"
+    rf"\$R\[\d+\]\s*=(?![=>])\s*\{{"
+    rf"(?P<fields>(?:{_JSON_STRING_LITERAL}|{_JS_SINGLE_STRING_LITERAL}|"
+    rf"[^{{}}\"'`])*)\}})"
+    rf"|{_JSON_STRING_LITERAL}|{_JS_SINGLE_STRING_LITERAL}"
+    r"|`(?:[^`\\]|\\.)*`|//[^\n]*|/\*.*?\*/",
+    re.DOTALL,
+)
+_TSR_EV_FIELD = re.compile(
+    rf"\s*(?P<key>d|k|\"d\"|\"k\"|'d'|'k')\s*:\s*"
+    rf"(?P<value>{_JSON_STRING_LITERAL}|-?(?:0|[1-9]\d*))\s*"
+    r"(?P<separator>,|$)"
+)
+
+
+def _parse_tsr_ev_literal(fields: str) -> Optional[Dict]:
+    """Accept only literal d/k fields belonging to one streamed ev object."""
+    values: Dict = {}
+    pos = 0
+    while fields[pos:].strip():
+        match = _TSR_EV_FIELD.match(fields, pos)
+        if not match:
+            return None
+        key = match["key"].strip("\"'")
+        if key in values:
+            return None
+        try:
+            values[key] = json.loads(match["value"])
+        except ValueError:
+            return None
+        pos = match.end()
+    return values if set(values) == {"d", "k"} else None
+
+
+def _resolve_player_media_url(value: object, page_url: str) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if any(ord(c) <= 32 or ord(c) == 127 for c in value) or "\\" in value:
+        return None
+    try:
+        original = urlparse(value)
+        if original.scheme and (
+            original.scheme.lower() not in {"http", "https"}
+            or not original.netloc
+        ):
+            return None
+        resolved = urljoin(page_url, value)
+        parsed = urlparse(resolved)
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return None
+        parsed.port  # Validate malformed / out-of-range ports as well.
+        return resolved
+    except ValueError:
+        return None
+
+
+def _extract_tanstack_ev_hls(html: str, page_url: str) -> Optional[str]:
+    """Recover the streamed player's HLS URL, including relative API routes."""
+    soup = BeautifulSoup(html, "lxml")
+    for script in soup.find_all("script", attrs={"data-tsr-stream-part": True}):
+        text = script.get_text()
+        if not re.match(
+            r"\s*\$_TSR\s*\.\s*router\s*=(?![=>])\s*"
+            r"\(\s*\$R\s*=>\s*\$R\[\d+\]\s*=(?![=>])\s*\{",
+            text,
+        ):
+            continue
+        for match in _TSR_EV_TOKENS.finditer(text):
+            if not match["ev"]:
+                continue
+            ev = _parse_tsr_ev_literal(match["fields"])
+            decoded = _decrypt_next_ev(ev) if ev else None
+            if not decoded:
+                continue
+            video_url = _resolve_player_media_url(
+                decoded.get("videoUrl") or decoded.get("url"), page_url
+            )
+            if video_url:
+                return video_url
+    return None
+
+
 @dataclass
 class VideoItem:
     """One scraped video entry shown to the user."""
@@ -320,6 +413,7 @@ class VideoItem:
     x_playlist_index: Optional[int] = None
     x_auth_browser: Optional[str] = None
     x_cookiejar: Optional[CookieJar] = field(default=None, repr=False)
+    hls_png_wrapped: bool = False
 
     @property
     def resolution(self) -> str:
@@ -479,20 +573,40 @@ class VideoScraper:
                 )
 
         if html_text:
+            streamed_player = False
             try:
                 ev_hls = _extract_next_data_ev_hls(html_text)
+                if not ev_hls:
+                    streamed_url = _extract_tanstack_ev_hls(html_text, url)
+                    ev_hls = (streamed_url, None) if streamed_url else None
+                    streamed_player = bool(streamed_url)
             except Exception as exc:  # noqa: BLE001
                 log(f"Encrypted-config extractor failed: {exc}")
                 ev_hls = None
-            if ev_hls and ev_hls[0] not in seen_urls:
+            if ev_hls:
                 ev_url, ev_title = ev_hls
                 seen_urls.add(ev_url)
-                results.insert(
-                    0,
-                    self._item_from_hls(
+                # A disguised / extensionless manifest may already have been
+                # scanned as a plain video. Upgrade it rather than letting
+                # deduplication suppress the authoritative player config.
+                existing = next((item for item in results if item.url == ev_url), None)
+                if existing:
+                    results = [item for item in results if item.url != ev_url]
+                    existing.title = ev_title or page_title
+                    existing.source_url = url
+                    existing.referer = url
+                    existing.ext = "m3u8"
+                    existing.is_direct = True
+                    existing.is_hls = True
+                    if not existing.thumbnail:
+                        existing.thumbnail = poster
+                    main_video = existing
+                else:
+                    main_video = self._item_from_hls(
                         ev_url, url, ev_title or page_title, poster
-                    ),
-                )
+                    )
+                main_video.hls_png_wrapped = streamed_player
+                results.insert(0, main_video)
                 log("Encrypted player-config extractor recovered the HLS stream")
 
         log(f"Found {len(results)} video(s).")
