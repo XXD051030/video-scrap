@@ -34,6 +34,7 @@ machine cannot proxy arbitrary URLs through it.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import secrets
@@ -44,7 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
@@ -71,7 +72,7 @@ _KNOWN_MEDIA_EXTS = {
 
 
 _M3U8_URI_ATTR_RE = re.compile(r'URI="([^"]+)"', re.IGNORECASE)
-_EXTINF_RE = re.compile(r"#EXTINF:([0-9.]+)", re.IGNORECASE)
+_EXTINF_RE = re.compile(r"#EXTINF:([0-9]+(?:\.[0-9]+)?|\.[0-9]+)\s*,", re.IGNORECASE)
 _CONTENT_RANGE_RE = re.compile(
     r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE
 )
@@ -83,6 +84,109 @@ _CROSS_HOST_MEDIA_HEADERS = {
     "accept", "accept-encoding", "accept-language", "origin", "referer",
     "user-agent",
 }
+
+
+def _googlevideo_variant_identity(url: str) -> Optional[tuple]:
+    """Compare a signed Googlevideo URL without changing its request URL.
+
+    Fetching the same master again can refresh its signatures while retaining
+    the video id, format, expiry and every other resource-identifying field.
+    Only signature values may differ; other hosts use exact URL matching.
+    """
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return None
+    if host != "googlevideo.com" and not host.endswith(".googlevideo.com"):
+        return None
+    signature_keys = {"sig", "lsig", "signature"}
+    parts = parsed.path.split("/")
+    index = 0
+    while index + 1 < len(parts):
+        if parts[index] in signature_keys:
+            parts[index + 1] = "<signature>"
+            index += 2
+        else:
+            index += 1
+    query = tuple(sorted(
+        (key, "<signature>" if key in signature_keys else value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+    ))
+    return (
+        parsed.scheme, parsed.netloc, tuple(parts), parsed.params, query,
+        parsed.fragment,
+    )
+
+
+def _select_hls_master_variant(
+    text: str, manifest_url: str, variant_url: str,
+) -> str:
+    """Keep one requested video variant and its related media groups."""
+    from .downloader import _parse_m3u8_attrs
+
+    lines = text.splitlines()
+    variants = []
+    pending = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#EXT-X-STREAM-INF:"):
+            if pending is not None:
+                raise ValueError("HLS master contains a variant without a playlist URL")
+            pending = index
+        elif stripped and not stripped.startswith("#") and pending is not None:
+            attrs = _parse_m3u8_attrs(lines[pending].split(":", 1)[1])
+            variants.append((pending, index, urljoin(manifest_url, stripped), attrs))
+            pending = None
+    if pending is not None:
+        raise ValueError("HLS master contains a variant without a playlist URL")
+
+    matches = [variant for variant in variants if variant[2] == variant_url]
+    if not matches:
+        identity = _googlevideo_variant_identity(variant_url)
+        if identity is not None:
+            matches = [
+                variant for variant in variants
+                if _googlevideo_variant_identity(variant[2]) == identity
+            ]
+    if not matches:
+        raise ValueError("Selected HLS preview variant is missing from the refreshed master")
+
+    def bandwidth(variant) -> int:
+        try:
+            return int(variant[3].get("BANDWIDTH") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    # The same video playlist can be paired with low/high audio groups.
+    # Keep the higher-bandwidth pairing, never another video resource.
+    selected = max(matches, key=bandwidth)
+    selected_indexes = {selected[0], selected[1]}
+    variant_indexes = {index for variant in variants for index in variant[:2]}
+    media_types = {"AUDIO", "VIDEO", "SUBTITLES", "CLOSED-CAPTIONS"}
+    referenced_groups = {
+        (kind, selected[3][kind])
+        for kind in media_types
+        if selected[3].get(kind) and selected[3][kind] != "NONE"
+    }
+    retained_groups = set()
+    output = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if index in variant_indexes and index not in selected_indexes:
+            continue
+        if stripped.startswith("#EXT-X-I-FRAME-STREAM-INF:"):
+            continue
+        if stripped.startswith("#EXT-X-MEDIA:"):
+            attrs = _parse_m3u8_attrs(stripped.split(":", 1)[1])
+            group = (attrs.get("TYPE"), attrs.get("GROUP-ID"))
+            if group not in referenced_groups:
+                continue
+            retained_groups.add(group)
+        output.append(line)
+    if referenced_groups - retained_groups:
+        raise ValueError("Selected HLS preview variant references a missing media group")
+    return "\n".join(output) + "\n"
 
 # Estimated playback bitrate when we don't know the actual one. ~16 Mbps,
 # which comfortably covers most 1080p web video. This is only used to
@@ -260,6 +364,7 @@ class _Entry:
         # Force manifest handling even when the URL extension / content-type
         # doesn't look like one (e.g. a .jpg-disguised m3u8 + signed token).
         self.force_manifest = False
+        self.hls_variant_url: Optional[str] = None
         # The media extension chosen for this entry's proxy URL, kept stable
         # across manifest re-fetches so reused children don't revert to .bin.
         self.proxy_ext = "bin"
@@ -847,6 +952,7 @@ class MediaProxyServer:
         parent: Optional[_Entry] = None,
         is_hls: bool = False,
         cookiejar: Optional[CookieJar] = None,
+        hls_variant_url: Optional[str] = None,
     ) -> str:
         if not upstream:
             raise ValueError("upstream URL required")
@@ -876,6 +982,7 @@ class MediaProxyServer:
             cookiejar=cookiejar,
         )
         entry.force_manifest = is_hls
+        entry.hls_variant_url = hls_variant_url
         with self._lock:
             self._entries[token] = entry
             self._token_by_entry[id(entry)] = token
@@ -1034,6 +1141,15 @@ class MediaProxyServer:
             return True
 
         try:
+            if upstream.status_code != 200:
+                message = f"Upstream manifest returned HTTP {upstream.status_code}"
+                self._emit(f"Player manifest error: {message}")
+                self._send_manifest_error(
+                    request,
+                    upstream.status_code if upstream.status_code >= 400 else 502,
+                    message,
+                )
+                return True
             content_type = (
                 upstream.headers.get("Content-Type") or ""
             ).lower().split(";")[0].strip()
@@ -1044,6 +1160,15 @@ class MediaProxyServer:
             ):
                 # Not actually a manifest - hand back to the regular path.
                 return False
+            if entry.hls_variant_url:
+                try:
+                    text = _select_hls_master_variant(
+                        text, final_url, entry.hls_variant_url
+                    )
+                except ValueError as exc:
+                    self._emit(f"Player manifest error: {exc}")
+                    self._send_manifest_error(request, 502, str(exc))
+                    return True
             rewritten, segment_entries, segment_durations = self._rewrite_m3u8(
                 text, final_url, entry
             )
@@ -1073,6 +1198,8 @@ class MediaProxyServer:
                 pass
 
     def _ensure_hls_prefetcher(self, manifest_entry: _Entry) -> None:
+        if not manifest_entry.hls_segment_entries:
+            return
         token = self._token_for(manifest_entry)
         if token is None:
             return
@@ -1091,6 +1218,20 @@ class MediaProxyServer:
             )
             self._hls_prefetchers[token] = worker
         worker.start()
+
+    @staticmethod
+    def _send_manifest_error(
+        request: BaseHTTPRequestHandler, status: int, message: str,
+    ) -> None:
+        payload = message.encode("utf-8")
+        request.send_response(status)
+        request.send_header("Content-Type", "text/plain; charset=utf-8")
+        request.send_header("Content-Length", str(len(payload)))
+        request.end_headers()
+        try:
+            request.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     # ----- HEAD ------------------------------------------------------------
 
@@ -1527,10 +1668,13 @@ class MediaProxyServer:
                 out_lines.append(line)
                 continue
             if stripped.startswith("#"):
+                if stripped.upper().startswith("#EXTINF:"):
+                    pending_duration = None
                 m = _EXTINF_RE.match(stripped)
                 if m:
                     try:
-                        pending_duration = float(m.group(1))
+                        duration = float(m.group(1))
+                        pending_duration = duration if math.isfinite(duration) else None
                     except ValueError:
                         pending_duration = None
                 rewritten = _M3U8_URI_ATTR_RE.sub(
@@ -1543,11 +1687,9 @@ class MediaProxyServer:
                     stripped, manifest_url, manifest_entry
                 )
                 out_lines.append(wrapped)
-                if child_entry is not None:
+                if child_entry is not None and pending_duration is not None:
                     segment_entries.append(child_entry)
-                    segment_durations.append(
-                        pending_duration if pending_duration is not None else 4.0
-                    )
+                    segment_durations.append(pending_duration)
                 pending_duration = None
         return "\n".join(out_lines) + "\n", segment_entries, segment_durations
 

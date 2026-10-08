@@ -113,8 +113,16 @@ def test_youtube_separate_hls_tracks_select_the_shared_master_without_mutation()
     assert PreviewPanel._is_hls_format(selected)
     assert formats == original, "Preview selection must not alter download formats"
     assert all(selected is not fmt for fmt in formats)
-    with _panel() as panel:
+    proxy = _Proxy()
+    with _panel(proxy) as panel:
         assert panel._best_playable_url(video) == selected["url"]
+        panel.show_video(video)
+        assert panel._pending_hls_variant_url == formats[3]["url"]
+        assert panel._wrap_with_proxy(panel._pending_playable_url, video)
+        args, kwargs = proxy.registrations[-1]
+        assert args == (selected["url"],)
+        assert kwargs["hls_variant_url"] == formats[3]["url"]
+        assert kwargs["is_hls"] is True
 
 
 def test_combined_hls_beats_silent_and_audio_only_direct_formats():

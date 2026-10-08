@@ -124,12 +124,12 @@ def _run_smoke_test(report_path: str) -> int:
 
         def respond(self, body):
             path = (root / unquote(urlsplit(self.path).path).lstrip("/")).resolve()
+            range_header = self.headers.get("Range")
+            requests_seen.append((path.name, range_header))
             if not path.is_relative_to(root) or not path.is_file():
                 self.send_error(404)
                 return
             data = path.read_bytes()
-            range_header = self.headers.get("Range")
-            requests_seen.append((path.name, range_header))
             start, end, status = 0, len(data) - 1, 200
             if range_header:
                 match = re.fullmatch(r"bytes=(\d+)-(\d*)", range_header)
@@ -428,6 +428,111 @@ def _run_smoke_test(report_path: str) -> int:
             return result
 
         check("qt_multimedia_proxy_playback", preview)
+
+        def hls_master_preview():
+            panel = window.preview_panel
+            from PyQt6.QtMultimedia import QMediaPlayer
+
+            # Normal TS segments exercise Qt's HLS master playback separately
+            # from the existing byte-range download checks.
+            run_ffmpeg(
+                "-i", str(root / "sample.mp4"), "-map", "0:v:0", "-c", "copy",
+                "-hls_time", "1", "-hls_list_size", "0",
+                "-hls_segment_filename", str(root / "preview-video-%03d.ts"),
+                str(root / "preview-video.m3u8"),
+            )
+            run_ffmpeg(
+                "-i", str(root / "sample.mp4"), "-map", "0:a:0", "-c", "copy",
+                "-hls_time", "1", "-hls_list_size", "0",
+                "-hls_segment_filename", str(root / "preview-audio-%03d.ts"),
+                str(root / "preview-audio.m3u8"),
+            )
+            (root / "preview-master.m3u8").write_text(
+                '#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n'
+                '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="wanted",NAME="Original",'
+                'DEFAULT=YES,AUTOSELECT=YES,URI="preview-audio.m3u8"\n'
+                '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="other",NAME="Other",'
+                'DEFAULT=YES,AUTOSELECT=YES,URI="unwanted-audio.m3u8"\n'
+                '#EXT-X-STREAM-INF:BANDWIDTH=200000,RESOLUTION=160x90,'
+                'CODECS="avc1.64000a,mp4a.40.2",AUDIO="wanted"\n'
+                'preview-video.m3u8\n'
+                '#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=640x360,'
+                'CODECS="avc1.64001e,mp4a.40.2",AUDIO="other"\n'
+                'unwanted-video.m3u8\n'
+                '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=1280x720,'
+                'CODECS="av01.0.05M.08,mp4a.40.2",AUDIO="other"\n'
+                'unwanted-av1.m3u8\n', encoding="utf-8",
+            )
+            master_url = base + "/preview-master.m3u8"
+            item = VideoItem(
+                "Smoke YouTube-shaped HLS preview", "https://www.youtube.com/watch?v=offline",
+                "https://www.youtube.com/watch?v=offline", ext="mp4", duration=8,
+                width=160, height=90, referer=base, raw={"extractor_key": "Youtube"},
+                formats=[
+                    {"format_id": "232", "url": base + "/preview-video.m3u8",
+                     "manifest_url": master_url, "protocol": "m3u8_native",
+                     "ext": "mp4", "vcodec": "avc1.64000a", "acodec": "none",
+                     "width": 160, "height": 90},
+                    {"format_id": "234", "url": base + "/preview-audio.m3u8",
+                     "manifest_url": master_url, "protocol": "m3u8_native",
+                     "ext": "mp4", "vcodec": "none", "acodec": None},
+                ],
+            )
+            initial_settings = window.settings_store.get()
+            initial_muted = panel.audio_output.isMuted()
+            initial_visible = window.isVisible()
+            frames = []
+
+            def record_frame(frame):
+                if frame.isValid():
+                    frames.append(frame.startTime())
+
+            panel.video_widget.videoSink().videoFrameChanged.connect(record_frame)
+            request_start = len(requests_seen)
+            try:
+                window.settings_store.update(settings_module.AppSettings(
+                    playback_buffer_seconds=190, theme=initial_settings.theme,
+                ))
+                panel.audio_output.setMuted(True)
+                panel.show_video(item)
+                assert panel.player.source().isEmpty(), "Selecting a video must remain lazy"
+                window.show()
+                app.processEvents()
+                panel._toggle_play()
+                wait_until(
+                    lambda: panel.player.position() >= 500 and len(frames) >= 3
+                    and panel.player.hasVideo() and panel.player.hasAudio(),
+                    "HLS master playback did not advance with video and audio",
+                )
+                assert panel.player.error() == QMediaPlayer.Error.NoError, panel.player.errorString()
+                assert window.settings_store.get().playback_buffer_seconds == 190
+                assert window.media_proxy.buffer_seconds() == 190
+                current_requests = requests_seen[request_start:]
+                names = {name for name, _header in current_requests}
+                assert {"preview-master.m3u8", "preview-video.m3u8", "preview-audio.m3u8"} <= names
+                assert any(name.startswith("preview-video-") and name.endswith(".ts") for name in names)
+                assert any(name.startswith("preview-audio-") and name.endswith(".ts") for name in names)
+                assert not any(name.startswith("unwanted-") for name in names), names
+                master_entry = window.media_proxy._lookup(panel.player.source().toString())
+                assert master_entry is not None and not master_entry.hls_segment_entries
+                master_token = window.media_proxy._token_for(master_entry)
+                assert master_token not in window.media_proxy._hls_prefetchers
+                return {
+                    "position_ms": panel.player.position(), "video_frames": len(frames),
+                    "has_video": panel.player.hasVideo(), "has_audio": panel.player.hasAudio(),
+                    "buffer_seconds": window.media_proxy.buffer_seconds(),
+                    "selected_variant_only": True, "master_prefetcher": False,
+                    "requested_files": sorted(names),
+                }
+            finally:
+                panel.release_stream()
+                panel.video_widget.videoSink().videoFrameChanged.disconnect(record_frame)
+                panel.audio_output.setMuted(initial_muted)
+                window.settings_store.update(initial_settings)
+                window.setVisible(initial_visible)
+                app.processEvents()
+
+        check("qt_multimedia_hls_master_preview", hls_master_preview)
         profile = QWebEngineProfile()
         assert profile.isOffTheRecord()
         page = QWebEnginePage(profile)

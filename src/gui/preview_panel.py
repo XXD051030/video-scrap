@@ -123,6 +123,7 @@ class PreviewPanel(QWidget):
         self._pending_playable_url: Optional[str] = None
         self._pending_playable_headers: dict[str, str] = {}
         self._pending_is_hls = False
+        self._pending_hls_variant_url: Optional[str] = None
         self._source_loaded = False
         self._fullscreen_window: Optional[_FullscreenWindow] = None
 
@@ -317,6 +318,7 @@ class PreviewPanel(QWidget):
         self._pending_playable_url = None
         self._pending_playable_headers = {}
         self._pending_is_hls = False
+        self._pending_hls_variant_url = None
         self._source_loaded = False
         self._show_thumbnail_view()
 
@@ -390,6 +392,7 @@ class PreviewPanel(QWidget):
             if isinstance(format_headers, dict):
                 self._pending_playable_headers.update(format_headers)
             self._pending_is_hls = self._is_hls_format(selected)
+            self._pending_hls_variant_url = selected.get("_preview_hls_variant_url")
         if playable_url:
             self._pending_playable_url = playable_url
             self._set_controls_enabled(True)
@@ -589,11 +592,15 @@ class PreviewPanel(QWidget):
                     is_hls=self._pending_is_hls,
                 )
             else:
+                variant_options = {}
+                if self._pending_hls_variant_url:
+                    variant_options["hls_variant_url"] = self._pending_hls_variant_url
                 local = self._proxy.register(
                     playable_url,
                     referer=video.referer,
                     extra_headers=self._pending_playable_headers,
                     is_hls=self._pending_is_hls or video.is_hls,
+                    **variant_options,
                 )
         except Exception as exc:  # noqa: BLE001
             if is_x_video:
@@ -670,7 +677,10 @@ class PreviewPanel(QWidget):
                 # YouTube exposes the two tracks separately. Its shared HLS
                 # master retains the audio-group relation that a video-only
                 # playlist loses; Qt can play that relation through the proxy.
-                selected = dict(fmt, url=fmt["manifest_url"], acodec=audio.get("acodec"))
+                selected = dict(
+                    fmt, url=fmt["manifest_url"], acodec=audio.get("acodec"),
+                    _preview_hls_variant_url=url,
+                )
                 acodec = str(selected.get("acodec") or "").lower()
             try:
                 height = int(fmt.get("height") or 0)
