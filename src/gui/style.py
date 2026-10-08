@@ -193,7 +193,8 @@ def build_stylesheet(theme: Theme) -> str:
         border-radius: {RADIUS}px;
     }}
     QWidget#PreviewPanel, QWidget#PlayerHost, QWidget#PlayerControls,
-    QWidget#MediaInfo, QWidget#DownloadControls, QWidget#AudioFormatControls {{
+    QWidget#MediaInfo, QWidget#DownloadControls, QWidget#AudioFormatControls,
+    QStackedWidget#VideoSidebar {{
         background-color: transparent;
         border: 0;
     }}
@@ -540,6 +541,24 @@ def build_stylesheet(theme: Theme) -> str:
         background-color: {t.surface_alt};
     }}
 
+    QPushButton#SidebarToggle {{
+        background-color: transparent;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        padding: 0;
+        min-height: 0;
+    }}
+    QPushButton#SidebarToggle:hover {{
+        background-color: {t.surface_alt};
+        border-color: {t.border_strong};
+    }}
+    QPushButton#SidebarToggle:pressed {{
+        background-color: {t.button_pressed};
+    }}
+    QPushButton#SidebarToggle:focus {{
+        border-color: {t.accent};
+    }}
+
     QPushButton#Ghost {{
         background-color: transparent;
         border: 1px solid {t.border};
@@ -693,8 +712,6 @@ def build_stylesheet(theme: Theme) -> str:
         border: 1px solid {t.border};
         border-radius: {RADIUS_SM}px;
         padding: 7px 10px;
-        min-height: 124px;
-        max-height: 124px;
         font-family: "SF Mono", Menlo, Consolas, monospace;
         font-size: 12px;
         color: {t.text_muted};

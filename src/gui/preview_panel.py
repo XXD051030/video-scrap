@@ -372,19 +372,24 @@ class PreviewPanel(QWidget):
         else:
             self.thumbnail_label.setText("(No thumbnail available)")
 
+        selected = None
         if self._is_x_video(video):
             selected = self._best_x_preview_format(video)
             playable_url = selected.get("url") if selected else None
-            if selected:
-                raw_headers = (video.raw or {}).get("http_headers") or {}
-                format_headers = selected.get("http_headers") or {}
-                if isinstance(raw_headers, dict):
-                    self._pending_playable_headers.update(raw_headers)
-                if isinstance(format_headers, dict):
-                    self._pending_playable_headers.update(format_headers)
-                self._pending_is_hls = self._is_hls_format(selected)
+        elif video.is_direct:
+            playable_url = video.url
+            self._pending_is_hls = video.is_hls
         else:
-            playable_url = self._best_playable_url(video)
+            selected = self._best_preview_format(video)
+            playable_url = selected.get("url") if selected else None
+        if selected:
+            raw_headers = (video.raw or {}).get("http_headers") or {}
+            format_headers = selected.get("http_headers") or {}
+            if isinstance(raw_headers, dict):
+                self._pending_playable_headers.update(raw_headers)
+            if isinstance(format_headers, dict):
+                self._pending_playable_headers.update(format_headers)
+            self._pending_is_hls = self._is_hls_format(selected)
         if playable_url:
             self._pending_playable_url = playable_url
             self._set_controls_enabled(True)
@@ -570,7 +575,9 @@ class PreviewPanel(QWidget):
                 self.player_message.emit("X preview unavailable: media proxy is not running.")
                 return None
             return playable_url
-        if not is_x_video and not video.referer:
+        if not is_x_video and not (
+            video.referer or self._pending_playable_headers or self._pending_is_hls
+        ):
             return playable_url
         try:
             if is_x_video:
@@ -583,7 +590,10 @@ class PreviewPanel(QWidget):
                 )
             else:
                 local = self._proxy.register(
-                    playable_url, referer=video.referer, is_hls=video.is_hls
+                    playable_url,
+                    referer=video.referer,
+                    extra_headers=self._pending_playable_headers,
+                    is_hls=self._pending_is_hls or video.is_hls,
                 )
         except Exception as exc:  # noqa: BLE001
             if is_x_video:
@@ -602,48 +612,81 @@ class PreviewPanel(QWidget):
         self._active_proxy_url = None
 
     def _best_playable_url(self, video: VideoItem) -> Optional[str]:
-        """Pick a URL Qt can play in-app.
-
-        Direct URLs (mp4, webm, m3u8...) are returned as-is - the proxy
-        rewrites HLS manifests so QMediaPlayer's FFmpeg backend handles
-        them too. For yt-dlp results we score the available formats.
-        """
+        """Return the chosen preview URL, retaining direct-link behavior."""
         if video.is_direct:
             return video.url
+        selected = self._best_preview_format(video)
+        return selected.get("url") if selected else None
+
+    @staticmethod
+    def _is_youtube_video(video: VideoItem) -> bool:
+        if str((video.raw or {}).get("extractor_key") or "").lower() == "youtube":
+            return True
+        for url in (video.source_url, video.referer, video.url):
+            host = (urlparse(url or "").hostname or "").lower()
+            if host in {"youtu.be", "youtube.com", "youtube-nocookie.com"} or host.endswith(
+                (".youtube.com", ".youtube-nocookie.com")
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _best_preview_format(cls, video: VideoItem) -> Optional[dict]:
+        """Choose a video-bearing format, favoring audio and common codecs."""
+        formats = [fmt for fmt in video.formats or [] if isinstance(fmt, dict)]
+        audio_by_manifest = {}
+        if cls._is_youtube_video(video):
+            for fmt in formats:
+                manifest = fmt.get("manifest_url")
+                if (
+                    isinstance(manifest, str)
+                    and manifest.startswith(("https://", "http://"))
+                    and cls._is_hls_format(fmt)
+                    and str(fmt.get("vcodec") or "").lower() == "none"
+                    and str(fmt.get("acodec") or "").lower() != "none"
+                    and not fmt.get("has_drm")
+                ):
+                    audio_by_manifest[manifest] = fmt
 
         candidates = []
-        hls_candidates = []
-        for fmt in video.formats or []:
+        for fmt in formats:
             url = fmt.get("url")
-            if not url:
+            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
                 continue
-            ext = (fmt.get("ext") or "").lower()
-            protocol = (fmt.get("protocol") or "").lower()
-            vcodec = (fmt.get("vcodec") or "").lower()
-            acodec = (fmt.get("acodec") or "").lower()
-            if "dash" in protocol or ext == "mpd":
+            ext = str(fmt.get("ext") or "").lower()
+            protocol = str(fmt.get("protocol") or "").lower()
+            vcodec = str(fmt.get("vcodec") or "").lower()
+            acodec = str(fmt.get("acodec") or "").lower()
+            if "dash" in protocol or ext == "mpd" or fmt.get("has_drm"):
                 continue
-            if vcodec == "none" and acodec == "none":
+            if vcodec == "none":
                 continue
-            height = fmt.get("height") or 0
-            score = 0
-            if vcodec != "none" and acodec != "none":
-                score += 100
-            if 360 <= (height or 0) <= 720:
-                score += 50
-            if ext == "mp4":
-                score += 10
-            if "m3u8" in protocol or ext == "m3u8":
-                hls_candidates.append((score, url))
-            elif ext in ("mp4", "webm", "mov", ""):
-                candidates.append((score, url))
-        if candidates:
-            candidates.sort(reverse=True)
-            return candidates[0][1]
-        if hls_candidates:
-            hls_candidates.sort(reverse=True)
-            return hls_candidates[0][1]
-        return None
+            is_hls = cls._is_hls_format(fmt)
+            if not is_hls and ext not in {"mp4", "webm", "mov", ""}:
+                continue
+            selected = fmt
+            audio = audio_by_manifest.get(fmt.get("manifest_url"))
+            if is_hls and acodec == "none" and audio is not None:
+                # YouTube exposes the two tracks separately. Its shared HLS
+                # master retains the audio-group relation that a video-only
+                # playlist loses; Qt can play that relation through the proxy.
+                selected = dict(fmt, url=fmt["manifest_url"], acodec=audio.get("acodec"))
+                acodec = str(selected.get("acodec") or "").lower()
+            try:
+                height = int(fmt.get("height") or 0)
+            except (TypeError, ValueError):
+                height = 0
+            # AV1 may be offered as MP4 even when Qt has no usable decoder.
+            # Prefer AVC without changing the user's download-format choice.
+            codec = 2 if vcodec.startswith(("avc1", "h264")) else (
+                0 if vcodec.startswith(("av01", "av1")) else 1
+            )
+            score = (
+                int(acodec != "none"), codec, int(360 <= height <= 720),
+                int(not is_hls), int(ext == "mp4"), height,
+            )
+            candidates.append((score, selected))
+        return max(candidates, key=lambda option: option[0])[1] if candidates else None
 
     def _apply_thumbnail(self, _index: int, data: bytes) -> None:
         pixmap = QPixmap()

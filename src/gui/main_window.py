@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 from typing import List, Optional
 
-from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QToolBar,
     QToolButton,
@@ -65,6 +66,10 @@ DOWNLOAD_LANE_IDLE_BASE = 8
 DOWNLOAD_LANE_IDLE_MAX = 32
 DOWNLOAD_LANE_STEP = 8
 DOWNLOAD_LANE_INCREASE_SEGMENTS = 80
+SIDEBAR_COLLAPSED_WIDTH = 52
+LOGS_DEFAULT_HEIGHT = 140
+LOGS_COMPACT_HEIGHT = 64
+LOGS_MIN_HEIGHT = 32
 
 
 def _make_card(parent: Optional[QWidget] = None) -> QFrame:
@@ -142,6 +147,9 @@ class MainWindow(QMainWindow):
         self._current_url: str = ""
         self._current_x_auth_browser: Optional[str] = None
         self._logs_expanded: bool = False
+        self._logs_window_growth: int = 0
+        self._video_list_collapsed: bool = False
+        self._video_list_expanded_width: int = 377
         self._download_failed_count: int = 0
         self._closing: bool = False
         self._ui_icon_bindings: list[tuple[object, str, bool]] = []
@@ -235,10 +243,13 @@ class MainWindow(QMainWindow):
 
     def _build_splitter(self) -> QWidget:
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.video_splitter = splitter
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(8)
 
         # --- Left: discovered videos card ---
+        self.sidebar_stack = QStackedWidget()
+        self.sidebar_stack.setObjectName("VideoSidebar")
         left_card = _make_card()
         left_layout = QVBoxLayout(left_card)
         left_layout.setContentsMargins(12, 12, 12, 12)
@@ -255,12 +266,37 @@ class MainWindow(QMainWindow):
         self.count_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         header.addWidget(self.count_badge)
         header.addStretch()
+        self.collapse_list_button = self._make_sidebar_button(
+            "Collapse video list", "chevron-left"
+        )
+        header.addWidget(self.collapse_list_button)
 
         left_layout.addLayout(header)
 
         self.video_list = VideoListWidget()
         self.video_list.selection_changed.connect(self._on_video_selected)
         left_layout.addWidget(self.video_list, stretch=1)
+        self.sidebar_stack.addWidget(left_card)
+
+        collapsed_card = _make_card()
+        collapsed_layout = QVBoxLayout(collapsed_card)
+        collapsed_layout.setContentsMargins(6, 12, 6, 12)
+        collapsed_layout.setSpacing(10)
+        self.expand_list_button = self._make_sidebar_button(
+            "Expand video list", "chevron-right"
+        )
+        collapsed_layout.addWidget(
+            self.expand_list_button, alignment=Qt.AlignmentFlag.AlignHCenter
+        )
+        self.collapsed_count_badge = QLabel("0")
+        self.collapsed_count_badge.setProperty("role", "badge")
+        self.collapsed_count_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.collapsed_count_badge.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        collapsed_layout.addWidget(self.collapsed_count_badge)
+        collapsed_layout.addStretch(1)
+        self.sidebar_stack.addWidget(collapsed_card)
 
         # --- Right: preview card ---
         right_card = _make_card()
@@ -274,12 +310,44 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.preview_panel, stretch=1)
         right_layout.addWidget(self._build_download_controls())
 
-        splitter.addWidget(left_card)
+        splitter.addWidget(self.sidebar_stack)
         splitter.addWidget(right_card)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([377, 923])
         return splitter
+
+    def _make_sidebar_button(self, label: str, icon: str) -> QPushButton:
+        button = QPushButton()
+        button.setObjectName("SidebarToggle")
+        button.setAccessibleName(label)
+        button.setToolTip(label)
+        button.setFixedSize(28, 28)
+        button.setIconSize(QSize(18, 18))
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.clicked.connect(self._toggle_video_list)
+        self._ui_icon_bindings.append((button, icon, False))
+        return button
+
+    def _toggle_video_list(self) -> None:
+        sizes = self.video_splitter.sizes()
+        available_width = sum(sizes)
+        if self._video_list_collapsed:
+            self.sidebar_stack.setMinimumWidth(0)
+            self.sidebar_stack.setMaximumWidth(16777215)
+            self.sidebar_stack.setCurrentIndex(0)
+            left_width = self._video_list_expanded_width
+        else:
+            self._video_list_expanded_width = sizes[0]
+            self.sidebar_stack.setCurrentIndex(1)
+            self.sidebar_stack.setFixedWidth(SIDEBAR_COLLAPSED_WIDTH)
+            left_width = SIDEBAR_COLLAPSED_WIDTH
+        self._video_list_collapsed = not self._video_list_collapsed
+        self.video_splitter.setSizes([
+            left_width, max(0, available_width - left_width)
+        ])
+        self._fit_content_minimum()
+        QTimer.singleShot(0, self._fit_content_minimum)
 
     def _build_download_controls(self) -> QWidget:
         wrap = QWidget()
@@ -421,6 +489,8 @@ class MainWindow(QMainWindow):
 
     def _build_logs_section(self) -> QWidget:
         wrap = QWidget()
+        self.logs_section = wrap
+        wrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout = QVBoxLayout(wrap)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
@@ -445,7 +515,7 @@ class MainWindow(QMainWindow):
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(500)
         self.log_view.setPlaceholderText("Logs will appear here...")
-        self.log_view.setFixedHeight(140)
+        self.log_view.setFixedHeight(LOGS_DEFAULT_HEIGHT)
         self.log_view.setVisible(False)
         layout.addWidget(self.log_view)
         return wrap
@@ -567,20 +637,73 @@ class MainWindow(QMainWindow):
         return f"{text[: max_chars - 1]}…"
 
     def _toggle_logs(self) -> None:
+        previous_height = self.height()
+        previous_logs_height = self.logs_section.sizeHint().height()
         self._logs_expanded = not self._logs_expanded
+        if self._logs_expanded:
+            available = self._logs_available_geometry()
+            frame_extra = max(0, self.frameGeometry().height() - previous_height)
+            max_height = available.height() - frame_extra
+            can_resize = not self.isMaximized() and not self.isFullScreen()
+            extra_room = max(0, max_height - previous_height) if can_resize else 0
+            gap = self.logs_section.layout().spacing()
+            # A compact, scrolling log leaves more room for playback on small
+            # screens; normal windows grow to preserve the existing stage.
+            self.log_view.setFixedHeight(max(
+                LOGS_COMPACT_HEIGHT, min(LOGS_DEFAULT_HEIGHT, extra_room - gap)
+            ))
         self.log_view.setVisible(self._logs_expanded)
         self.logs_toggle_button.setIcon(make_icon(
             "chevron-up" if self._logs_expanded else "chevron-down", self._theme.text_muted
         ))
         self._fit_content_minimum()
+        if self._logs_expanded and self.minimumHeight() > max_height:
+            # Wrapped metadata can require more room than the first budget.
+            # Keep at least one readable log line, with scrolling for the rest.
+            self.log_view.setFixedHeight(max(
+                LOGS_MIN_HEIGHT,
+                self.log_view.height() - (self.minimumHeight() - max_height),
+            ))
+            self._fit_content_minimum()
+
+        if not self.isMaximized() and not self.isFullScreen():
+            if self._logs_expanded:
+                added_height = self.logs_section.sizeHint().height() - previous_logs_height
+                target_height = max(
+                    self.minimumHeight(), min(previous_height + added_height, max_height)
+                )
+                self.resize(self.width(), target_height)
+                self._logs_window_growth = max(0, self.height() - previous_height)
+
+                frame = self.frameGeometry()
+                frame_top = max(
+                    available.top(),
+                    frame.top() - max(0, frame.bottom() - available.bottom()),
+                )
+                if frame_top != frame.top():
+                    self.move(self.pos().x(), self.pos().y() + frame_top - frame.top())
+            else:
+                self.resize(self.width(), max(
+                    self.minimumHeight(), previous_height - self._logs_window_growth
+                ))
+                self._logs_window_growth = 0
+        else:
+            self._logs_window_growth = 0
 
         # Qt finishes propagating visibility changes on the next event turn.
         QTimer.singleShot(0, self._fit_content_minimum)
+
+    def _logs_available_geometry(self) -> QRect:
+        return self.screen().availableGeometry()
 
     def _fit_content_minimum(self) -> None:
         """Account for wrapped captions as well as the expanded log area."""
         if self._closing:
             return
+        self.logs_section.layout().invalidate()
+        self.logs_section.layout().activate()
+        self.logs_section.updateGeometry()
+        self.centralWidget().layout().invalidate()
         self.centralWidget().layout().activate()
         self.layout().invalidate()
         self.layout().activate()
@@ -597,6 +720,8 @@ class MainWindow(QMainWindow):
 
     def _update_video_count_badge(self, count: int) -> None:
         self.count_badge.setText(str(count))
+        self.collapsed_count_badge.setText(str(count))
+        self.collapsed_count_badge.setToolTip(f"{count} discovered videos")
 
     def log(self, message: str) -> None:
         self.log_view.appendPlainText(message)

@@ -20,6 +20,8 @@ _ALIASES = {
     "exit_fullscreen": "exit-fullscreen",
     "chevron_down": "chevron-down",
     "chevron_up": "chevron-up",
+    "chevron_left": "chevron-left",
+    "chevron_right": "chevron-right",
     "info": "about",
     "browser": "globe",
     "scrape": "search",
@@ -27,8 +29,8 @@ _ALIASES = {
 _NAMES = {
     "link", "search", "globe", "folder-open", "folder", "stop", "play",
     "pause", "volume", "volume-muted", "fullscreen", "exit-fullscreen",
-    "settings", "about", "more", "chevron-down", "chevron-up", "sun",
-    "moon", "download", "close", "check",
+    "settings", "about", "more", "chevron-down", "chevron-up",
+    "chevron-left", "chevron-right", "sun", "moon", "download", "close", "check",
 }
 
 
@@ -111,6 +113,9 @@ def _draw(painter: QPainter, name: str) -> None:
     elif name in {"chevron-down", "chevron-up"}:
         y1, y2 = (9, 15) if name == "chevron-down" else (15, 9)
         _path(painter, ((6, y1), (12, y2), (18, y1)))
+    elif name in {"chevron-left", "chevron-right"}:
+        x1, x2 = (15, 9) if name == "chevron-left" else (9, 15)
+        _path(painter, ((x1, 6), (x2, 12), (x1, 18)))
     elif name == "sun":
         painter.drawEllipse(QRectF(8, 8, 8, 8))
         for index in range(8):
