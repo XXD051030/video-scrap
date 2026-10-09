@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -279,14 +280,14 @@ class MainWindow(QMainWindow):
         self.sidebar_stack.addWidget(left_card)
 
         collapsed_card = _make_card()
-        collapsed_layout = QVBoxLayout(collapsed_card)
+        collapsed_layout = QGridLayout(collapsed_card)
         collapsed_layout.setContentsMargins(6, 12, 6, 12)
         collapsed_layout.setSpacing(10)
         self.expand_list_button = self._make_sidebar_button(
             "Expand video list", "chevron-right"
         )
         collapsed_layout.addWidget(
-            self.expand_list_button, alignment=Qt.AlignmentFlag.AlignHCenter
+            self.expand_list_button, 0, 0, alignment=Qt.AlignmentFlag.AlignCenter
         )
         self.collapsed_count_badge = QLabel("0")
         self.collapsed_count_badge.setProperty("role", "badge")
@@ -294,8 +295,10 @@ class MainWindow(QMainWindow):
         self.collapsed_count_badge.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
-        collapsed_layout.addWidget(self.collapsed_count_badge)
-        collapsed_layout.addStretch(1)
+        # Anchor the badge independently so the arrow stays at the rail's center.
+        collapsed_layout.addWidget(
+            self.collapsed_count_badge, 0, 0, alignment=Qt.AlignmentFlag.AlignTop
+        )
         self.sidebar_stack.addWidget(collapsed_card)
 
         # --- Right: preview card ---
