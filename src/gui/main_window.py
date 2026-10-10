@@ -286,11 +286,13 @@ class MainWindow(QMainWindow):
         self.expand_list_button = self._make_sidebar_button(
             "Expand video list", "chevron-right"
         )
+        self.expand_list_button.setProperty("collapsedHandle", True)
+        self.expand_list_button.setFixedSize(28, 96)
         collapsed_layout.addWidget(
             self.expand_list_button, 0, 0, alignment=Qt.AlignmentFlag.AlignCenter
         )
         self.collapsed_count_badge = QLabel("0")
-        self.collapsed_count_badge.setProperty("role", "badge")
+        self.collapsed_count_badge.setProperty("role", "collapsedCount")
         self.collapsed_count_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.collapsed_count_badge.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred

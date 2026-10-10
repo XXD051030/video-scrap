@@ -324,6 +324,13 @@ def build_stylesheet(theme: Theme) -> str:
         font-size: 11px;
         font-weight: 600;
     }}
+    QLabel[role="collapsedCount"] {{
+        background-color: transparent;
+        color: {t.text_dim};
+        padding: 2px 0;
+        font-size: 11px;
+        font-weight: 400;
+    }}
     QLabel[role="path"] {{
         color: {t.text_muted};
         font-family: "SF Mono", Menlo, Consolas, monospace;
@@ -548,6 +555,12 @@ def build_stylesheet(theme: Theme) -> str:
         padding: 0;
         min-height: 0;
     }}
+    QPushButton#SidebarToggle[collapsedHandle="true"] {{
+        background-color: {t.button_bg};
+        border-color: {t.border};
+        min-height: 94px;
+        max-height: 94px;
+    }}
     QPushButton#SidebarToggle:hover {{
         background-color: {t.surface_alt};
         border-color: {t.border_strong};
@@ -556,6 +569,16 @@ def build_stylesheet(theme: Theme) -> str:
         background-color: {t.button_pressed};
     }}
     QPushButton#SidebarToggle:focus {{
+        border-color: {t.accent};
+    }}
+    QPushButton#SidebarToggle[collapsedHandle="true"]:hover {{
+        background-color: {t.button_hover};
+        border-color: {t.border_strong};
+    }}
+    QPushButton#SidebarToggle[collapsedHandle="true"]:pressed {{
+        background-color: {t.button_pressed};
+    }}
+    QPushButton#SidebarToggle[collapsedHandle="true"]:focus {{
         border-color: {t.accent};
     }}
 
