@@ -288,7 +288,9 @@ class DownloadNameReservationTests(unittest.TestCase):
                 raise TimeoutError("second segment was not released")
             raise RuntimeError("stopped after the first segment")
 
-        def remux_partial(_ffmpeg: str, _concat: Path, target: Path) -> None:
+        def remux_partial(
+            _ffmpeg: str, _concat: Path, target: Path, *, allow_cancelled: bool = False
+        ) -> None:
             target.write_bytes(b"partial from A")
 
         def remux_full(_ffmpeg: str, _concat: Path, target: Path) -> None:

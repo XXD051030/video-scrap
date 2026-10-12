@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +42,8 @@ def _run_smoke_test(report_path: str) -> int:
     from Crypto.Cipher import AES
     import certifi
     import yt_dlp.extractor
+    import psutil
+    from src import __version__
     import src.settings as settings_module
     import src.gui.main_window as window_module
     from src.downloader import VideoDownloader
@@ -50,6 +53,7 @@ def _run_smoke_test(report_path: str) -> int:
     report: dict = {
         "ok": False,
         "frozen": bool(getattr(sys, "frozen", False)),
+        "app_version": __version__,
         "python": sys.version,
         "bundle_path": str(getattr(sys, "_MEIPASS", "")),
         "checks": {},
@@ -154,7 +158,13 @@ def _run_smoke_test(report_path: str) -> int:
             self.end_headers()
             if body:
                 try:
-                    self.wfile.write(data[start:end + 1])
+                    if path.name.startswith("controlled-task-"):
+                        for offset in range(start, end + 1, 8192):
+                            self.wfile.write(data[offset:min(offset + 8192, end + 1)])
+                            self.wfile.flush()
+                            time.sleep(0.025)
+                    else:
+                        self.wfile.write(data[start:end + 1])
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
@@ -168,6 +178,7 @@ def _run_smoke_test(report_path: str) -> int:
             assert extractor is not None
             assert extractor().ie_key() == "Twitter"
             assert AES.new(bytes(16), AES.MODE_CBC, bytes(16)).encrypt(bytes(16))
+            assert psutil.Process().pid > 0
             ca_file = Path(certifi.where())
             assert ca_file.is_file() and ca_file.stat().st_size > 0
             return {"twitter_extractor": extractor.__name__, "certifi": str(ca_file)}
@@ -232,7 +243,7 @@ def _run_smoke_test(report_path: str) -> int:
             assert dialog.logo_label.isVisible()
             assert dialog.github_button.toolTip() == GITHUB_URL
             assert dialog.github_button.isVisible()
-            assert dialog.version_label.text().startswith("Version ")
+            assert dialog.version_label.text() == f"Version {__version__}"
             dialog.close_button.click()
             assert not dialog.isVisible()
             dialog.deleteLater()
@@ -674,6 +685,103 @@ def _run_smoke_test(report_path: str) -> int:
             return {"javascript": values[-1], "off_the_record": True}
 
         check("qt_webengine", browser)
+
+        def download_task_controls():
+            """Exercise the frozen executable's spawn path via real UI buttons."""
+            payload = bytes(range(256)) * 8192
+            items = []
+            for suffix in ("a", "b", "c"):
+                name = f"controlled-task-{suffix}.bin"
+                (root / name).write_bytes(payload)
+                items.append(VideoItem(
+                    f"Controlled task {suffix}", base + "/" + name, base,
+                    ext="bin", is_direct=True, referer=base,
+                ))
+            output = root / "controlled-downloads"
+            output.mkdir()
+            old_output, old_visible = window.output_dir, window.isVisible()
+            window.output_dir = output
+            window.video_list.set_videos(items)
+            window.show()
+            app.processEvents()
+
+            def start(index):
+                window.video_list.setCurrentRow(index)
+                app.processEvents()
+                task_id = window._next_download_id
+                window.start_download()
+                wait_until(
+                    lambda: task_id in window._download_tasks
+                    and (window._download_tasks[task_id].get("progress_pct") or 0) > 0
+                    and window._download_tasks[task_id].get("state") == "downloading",
+                    "Controlled download did not enter its downloading state",
+                )
+                return task_id
+
+            def controls(task_id):
+                return window._download_rows[window._download_task_slots[task_id]]
+
+            try:
+                assert window.stop_downloads_action is None
+                first = start(0)
+                controls(first)["pause"].click()
+                wait_until(
+                    lambda: window._download_tasks[first].get("state") == "paused",
+                    "The actual packaged task did not confirm Pause",
+                )
+                frozen_progress = window._download_tasks[first]["progress_pct"]
+                second = start(1)
+                second_file = output / "Controlled task b.bin"
+                wait_until(
+                    lambda: second_file.exists() and second not in window.download_workers,
+                    "A second download did not finish while the first was paused",
+                )
+                assert second_file.read_bytes() == payload
+                assert window._download_tasks[first]["state"] == "paused"
+                assert window._download_tasks[first]["progress_pct"] == frozen_progress
+                controls(first)["pause"].click()
+                first_file = output / "Controlled task a.bin"
+                wait_until(
+                    lambda: first_file.exists() and first not in window.download_workers,
+                    "The actual packaged task did not resume and finish",
+                )
+                assert first_file.read_bytes() == payload
+                third = start(2)
+                controls(third)["pause"].click()
+                wait_until(
+                    lambda: window._download_tasks[third].get("state") == "paused",
+                    "The cancellation fixture did not pause",
+                )
+                controls(third)["cancel"].click()
+                wait_until(
+                    lambda: third not in window.download_workers,
+                    "Cancelling a paused packaged download did not stop its worker",
+                )
+                assert not (output / "Controlled task c.bin").exists()
+                assert not list(output.glob(".video-scrap-job-*"))
+                return {
+                    "toolbar_stop_removed": True,
+                    "pause_confirmed": True,
+                    "progress_frozen_while_paused": True,
+                    "other_download_completed": True,
+                    "resume_exact_bytes": True,
+                    "paused_cancelled_without_output": True,
+                    "staging_clean": True,
+                    "spawned_from_actual_executable": True,
+                }
+            finally:
+                for worker in list(window.download_workers.values()):
+                    worker.cancel()
+                wait_until(
+                    lambda: not window.download_workers,
+                    "Controlled workers did not clean up after the test",
+                )
+                window.video_list.set_videos([])
+                window.output_dir = old_output
+                window.setVisible(old_visible)
+                app.processEvents()
+
+        check("download_task_controls", download_task_controls)
         report["ok"] = True
     except Exception:
         report["traceback"] = traceback.format_exc()

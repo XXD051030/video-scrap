@@ -21,7 +21,7 @@ ASSETS = PROJECT / "build" / "windows-app-assets"
 RUNTIME_DISTRIBUTIONS = (
     "PyQt6", "PyQt6-Qt6", "PyQt6-sip", "PyQt6-WebEngine", "PyQt6-WebEngine-Qt6",
     "yt-dlp", "requests", "urllib3", "certifi", "charset-normalizer", "idna",
-    "beautifulsoup4", "soupsieve", "lxml", "Pillow", "pycryptodome", "imageio-ffmpeg",
+    "beautifulsoup4", "soupsieve", "lxml", "Pillow", "pycryptodome", "imageio-ffmpeg", "psutil",
 )
 BUILD_DISTRIBUTIONS = ("pyinstaller", "pyinstaller-hooks-contrib")
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)

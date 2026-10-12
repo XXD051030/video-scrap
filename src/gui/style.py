@@ -690,6 +690,33 @@ def build_stylesheet(theme: Theme) -> str:
         font-size: 11px;
         font-family: "SF Mono", Menlo, Consolas, monospace;
     }}
+    QLabel[role="downloadPercent"] {{
+        color: {t.text};
+        font-size: 11px;
+        font-family: "SF Mono", Menlo, Consolas, monospace;
+    }}
+    QPushButton#DownloadControl {{
+        background-color: transparent;
+        border: 1px solid {t.border};
+        border-radius: 5px;
+        padding: 0;
+        min-height: 26px;
+        max-height: 26px;
+    }}
+    QPushButton#DownloadControl:hover {{
+        background-color: {t.button_hover};
+        border-color: {t.border_strong};
+    }}
+    QPushButton#DownloadControl:pressed {{
+        background-color: {t.button_pressed};
+    }}
+    QPushButton#DownloadControl:focus {{
+        border-color: {t.accent};
+    }}
+    QPushButton#DownloadControl:disabled {{
+        border-color: {t.border};
+        background-color: transparent;
+    }}
 
     /* ---------- Slider (preview seek bar) ---------- */
     QSlider {{

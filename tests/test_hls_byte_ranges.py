@@ -120,7 +120,7 @@ class HlsByteRangeTests(unittest.TestCase):
         )
 
     @staticmethod
-    def remux(_ffmpeg, concat_list, output):
+    def remux(_ffmpeg, concat_list, output, *, allow_cancelled=False):
         sources = [Path(shlex.split(line)[1])
                    for line in concat_list.read_text("utf-8").splitlines()]
         output.write_bytes(b"".join(source.read_bytes() for source in sources))

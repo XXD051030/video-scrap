@@ -201,9 +201,9 @@ def test_worker_passes_selected_audio_format_and_reports_the_final_path():
         root = Path(directory)
         for audio_format in ("original", "mp3", "m4a"):
             final_path = root / f"audio.{audio_format}"
-            with mock.patch.object(workers, "VideoDownloader") as downloader_class:
-                downloader = downloader_class.return_value
-                downloader.download.return_value = final_path
+            with mock.patch.object(workers, "DownloadJob") as job_class:
+                job = job_class.return_value
+                job.run.return_value = final_path
                 worker = workers.DownloadWorker(
                     [_fixture()], root, quality="audio only", audio_format=audio_format
                 )
@@ -212,20 +212,20 @@ def test_worker_passes_selected_audio_format_and_reports_the_final_path():
                 worker.item_finished.connect(lambda index, path: finished.append((index, path)))
                 worker.item_failed.connect(lambda index, message: failed.append((index, message)))
                 worker.run()
-                assert downloader.download.call_args.kwargs["audio_format"] == audio_format
-                assert downloader.download.call_args.kwargs["quality"] == "audio only"
+                assert job_class.call_args.kwargs["audio_format"] == audio_format
+                assert job_class.call_args.kwargs["quality"] == "audio only"
                 assert finished == [(0, str(final_path))]
                 assert not failed
-                downloader.close.assert_called_once()
+                job.run.assert_called_once()
                 worker.deleteLater()
         _flush()
 
 
-def test_worker_reports_missing_audio_as_failure_and_closes_downloader():
+def test_worker_reports_missing_audio_as_failure():
     with tempfile.TemporaryDirectory(prefix="video-audio-failure-") as directory:
-        with mock.patch.object(workers, "VideoDownloader") as downloader_class:
-            downloader = downloader_class.return_value
-            downloader.download.side_effect = RuntimeError("This source has no audio track")
+        with mock.patch.object(workers, "DownloadJob") as job_class:
+            job = job_class.return_value
+            job.run.side_effect = RuntimeError("This source has no audio track")
             worker = workers.DownloadWorker(
                 [_fixture()], Path(directory), quality="audio only", audio_format="mp3"
             )
@@ -236,7 +236,7 @@ def test_worker_reports_missing_audio_as_failure_and_closes_downloader():
             worker.run()
             assert not finished
             assert failed == [(0, "This source has no audio track")]
-            downloader.close.assert_called_once()
+            job.run.assert_called_once()
             worker.deleteLater()
             _flush()
 

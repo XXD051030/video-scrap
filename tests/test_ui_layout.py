@@ -134,7 +134,7 @@ def _assert_inside(widget, window):
     assert point.y() + widget.height() <= window.height(), f"Control spills vertically: {widget}"
 
 
-def test_more_menu_and_toolbar_keep_commands_and_idle_stop_state():
+def test_more_menu_and_toolbar_keep_commands_without_global_stop_button():
     with _window() as window:
         toolbar = window.main_toolbar
         assert window.more_button.menu() is window.more_menu
@@ -145,21 +145,17 @@ def test_more_menu_and_toolbar_keep_commands_and_idle_stop_state():
         assert window.about_action in window.actions()
         assert not window.prefs_action.shortcut().isEmpty()
         assert not window.about_action.shortcut().isEmpty()
-        assert not window.stop_downloads_action.isEnabled()
-        assert not toolbar.widgetForAction(window.stop_downloads_action).isEnabled()
-        window.stop_downloads_action.trigger()
-        assert "stop" not in window.commands
+        assert window.stop_downloads_action is None
+        assert all(action.text() != "Stop downloads" for action in toolbar.actions())
         toolbar.widgetForAction(window.open_dir_action).click()
         if window.browser_scrape_action is not None:
             toolbar.widgetForAction(window.browser_scrape_action).click()
         window.prefs_action.trigger()
         window.about_action.trigger()
-        window.stop_downloads_action.setEnabled(True)
-        toolbar.widgetForAction(window.stop_downloads_action).click()
         expected = ["folder"]
         if window.browser_scrape_action is not None:
             expected.append("browser")
-        assert window.commands == expected + ["preferences", "about", "stop"]
+        assert window.commands == expected + ["preferences", "about"]
         # Moving actions into More must not require opening the menu first.
         for action in (window.prefs_action, window.about_action):
             key = action.shortcut()[0]

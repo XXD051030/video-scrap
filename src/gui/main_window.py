@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import time
 from typing import List, Optional
 
-from PyQt6.QtCore import QEvent, QRect, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -67,6 +68,7 @@ DOWNLOAD_LANE_IDLE_BASE = 8
 DOWNLOAD_LANE_IDLE_MAX = 32
 DOWNLOAD_LANE_STEP = 8
 DOWNLOAD_LANE_INCREASE_SEGMENTS = 80
+DOWNLOAD_TASK_CONNECTIONS = 16
 SIDEBAR_COLLAPSED_WIDTH = 52
 LOGS_DEFAULT_HEIGHT = 140
 LOGS_COMPACT_HEIGHT = 64
@@ -153,6 +155,8 @@ class MainWindow(QMainWindow):
         self._video_list_expanded_width: int = 377
         self._download_failed_count: int = 0
         self._closing: bool = False
+        self._close_downloads_deadline: Optional[float] = None
+        self._close_retry_pending: bool = False
         self._ui_icon_bindings: list[tuple[object, str, bool]] = []
         self.output_dir: Path = DEFAULT_DOWNLOAD_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -460,7 +464,7 @@ class MainWindow(QMainWindow):
 
             meta = QHBoxLayout()
             meta.setSpacing(8)
-            title = QLabel("Idle")
+            title = _ElidedPathLabel("Idle")
             title.setProperty("role", "downloadTitle")
             title.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
@@ -475,9 +479,30 @@ class MainWindow(QMainWindow):
             detail.setAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
-            detail.setMinimumWidth(220)
-            detail.setMaximumWidth(360)
+            detail.setMinimumWidth(0)
+            detail.setMaximumWidth(230)
             meta.addWidget(detail)
+            percent = QLabel("0%")
+            percent.setProperty("role", "downloadPercent")
+            percent.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            percent.setFixedWidth(42)
+            meta.addWidget(percent)
+            pause = QPushButton()
+            pause.setObjectName("DownloadControl")
+            pause.setFixedSize(76, 28)
+            pause.setIconSize(QSize(16, 16))
+            pause.setCursor(Qt.CursorShape.PointingHandCursor)
+            pause.clicked.connect(lambda _checked=False, slot=_slot: self._toggle_download_slot(slot))
+            meta.addWidget(pause)
+            cancel = QPushButton()
+            cancel.setObjectName("DownloadControl")
+            cancel.setFixedSize(28, 28)
+            cancel.setIconSize(QSize(16, 16))
+            cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+            cancel.setToolTip("Cancel this download")
+            cancel.setAccessibleName("Cancel this download")
+            cancel.clicked.connect(lambda _checked=False, slot=_slot: self._cancel_download_slot(slot))
+            meta.addWidget(cancel)
             row_layout.addLayout(meta)
 
             bar = QProgressBar()
@@ -488,8 +513,10 @@ class MainWindow(QMainWindow):
             row_layout.addWidget(bar)
             layout.addWidget(row)
             self._download_rows.append(
-                {"row": row, "title": title, "detail": detail, "bar": bar}
+                {"row": row, "title": title, "detail": detail, "percent": percent,
+                 "pause": pause, "cancel": cancel, "bar": bar}
             )
+            self._refresh_download_controls(_slot)
         return wrap
 
     def _build_logs_section(self) -> QWidget:
@@ -551,15 +578,6 @@ class MainWindow(QMainWindow):
         toolbar.addAction(open_dir_action)
         self._ui_icon_bindings.append((open_dir_action, "folder-open", False))
 
-        self.stop_downloads_action = QAction("Stop downloads", self)
-        self.stop_downloads_action.setToolTip(
-            "Stop all downloads and merge available HLS segments"
-        )
-        self.stop_downloads_action.setEnabled(False)
-        self.stop_downloads_action.triggered.connect(self.stop_all_downloads)
-        toolbar.addAction(self.stop_downloads_action)
-        self._ui_icon_bindings.append((self.stop_downloads_action, "stop", False))
-
         self.more_menu = QMenu(self)
         self.more_menu.setObjectName("MoreMenu")
         self.more_menu.setMinimumWidth(230)
@@ -617,6 +635,8 @@ class MainWindow(QMainWindow):
         for control, icon_name, primary in self._ui_icon_bindings:
             color = self._theme.accent_text if primary else self._theme.text
             control.setIcon(make_icon(icon_name, color))
+        for slot in range(len(self._download_rows)):
+            self._refresh_download_controls(slot)
         self.url_icon_label.setPixmap(make_icon("link", self._theme.text_muted).pixmap(
             QSize(18, 18), self.devicePixelRatioF()
         ))
@@ -1015,6 +1035,7 @@ class MainWindow(QMainWindow):
             "audio_format": self.audio_format_combo.currentData(),
             "output_dir": self.output_dir,
             "failed": False,
+            "state": "queued",
         }
         self._download_queue.append(task_id)
         self.log(f"[D{task_id}] Queued: {item.title}")
@@ -1035,24 +1056,21 @@ class MainWindow(QMainWindow):
 
         for task_id, worker in list(self.download_workers.items()):
             task = self._download_tasks.get(task_id)
-            if task is not None:
+            if task is not None and worker.cancel(keep_partial=False) is not False:
                 task["stopping"] = True
-            self._set_download_row(
-                task_id,
-                status="Stopping; merging available segments...",
-                indeterminate=True,
-            )
-            worker.cancel(keep_partial=True)
-            worker.requestInterruption()
+                task["cancel_requested"] = True
+                self._on_dl_item_state(task_id, 0, "cancelling")
 
         self._lane_limiter.wake()
         self.log(
-            f"Stopping {active} active download(s); cleared {queued} queued task(s)"
+            f"Cancelling {active} active download(s); cleared {queued} queued task(s)"
         )
-        self.statusBar().showMessage("Stopping downloads...")
+        self.statusBar().showMessage("Cancelling downloads…")
         self._update_download_summary()
 
     def _pump_download_queue(self) -> None:
+        if self._closing:
+            return
         self._recalculate_download_lanes()
         while (
             len(self.download_workers) < MAX_ACTIVE_DOWNLOADS
@@ -1063,17 +1081,23 @@ class MainWindow(QMainWindow):
             if task is None:
                 continue
             item = task["item"]
+            task["state"] = "starting"
+            task["progress_pct"] = 0
             worker = DownloadWorker(
                 [item],
                 task["output_dir"],
                 quality=task["quality"],
-                parallel_connections=DOWNLOAD_LANE_IDLE_MAX,
+                parallel_connections=DOWNLOAD_TASK_CONNECTIONS,
                 lane_limiter=self._lane_limiter,
                 parent=self,
                 audio_format=task.get("audio_format", "original"),
             )
             self.download_workers[task_id] = worker
             task["worker"] = worker
+            self._assign_download_slot(task_id)
+            self._set_download_row(
+                task_id, title=f"D{task_id}  {item.title}", status="Starting", value=0
+            )
             worker.item_started.connect(
                 lambda index, started_item, tid=task_id: self._on_dl_item_started(
                     tid, index, started_item
@@ -1083,6 +1107,12 @@ class MainWindow(QMainWindow):
                 lambda index, progress, tid=task_id: self._on_dl_item_progress(
                     tid, index, progress
                 )
+            )
+            worker.item_state.connect(
+                lambda index, state, tid=task_id: self._on_dl_item_state(tid, index, state)
+            )
+            worker.item_control_error.connect(
+                lambda index, message, tid=task_id: self._on_dl_control_error(tid, index, message)
             )
             worker.item_finished.connect(
                 lambda index, path, tid=task_id: self._on_dl_item_finished(
@@ -1094,7 +1124,11 @@ class MainWindow(QMainWindow):
                     tid, index, message
                 )
             )
-            worker.all_done.connect(
+            # The QThread's finished signal guarantees run() has returned.
+            # Deleting a thread on a custom signal emitted inside run() races
+            # its final Python/Qt teardown.
+            done_signal = worker.finished if isinstance(worker, QThread) else worker.all_done
+            done_signal.connect(
                 lambda tid=task_id: self._on_dl_all_done(tid)
             )
             worker.start()
@@ -1109,13 +1143,21 @@ class MainWindow(QMainWindow):
         self._recalculate_download_lanes()
         if has_downloads:
             self.statusBar().showMessage(
-                f"Downloads: {active} active, {queued} queued"
+                self._download_activity_text()
             )
         else:
             self.statusBar().showMessage("Ready")
         self._update_download_summary()
 
-    def _assign_download_slot(self, task_id: int) -> int:
+    def _download_activity_text(self) -> str:
+        paused = sum(
+            self._download_tasks.get(task_id, {}).get("state") == "paused"
+            for task_id in self.download_workers
+        )
+        running = len(self.download_workers) - paused
+        return f"Downloads: {running} running, {paused} paused, {len(self._download_queue)} queued"
+
+    def _assign_download_slot(self, task_id: int) -> Optional[int]:
         existing = self._download_task_slots.get(task_id)
         if existing is not None:
             return existing
@@ -1124,14 +1166,90 @@ class MainWindow(QMainWindow):
                 self._download_slot_tasks[slot] = task_id
                 self._download_task_slots[task_id] = slot
                 return slot
-        self._download_slot_tasks[0] = task_id
-        self._download_task_slots[task_id] = 0
-        return 0
+        return None
 
     def _release_download_slot(self, task_id: int) -> None:
         slot = self._download_task_slots.pop(task_id, None)
         if slot is not None and self._download_slot_tasks[slot] == task_id:
             self._download_slot_tasks[slot] = None
+            self._refresh_download_controls(slot)
+
+    def _refresh_download_controls(self, slot: int) -> None:
+        widgets = self._download_rows[slot]
+        task_id = self._download_slot_tasks[slot]
+        task = self._download_tasks.get(task_id, {})
+        state = task.get("state", "starting")
+        live = task_id in self.download_workers
+        paused = state == "paused"
+        pause = widgets["pause"]
+        pause.setText("Resume" if paused else "Pause")
+        pause.setIcon(make_icon("play" if paused else "pause", self._theme.text, 16))
+        pause.setToolTip("Resume this download" if paused else "Pause this download")
+        pause.setAccessibleName("Resume this download" if paused else "Pause this download")
+        pause.setEnabled(live and state in {"starting", "downloading", "paused"})
+        cancel = widgets["cancel"]
+        cancel.setIcon(make_icon("close", self._theme.text, 16))
+        cancel.setEnabled(live and state not in {"cancelling", "cancelled", "completed", "failed"})
+
+    def _toggle_download_slot(self, slot: int) -> None:
+        task_id = self._download_slot_tasks[slot]
+        task = self._download_tasks.get(task_id)
+        worker = self.download_workers.get(task_id)
+        if task is None or worker is None or self._closing:
+            return
+        state = task.get("state", "starting")
+        if state == "paused":
+            if worker.resume() and task.get("state", "starting") == "paused":
+                self._on_dl_item_state(task_id, 0, "resuming")
+        elif state in {"starting", "downloading"}:
+            if worker.pause() and task.get("state", "starting") in {"starting", "downloading"}:
+                self._on_dl_item_state(task_id, 0, "pausing")
+
+    def _cancel_download_slot(self, slot: int) -> None:
+        task_id = self._download_slot_tasks[slot]
+        task = self._download_tasks.get(task_id)
+        worker = self.download_workers.get(task_id)
+        if task is None or worker is None or self._closing:
+            return
+        if task.get("state") in {"cancelling", "cancelled", "completed", "failed"}:
+            return
+        if worker.cancel(keep_partial=False) is not False:
+            task["cancel_requested"] = True
+            self._on_dl_item_state(task_id, 0, "cancelling")
+
+    def _on_dl_item_state(self, task_id: int, index: int, state: str) -> None:
+        task = self._download_tasks.get(task_id)
+        if task is None or task_id not in self.download_workers or self._closing:
+            return
+        current = task.get("state", "starting")
+        if current in {"completed", "failed", "cancelled"}:
+            return
+        if current == "cancelling" and state not in {"cancelled", "completed", "failed"}:
+            return
+        if current == "pausing" and state in {"starting", "downloading", "resuming"}:
+            return
+        if current == "paused" and state in {"starting", "downloading", "pausing"}:
+            return
+        if current == "resuming" and state in {"starting", "pausing"}:
+            return
+        if current == "finalizing" and state in {"starting", "downloading", "pausing", "paused", "resuming"}:
+            return
+        if state not in {"starting", "downloading", "pausing", "paused", "resuming",
+                         "finalizing", "cancelling", "cancelled", "completed", "failed"}:
+            return
+        if current == "cancelling" and state == "failed":
+            state = "cancelled"
+        task["state"] = state
+        if state == "cancelled":
+            task["cancelled"] = True
+        labels = {"starting": "Starting", "downloading": "Downloading…",
+                  "pausing": "Pausing…", "paused": "Paused", "resuming": "Resuming…",
+                  "finalizing": "Finishing…", "cancelling": "Cancelling…",
+                  "cancelled": "Cancelled", "completed": "Complete", "failed": "Failed"}
+        if state == "completed":
+            task["progress_pct"] = 100
+        self._set_download_row(task_id, status=labels[state], value=task.get("progress_pct"))
+        self._refresh_download_activity()
 
     def _set_download_row(
         self,
@@ -1141,14 +1259,18 @@ class MainWindow(QMainWindow):
         value: Optional[int] = None,
         indeterminate: bool = False,
     ) -> None:
-        if not self._download_rows:
+        if (not self._download_rows or task_id not in self._download_tasks
+                or task_id not in self.download_workers):
             return
         slot = self._assign_download_slot(task_id)
+        if slot is None:
+            return
         widgets = self._download_rows[slot]
         row = widgets["row"]
         title_label = widgets["title"]
         detail_label = widgets["detail"]
         bar = widgets["bar"]
+        percent = widgets["percent"]
 
         row.setVisible(True)
         if title is not None:
@@ -1159,10 +1281,13 @@ class MainWindow(QMainWindow):
             detail_label.setToolTip(status)
         if indeterminate:
             bar.setRange(0, 0)
+            percent.setText("—")
         else:
             bar.setRange(0, 100)
             if value is not None:
                 bar.setValue(max(0, min(100, value)))
+                percent.setText(f"{max(0, min(100, value))}%")
+        self._refresh_download_controls(slot)
 
     def _update_download_summary(self) -> None:
         active = len(self.download_workers)
@@ -1188,43 +1313,28 @@ class MainWindow(QMainWindow):
         else:
             self.progress_bar.setRange(0, 0)
         self.progress_bar.setFormat(
-            f"Downloads: {active} active, {queued} queued"
+            self._download_activity_text()
         )
 
     def _recalculate_download_lanes(self) -> None:
-        limit = self._download_idle_lane_limit
-        self._lane_limiter.set_limit(limit)
-        if limit != self._download_lane_limit:
-            self._download_lane_limit = limit
-            if self.download_workers:
-                self.log(f"Download lanes adjusted to {limit} (network stable)")
+        # Kept for callers using the older GUI hook. Isolated download jobs
+        # now own their fixed connection limit and never share this limiter.
+        return
 
     def _record_segment_downloaded(self) -> None:
-        if self._download_idle_lane_limit >= DOWNLOAD_LANE_IDLE_MAX:
-            return
-        self._download_segment_successes += 1
-        if self._download_segment_successes < DOWNLOAD_LANE_INCREASE_SEGMENTS:
-            return
-
-        self._download_segment_successes = 0
-        self._download_idle_lane_limit = min(
-            DOWNLOAD_LANE_IDLE_MAX,
-            self._download_idle_lane_limit + DOWNLOAD_LANE_STEP,
-        )
-        self._recalculate_download_lanes()
+        return
 
     def _record_download_pressure(self) -> None:
-        self._download_segment_successes = 0
-        if self._download_idle_lane_limit <= DOWNLOAD_LANE_IDLE_BASE:
-            return
-        self._download_idle_lane_limit = DOWNLOAD_LANE_IDLE_BASE
-        self._recalculate_download_lanes()
+        return
 
     def _on_dl_item_started(self, task_id: int, index: int, item: VideoItem) -> None:
-        self.log(f"[D{task_id}] Starting: {item.title}")
         task = self._download_tasks.get(task_id)
-        if task is not None:
-            task["progress_pct"] = 0
+        if (task is None or task_id not in self.download_workers or self._closing
+                or task.get("state") in {"pausing", "paused", "resuming", "cancelling",
+                                         "cancelled", "completed", "failed"}):
+            return
+        self.log(f"[D{task_id}] Starting: {item.title}")
+        task["progress_pct"] = 0
         self._set_download_row(
             task_id,
             title=f"D{task_id}  {item.title}",
@@ -1237,18 +1347,27 @@ class MainWindow(QMainWindow):
         self, task_id: int, index: int, progress: DownloadProgress
     ) -> None:
         task = self._download_tasks.get(task_id)
+        if task is None or task_id not in self.download_workers or self._closing:
+            return
+        state = task.get("state", "starting")
+        if state in {"pausing", "paused", "resuming", "cancelling", "cancelled", "completed", "failed"}:
+            return
+        if state == "finalizing" and progress.status == "downloading":
+            return
         if progress.status == "downloading" and progress.total_bytes > 0:
+            task["state"] = "downloading"
             pct = int(progress.downloaded_bytes * 100 / progress.total_bytes)
             if task is not None:
                 task["progress_pct"] = pct
             if progress.message:
-                detail = f"{pct}%  {progress.message}"
+                detail = progress.message
             else:
                 speed = format_bytes(progress.speed) + "/s" if progress.speed else "--"
                 eta = f"{progress.eta}s" if progress.eta is not None else "--"
-                detail = f"{pct}%  {speed}  ETA {eta}"
+                detail = f"{speed}  ETA {eta}"
             self._set_download_row(task_id, status=detail, value=pct)
         elif progress.status == "downloading":
+            task["state"] = "downloading"
             if task is not None:
                 task["progress_pct"] = None
             self._set_download_row(
@@ -1257,12 +1376,14 @@ class MainWindow(QMainWindow):
                 indeterminate=True,
             )
         elif progress.status == "finished":
+            task["state"] = "finalizing"
             if task is not None:
                 task["progress_pct"] = None
             self._set_download_row(
-                task_id, status=progress.message or "Post-processing", indeterminate=True
+                task_id, status=progress.message or "Finishing…", indeterminate=True
             )
         elif progress.status == "completed":
+            task["state"] = "completed"
             if task is not None:
                 task["progress_pct"] = 100
                 if progress.message:
@@ -1297,13 +1418,18 @@ class MainWindow(QMainWindow):
             and progress.message.startswith("Parallel HLS failed")
         ):
             self._record_download_pressure()
-        self._update_download_summary()
+        self._refresh_download_activity()
 
     def _on_dl_item_finished(self, task_id: int, index: int, path: str) -> None:
         task = self._download_tasks.get(task_id)
-        if task is not None:
-            task["path"] = path
-            task["progress_pct"] = 100
+        if (task is None or task_id not in self.download_workers or self._closing
+                or task.get("state") in {"cancelled", "failed"}):
+            return
+        # item_finished is emitted only after the engine committed its output.
+        # A cancellation click that lost that race must keep the valid file.
+        task["path"] = path
+        task["progress_pct"] = 100
+        task["state"] = "completed"
         if task and task.get("partial"):
             self._set_download_row(task_id, status="Partial saved", value=100)
             self.log(f"[D{task_id}] Partial saved -> {path}")
@@ -1318,13 +1444,25 @@ class MainWindow(QMainWindow):
                 value=100,
             )
             self.log(f"[D{task_id}] Done -> {path}")
+        self._refresh_download_activity()
 
     def _on_dl_item_failed(self, task_id: int, index: int, message: str) -> None:
-        self._download_failed_count += 1
         task = self._download_tasks.get(task_id)
-        if task is not None:
-            task["failed"] = True
-            task["progress_pct"] = 0
+        if (task is None or task_id not in self.download_workers or self._closing
+                or task.get("state") in {"completed", "cancelled"}
+                or task.get("failed")):
+            return
+        if task.get("cancel_requested") or task.get("stopping") or task.get("state") == "cancelling":
+            task["state"] = "cancelled"
+            task["cancelled"] = True
+            self._set_download_row(task_id, status="Cancelled", value=task.get("progress_pct"))
+            self.log(f"[D{task_id}] Cancelled")
+            self._refresh_download_activity()
+            return
+        self._download_failed_count += 1
+        task["failed"] = True
+        task["state"] = "failed"
+        task["progress_pct"] = 0
         self._record_download_pressure()
         self._set_download_row(
             task_id,
@@ -1332,16 +1470,39 @@ class MainWindow(QMainWindow):
             value=0,
         )
         self.log(f"[D{task_id}] FAILED: {message}")
+        self._refresh_download_activity()
+
+    def _on_dl_control_error(self, task_id: int, index: int, message: str) -> None:
+        """A supervisor cleanup error must never be disguised as cancellation."""
+        task = self._download_tasks.get(task_id)
+        if task is None or task_id not in self.download_workers or self._closing:
+            return
+        if not task.get("control_failed"):
+            self._download_failed_count += 1
+        task.update(
+            control_failed=True, failed=True, state="failed", cancelled=False,
+            cancel_requested=False, stopping=False,
+        )
+        self._set_download_row(task_id, status="Cleanup failed", value=task.get("progress_pct"))
+        self.log(f"[D{task_id}] Could not clean up download: {message}")
+        self._refresh_download_activity()
 
     def _on_dl_all_done(self, task_id: int) -> None:
-        worker = self.download_workers.pop(task_id, None)
-        if worker is not None:
-            worker.deleteLater()
+        worker = self.download_workers.get(task_id)
+        task = self._download_tasks.get(task_id)
+        if worker is None or task is None:
+            return
         if self._closing:
             return
-        task = self._download_tasks.get(task_id, {})
-        if task.get("partial"):
+        if task.get("control_failed"):
+            self._set_download_row(task_id, status="Cleanup failed", value=task.get("progress_pct"))
+        elif task.get("state") == "completed" and not task.get("partial"):
+            self._set_download_row(task_id, status="Complete", value=100)
+        elif task.get("partial"):
             self._set_download_row(task_id, status="Partial saved", value=100)
+        elif task.get("cancelled") or task.get("stopping") or task.get("cancel_requested") or task.get("state") in {"cancelling", "cancelled"}:
+            task["state"] = "cancelled"
+            self._set_download_row(task_id, status="Cancelled", value=task.get("progress_pct"))
         elif task.get("failed"):
             self._set_download_row(
                 task_id,
@@ -1349,7 +1510,13 @@ class MainWindow(QMainWindow):
                 value=0,
             )
         else:
-            self._set_download_row(task_id, status="Complete", value=100)
+            # A worker ending without a committed output is never completion.
+            self._set_download_row(task_id, status="Stopped", value=task.get("progress_pct"))
+        self.download_workers.pop(task_id, None)
+        if worker.isRunning():
+            worker.finished.connect(worker.deleteLater)
+        else:
+            worker.deleteLater()
         self._release_download_slot(task_id)
         self._download_tasks.pop(task_id, None)
         self._pump_download_queue()
@@ -1405,19 +1572,33 @@ class MainWindow(QMainWindow):
             self.theme_action.setToolTip("Switch to dark theme")
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
-        self._closing = True
-        self.preview_panel.shutdown()
-        self.video_list.shutdown()
-        self._download_queue.clear()
-        for worker in list(self.download_workers.values()):
-            if worker.isRunning():
-                worker.cancel()
-                worker.requestInterruption()
+        if not self._closing:
+            self._closing = True
+            self._close_downloads_deadline = time.monotonic() + 5.0
+            self.preview_panel.shutdown()
+            self.video_list.shutdown()
+            self._download_queue.clear()
+            for worker in list(self.download_workers.values()):
+                if worker.isRunning():
+                    worker.cancel(keep_partial=False)
+                    worker.requestInterruption()
+        pending = False
         for task_id, worker in list(self.download_workers.items()):
-            if worker.isRunning() and not worker.wait(5000):
-                worker.terminate()
-                worker.wait(1000)
+            if worker.isRunning():
+                remaining = max(0, int((self._close_downloads_deadline - time.monotonic()) * 1000))
+                if not worker.wait(remaining):
+                    pending = True
+                    continue
             self.download_workers.pop(task_id, None)
+        if pending:
+            # The engine owns process-tree cancellation and cleanup. Never
+            # destroy its QThread while it is still releasing output files.
+            event.ignore()
+            self.statusBar().showMessage("Closing: waiting for download cleanup…")
+            if not self._close_retry_pending:
+                self._close_retry_pending = True
+                QTimer.singleShot(100, self._retry_close_after_downloads)
+            return
         if self.scrape_worker and self.scrape_worker.isRunning():
             self.scrape_worker.requestInterruption()
             if not self.scrape_worker.wait(3000):
@@ -1428,3 +1609,7 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             pass
         super().closeEvent(event)
+
+    def _retry_close_after_downloads(self) -> None:
+        self._close_retry_pending = False
+        self.close()

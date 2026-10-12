@@ -19,7 +19,7 @@ ASSETS = PROJECT / "build" / "app-assets"
 RUNTIME_DISTRIBUTIONS = (
     "PyQt6", "PyQt6-Qt6", "PyQt6-sip", "PyQt6-WebEngine", "PyQt6-WebEngine-Qt6",
     "yt-dlp", "requests", "urllib3", "certifi", "charset-normalizer", "idna",
-    "beautifulsoup4", "soupsieve", "lxml", "Pillow", "pycryptodome", "imageio-ffmpeg",
+    "beautifulsoup4", "soupsieve", "lxml", "Pillow", "pycryptodome", "imageio-ffmpeg", "psutil",
 )
 
 

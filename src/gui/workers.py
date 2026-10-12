@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from http.cookiejar import CookieJar
 from pathlib import Path
+import threading
 from typing import List, Optional
 
 import requests
@@ -16,9 +17,9 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 from ..downloader import (
     DownloadLaneLimiter,
     DownloadProgress,
-    VideoDownloader,
     build_request_headers,
 )
+from ..download_job import DownloadCancelled, DownloadCleanupError, DownloadJob
 from ..net import build_session
 from ..scraper import VideoItem, VideoScraper
 
@@ -98,12 +99,14 @@ class ThumbnailWorker(QThread):
 
 
 class DownloadWorker(QThread):
-    """Download a list of VideoItems sequentially."""
+    """Supervise isolated download jobs without blocking the GUI controls."""
 
     item_started = pyqtSignal(int, object)
     item_progress = pyqtSignal(int, object)
     item_finished = pyqtSignal(int, str)
     item_failed = pyqtSignal(int, str)
+    item_state = pyqtSignal(int, str)
+    item_control_error = pyqtSignal(int, str)
     all_done = pyqtSignal()
 
     def __init__(
@@ -124,53 +127,126 @@ class DownloadWorker(QThread):
         self.parallel_connections = parallel_connections
         self.lane_limiter = lane_limiter
         self._cancelled = False
-        self._keep_partial = False
-        self._downloader: Optional[VideoDownloader] = None
+        self._pause_requested = False
+        self._done = False
+        self._phase = "starting"
+        self._current_index = 0
+        self._job: Optional[DownloadJob] = None
+        self._job_lock = threading.RLock()
 
-    def cancel(self, keep_partial: bool = False) -> None:
-        self._cancelled = True
-        self._keep_partial = self._keep_partial or keep_partial
-        if self._downloader is not None:
-            self._downloader.cancel(keep_partial=keep_partial)
+    def pause(self) -> bool:
+        with self._job_lock:
+            if self._cancelled or self._done or self._phase in {
+                "finalizing", "completed", "failed", "cancelled",
+            }:
+                return False
+            self._pause_requested = True
+            job, index = self._job, self._current_index
+        if job is not None:
+            accepted = job.pause()
+            if not accepted:
+                with self._job_lock:
+                    self._pause_requested = False
+            return accepted
+        self.item_state.emit(index, "pausing")
+        return True
+
+    def resume(self) -> bool:
+        with self._job_lock:
+            if self._cancelled or self._done or not self._pause_requested:
+                return False
+            self._pause_requested = False
+            job, index = self._job, self._current_index
+        if job is not None:
+            return job.resume()
+        self.item_state.emit(index, "resuming")
+        return True
+
+    def cancel(self, keep_partial: bool = False) -> bool:
+        """Cancel unfinished output; pause is the operation that retains it.
+
+        The legacy argument remains accepted for callers. GUI cancellation no
+        longer exports a partial result: the complete private job is removed.
+        Process shutdown happens in run(), never in this GUI-thread method.
+        """
+        with self._job_lock:
+            if self._done or (
+                self._phase == "completed" and self._current_index == len(self.items) - 1
+            ):
+                return False
+            job, index = self._job, self._current_index
+            if job is None:
+                self._cancelled = True
+                self._pause_requested = False
+        if job is not None:
+            if job.cancel() is False:
+                return False
+            with self._job_lock:
+                self._cancelled = True
+                self._pause_requested = False
+        else:
+            self.item_state.emit(index, "cancelling")
+        return True
 
     def run(self) -> None:
-        downloader = VideoDownloader(
-            self.output_dir,
-            parallel_connections=self.parallel_connections,
-            lane_limiter=self.lane_limiter,
-        )
-        self._downloader = downloader
         try:
             for index, item in enumerate(self.items):
-                if self._cancelled:
+                with self._job_lock:
+                    self._current_index = index
+                    self._phase = "starting"
+                    cancelled = self._cancelled
+                if cancelled:
+                    self.item_state.emit(index, "cancelled")
+                    self.item_failed.emit(index, "Cancelled")
                     break
                 self.item_started.emit(index, item)
 
                 def on_progress(progress: DownloadProgress, idx: int = index) -> None:
                     self.item_progress.emit(idx, progress)
 
+                def on_state(state: str, idx: int = index) -> None:
+                    with self._job_lock:
+                        self._phase = state
+                    self.item_state.emit(idx, state)
+
+                job = DownloadJob(
+                    item,
+                    self.output_dir,
+                    quality=self.quality,
+                    audio_format=self.audio_format,
+                    parallel_connections=min(16, self.parallel_connections),
+                    on_progress=on_progress,
+                    on_state=on_state,
+                )
+                with self._job_lock:
+                    self._job = job
+                    cancelled, paused = self._cancelled, self._pause_requested
+                if cancelled:
+                    job.cancel()
+                elif paused:
+                    job.pause()
                 try:
-                    final_path = downloader.download(
-                        item,
-                        quality=self.quality,
-                        on_progress=on_progress,
-                        audio_format=self.audio_format,
-                    )
-                    if not self._cancelled or final_path.exists():
-                        self.item_finished.emit(index, str(final_path))
+                    final_path = job.run()
+                    # A successful return means final publication was committed
+                    # before any late cancellation request could be accepted.
+                    self.item_finished.emit(index, str(final_path))
+                except DownloadCancelled:
+                    on_state("cancelled")
+                    self.item_failed.emit(index, "Cancelled")
+                except DownloadCleanupError as exc:
+                    on_state("failed")
+                    self.item_control_error.emit(index, str(exc))
                 except Exception as exc:  # noqa: BLE001
-                    if not self._cancelled:
-                        self.item_failed.emit(index, str(exc))
-                    elif self._keep_partial:
-                        self.item_failed.emit(index, str(exc))
-                    else:
-                        # Plain stop (no partial kept): surface it as a stop
-                        # so the row isn't later mislabeled "Complete".
-                        self.item_failed.emit(index, "Stopped")
+                    with self._job_lock:
+                        cancelled = self._cancelled
+                    on_state("cancelled" if cancelled else "failed")
+                    self.item_failed.emit(index, "Cancelled" if cancelled else str(exc))
+                finally:
+                    with self._job_lock:
+                        self._job = None
+                if self._cancelled:
+                    break
         finally:
-            try:
-                downloader.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._downloader = None
+            with self._job_lock:
+                self._done = True
             self.all_done.emit()

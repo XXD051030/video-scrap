@@ -237,6 +237,8 @@ class VideoDownloader:
         self._lane_limiter = lane_limiter
         self._parallel: Optional[ParallelDownloader] = None
         self._ffmpeg_proc: Optional[subprocess.Popen[str]] = None
+        self._process_lock = threading.RLock()
+        self._ffmpeg_allow_cancelled = False
         self._cancelled = False
         self._partial_on_cancel = False
         self._session = build_session(pool=max(self.parallel_connections, 8))
@@ -248,22 +250,80 @@ class VideoDownloader:
             pass
 
     def cancel(self, keep_partial: bool = False) -> None:
-        self._cancelled = True
-        self._partial_on_cancel = self._partial_on_cancel or keep_partial
-        if self._parallel is not None:
-            self._parallel.cancel()
-        proc = self._ffmpeg_proc
-        if proc is not None and proc.poll() is None:
-            # Snapshot into a local first: the download thread may null out
-            # self._ffmpeg_proc between the check and the call, which would
-            # otherwise raise AttributeError on None.
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        with self._process_lock:
+            self._cancelled = True
+            self._partial_on_cancel = self._partial_on_cancel or keep_partial
+            parallel = self._parallel
+            proc = self._ffmpeg_proc
+            preserve_partial = self._ffmpeg_allow_cancelled
+        if parallel is not None:
+            parallel.cancel()
+        if proc is not None and not preserve_partial:
+            self._stop_ffmpeg_process(proc)
         if self._lane_limiter is not None:
             self._lane_limiter.wake()
+
+    def _raise_if_cancelled(self, *, allow_cancelled: bool = False) -> None:
+        if self._cancelled and not allow_cancelled:
+            raise RuntimeError("Download cancelled")
+
+    @staticmethod
+    def _stop_ffmpeg_process(proc: subprocess.Popen[str]) -> None:
+        """Stop the captured child even if it exits while cancellation runs."""
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait(timeout=3)
+
+    @contextmanager
+    def _ffmpeg_process(
+        self,
+        command: list[str],
+        *,
+        allow_cancelled: bool = False,
+        bufsize: int = -1,
+    ) -> Iterator[subprocess.Popen[str]]:
+        """Order process creation against cancel and protect partial-file work."""
+        with self._process_lock:
+            self._raise_if_cancelled(allow_cancelled=allow_cancelled)
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                bufsize=bufsize,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            self._ffmpeg_proc = proc
+            self._ffmpeg_allow_cancelled = allow_cancelled
+        try:
+            self._raise_if_cancelled(allow_cancelled=allow_cancelled)
+            yield proc
+            self._raise_if_cancelled(allow_cancelled=allow_cancelled)
+        finally:
+            try:
+                self._stop_ffmpeg_process(proc)
+            finally:
+                try:
+                    if proc.stderr is not None:
+                        proc.stderr.close()
+                finally:
+                    with self._process_lock:
+                        if self._ffmpeg_proc is proc:
+                            self._ffmpeg_proc = None
+                            self._ffmpeg_allow_cancelled = False
 
     def download(
         self,
@@ -273,6 +333,7 @@ class VideoDownloader:
         audio_format: str = "original",
     ) -> Path:
         """Normalize explicitly wrapped HLS before using the existing backends."""
+        self._raise_if_cancelled()
         with self._download_source(item) as source:
             return self._download_with_stage(
                 source, quality, on_progress, audio_format
@@ -301,6 +362,7 @@ class VideoDownloader:
                 is_hls=True,
                 hls_png_wrapped=True,
             )
+            self._raise_if_cancelled()
             yield replace(item, url=local_url, hls_png_wrapped=False)
         finally:
             proxy.stop()
@@ -335,24 +397,24 @@ class VideoDownloader:
 
             try:
                 staged = self._download_to_stage(
-                    item, quality, relay if on_progress is not None or audio_only else None
+                    item, quality, relay
                 )
                 if (
                     not staged.is_file()
                     or staged.resolve().parent != self.output_dir.resolve()
                 ):
                     raise RuntimeError("Download did not produce a finished file")
+                keep_partial = bool(
+                    final_progress is not None
+                    and final_progress.status == "partial"
+                    and self._partial_on_cancel
+                )
+                self._raise_if_cancelled(allow_cancelled=keep_partial)
                 if audio_only:
-                    keep_partial = bool(
-                        final_progress is not None
-                        and final_progress.status == "partial"
-                        and self._partial_on_cancel
-                    )
                     staged = self._extract_audio(
                         staged, audio_format, on_progress, allow_cancelled=keep_partial
                     )
-                    if self._cancelled and not keep_partial:
-                        raise RuntimeError("Download cancelled")
+                    self._raise_if_cancelled(allow_cancelled=keep_partial)
                     size = staged.stat().st_size
                     final_progress = DownloadProgress(
                         status="partial" if keep_partial else "completed",
@@ -365,7 +427,16 @@ class VideoDownloader:
                             else f"Audio saved ({audio_format})"
                         ),
                     )
-                published = _publish_unique(staged, destination / staged.name)
+                # Cancel and publishing have a defined order: cancellation
+                # accepted before this lock cannot publish a complete file.
+                if on_progress is not None:
+                    on_progress(DownloadProgress(
+                        status="finalizing", filename=str(staged),
+                        message="Saving downloaded file...",
+                    ))
+                with self._process_lock:
+                    self._raise_if_cancelled(allow_cancelled=keep_partial)
+                    published = _publish_unique(staged, destination / staged.name)
             finally:
                 self.output_dir = destination
 
@@ -377,40 +448,16 @@ class VideoDownloader:
         self, command: list[str], *, allow_cancelled: bool = False
     ) -> tuple[int, str]:
         """Keep probing and conversion cancellable, including on Windows."""
-        if self._cancelled and not allow_cancelled:
-            raise RuntimeError("Download cancelled")
-        proc = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        self._ffmpeg_proc = proc
-        try:
+        with self._ffmpeg_process(command, allow_cancelled=allow_cancelled) as proc:
             while True:
-                if self._cancelled and not allow_cancelled:
-                    raise RuntimeError("Download cancelled")
+                self._raise_if_cancelled(allow_cancelled=allow_cancelled)
                 try:
                     _stdout, stderr = proc.communicate(timeout=0.2)
                     break
                 except subprocess.TimeoutExpired:
                     continue
-            if self._cancelled and not allow_cancelled:
-                raise RuntimeError("Download cancelled")
+            self._raise_if_cancelled(allow_cancelled=allow_cancelled)
             return proc.returncode, stderr or ""
-        finally:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.communicate(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.communicate()
-            if self._ffmpeg_proc is proc:
-                self._ffmpeg_proc = None
 
     def _extract_audio(
         self,
@@ -426,7 +473,7 @@ class VideoDownloader:
             raise RuntimeError("FFmpeg is required for audio-only downloads")
         if on_progress is not None:
             on_progress(DownloadProgress(
-                status="finished", filename=str(source),
+                status="finalizing", filename=str(source),
                 message=("Extracting original audio..." if audio_format == "original"
                          else f"Preparing {audio_format.upper()} audio..."),
             ))
@@ -477,8 +524,7 @@ class VideoDownloader:
         quality: str,
         on_progress: Optional[ProgressHandler],
     ) -> Path:
-        self._cancelled = False
-        self._partial_on_cancel = False
+        self._raise_if_cancelled()
         # HLS / DASH manifests are not single files - they reference dozens
         # of segment URLs. yt-dlp knows how to fetch + concat them, so route
         # through it. Only single-file direct URLs use the parallel path.
@@ -550,11 +596,11 @@ class VideoDownloader:
         def post_hook(filename: str) -> None:
             # yt-dlp calls this after merging and moving the finished file.
             # The progress hook can still point to a temporary format file.
+            self._raise_if_cancelled()
             final_path["path"] = filename
 
         def hook(data: Dict) -> None:
-            if quality == "audio only" and self._cancelled:
-                raise RuntimeError("Download cancelled")
+            self._raise_if_cancelled()
             status = data.get("status", "")
             if status == "downloading":
                 progress = DownloadProgress(
@@ -572,9 +618,9 @@ class VideoDownloader:
                 last_path["path"] = data.get("filename") or last_path["path"]
             elif status == "finished":
                 progress = DownloadProgress(
-                    status="finished",
+                    status="downloading",
                     filename=data.get("filename"),
-                    message="Post-processing...",
+                    message="Downloaded media track; preparing remaining tracks...",
                 )
                 last_path["path"] = data.get("filename") or last_path["path"]
             elif status == "error":
@@ -586,6 +632,18 @@ class VideoDownloader:
                 return
             if on_progress:
                 on_progress(progress)
+            self._raise_if_cancelled()
+
+        def postprocessor_hook(data: Dict) -> None:
+            self._raise_if_cancelled()
+            if data.get("status") == "started" and on_progress is not None:
+                info = data.get("info_dict") or {}
+                on_progress(DownloadProgress(
+                    status="finalizing",
+                    filename=info.get("filepath") or info.get("_filename"),
+                    message="Merging or processing downloaded media...",
+                ))
+            self._raise_if_cancelled()
 
         http_headers = build_request_headers(item.referer)
 
@@ -597,6 +655,7 @@ class VideoDownloader:
             "no_warnings": True,
             "progress_hooks": [hook],
             "post_hooks": [post_hook],
+            "postprocessor_hooks": [postprocessor_hook],
             "merge_output_format": "mp4",
             "concurrent_fragment_downloads": 2,
             "retries": 5,
@@ -618,8 +677,11 @@ class VideoDownloader:
             if x_index is not None:
                 ydl_opts["playlist_items"] = str(x_index)
 
+        self._raise_if_cancelled()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             result = ydl.download([_x_download_url(item.url) if is_x_item else item.url])
+
+        self._raise_if_cancelled()
 
         if result and not is_x_item:
             raise RuntimeError("yt-dlp download failed")
@@ -740,11 +802,21 @@ class VideoDownloader:
                     break
                 return count
 
-            def merge_downloaded(count: int, destination: Path) -> float:
+            def merge_downloaded(
+                count: int, destination: Path, *, allow_cancelled: bool = False
+            ) -> float:
+                self._raise_if_cancelled(allow_cancelled=allow_cancelled)
                 merge_started = time.monotonic()
                 concat_list = tmp_dir / f"{destination.stem}.concat.txt"
                 self._write_ffmpeg_concat_list(paths[:count], concat_list)
-                self._remux_hls_segments(ffmpeg, concat_list, destination)
+                self._raise_if_cancelled(allow_cancelled=allow_cancelled)
+                if allow_cancelled:
+                    self._remux_hls_segments(
+                        ffmpeg, concat_list, destination, allow_cancelled=True
+                    )
+                else:
+                    self._remux_hls_segments(ffmpeg, concat_list, destination)
+                self._raise_if_cancelled(allow_cancelled=allow_cancelled)
                 return time.monotonic() - merge_started
 
             def build_partial() -> Path:
@@ -757,7 +829,7 @@ class VideoDownloader:
                 if on_progress is not None:
                     on_progress(
                         DownloadProgress(
-                            status="downloading",
+                            status="finalizing",
                             downloaded_bytes=partial_count,
                             total_bytes=total,
                             filename=str(partial_path),
@@ -767,7 +839,9 @@ class VideoDownloader:
                             ),
                         )
                     )
-                merge_seconds = merge_downloaded(partial_count, partial_path)
+                merge_seconds = merge_downloaded(
+                    partial_count, partial_path, allow_cancelled=True
+                )
                 if on_progress is not None:
                     on_progress(
                         DownloadProgress(
@@ -835,11 +909,14 @@ class VideoDownloader:
                 return build_partial()
             if pending_error is not None:
                 raise pending_error
+            if self._cancelled and self._partial_on_cancel:
+                return build_partial()
+            self._raise_if_cancelled()
 
             if on_progress is not None:
                 on_progress(
                     DownloadProgress(
-                        status="downloading",
+                        status="finalizing",
                         downloaded_bytes=total,
                         total_bytes=total,
                         filename=str(output_path),
@@ -876,12 +953,14 @@ class VideoDownloader:
         media_only: bool = False,
         audio_only: bool = False,
     ) -> tuple[str, str, Optional[_HlsMasterContext]]:
+        self._raise_if_cancelled()
         with self._session.get(
             url, headers=headers, timeout=(10, 60), allow_redirects=True
         ) as resp:
             resp.raise_for_status()
             text = resp.text
             final_url = resp.url
+        self._raise_if_cancelled()
         self._validate_hls_manifest_header(text)
         if media_only:
             self._validate_hls_media_manifest(text)
@@ -904,11 +983,13 @@ class VideoDownloader:
             and self._hls_variant_has_external_audio(text, final_url, variant)
             else None
         )
+        self._raise_if_cancelled()
         with self._session.get(
             variant, headers=headers, timeout=(10, 60), allow_redirects=True
         ) as child:
             child.raise_for_status()
             child_url, child_text = child.url, child.text
+        self._raise_if_cancelled()
         self._validate_hls_media_manifest(child_text)
         return child_url, child_text, master_context
 
@@ -1106,6 +1187,7 @@ class VideoDownloader:
         previous_range_end: Optional[int] = None
 
         for line in lines:
+            self._raise_if_cancelled()
             if not line:
                 continue
             if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
@@ -1179,6 +1261,7 @@ class VideoDownloader:
                     absolute_key = urljoin(manifest_url, key_uri)
                     key = key_cache.get(absolute_key)
                     if key is None:
+                        self._raise_if_cancelled()
                         key_resp = self._session.get(
                             absolute_key,
                             headers=headers,
@@ -1187,6 +1270,7 @@ class VideoDownloader:
                         )
                         key_resp.raise_for_status()
                         key = key_resp.content
+                        self._raise_if_cancelled()
                         key_cache[absolute_key] = key
                     iv = _parse_hls_iv(key_iv, segment_number)
                 segments.append(
@@ -1315,7 +1399,14 @@ class VideoDownloader:
                 escaped = str(source).replace("\\", "\\\\").replace("'", "\\'")
                 file.write(f"file '{escaped}'\n")
 
-    def _remux_hls_segments(self, ffmpeg: str, concat_list: Path, output: Path) -> None:
+    def _remux_hls_segments(
+        self,
+        ffmpeg: str,
+        concat_list: Path,
+        output: Path,
+        *,
+        allow_cancelled: bool = False,
+    ) -> None:
         cmd = [
             ffmpeg,
             "-y",
@@ -1334,19 +1425,9 @@ class VideoDownloader:
             "aac_adtstoasc",
             str(output),
         ]
-        proc = subprocess.Popen(
-            cmd,
-            stderr=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            text=True,
-        )
-        self._ffmpeg_proc = proc
-        try:
-            _stdout, stderr = proc.communicate()
-            if proc.returncode != 0:
-                raise RuntimeError(stderr.strip() or f"ffmpeg exited with {proc.returncode}")
-        finally:
-            self._ffmpeg_proc = None
+        code, stderr = self._run_audio_ffmpeg(cmd, allow_cancelled=allow_cancelled)
+        if code != 0:
+            raise RuntimeError(stderr.strip() or f"ffmpeg exited with {code}")
 
     def _download_hls_ytdlp(
         self,
@@ -1359,11 +1440,11 @@ class VideoDownloader:
         final_path: Dict[str, Optional[str]] = {"path": None}
 
         def post_hook(filename: str) -> None:
+            self._raise_if_cancelled()
             final_path["path"] = filename
 
         def hook(data: Dict) -> None:
-            if self._cancelled:
-                raise RuntimeError("Download cancelled")
+            self._raise_if_cancelled()
             status = data.get("status", "")
             filename = data.get("filename") or data.get("tmpfilename")
             if filename:
@@ -1397,9 +1478,9 @@ class VideoDownloader:
                 )
             elif status == "finished":
                 progress = DownloadProgress(
-                    status="finished",
+                    status="downloading",
                     filename=filename,
-                    message="Post-processing...",
+                    message="Downloaded media track; preparing remaining tracks...",
                 )
             elif status == "error":
                 progress = DownloadProgress(
@@ -1410,6 +1491,18 @@ class VideoDownloader:
                 return
             if on_progress is not None:
                 on_progress(progress)
+            self._raise_if_cancelled()
+
+        def postprocessor_hook(data: Dict) -> None:
+            self._raise_if_cancelled()
+            if data.get("status") == "started" and on_progress is not None:
+                info = data.get("info_dict") or {}
+                on_progress(DownloadProgress(
+                    status="finalizing",
+                    filename=info.get("filepath") or info.get("_filename"),
+                    message="Merging or processing downloaded media...",
+                ))
+            self._raise_if_cancelled()
 
         if on_progress is not None:
             on_progress(
@@ -1429,6 +1522,7 @@ class VideoDownloader:
             "noprogress": True,
             "progress_hooks": [hook],
             "post_hooks": [post_hook],
+            "postprocessor_hooks": [postprocessor_hook],
             "merge_output_format": "mp4",
             "hls_prefer_native": True,
             "concurrent_fragment_downloads": 4,
@@ -1442,8 +1536,11 @@ class VideoDownloader:
         if ffmpeg and not shutil.which("ffmpeg"):
             ydl_opts["ffmpeg_location"] = ffmpeg
 
+        self._raise_if_cancelled()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             result = ydl.download([item.url])
+
+        self._raise_if_cancelled()
 
         if result:
             raise RuntimeError("Native HLS download failed")
@@ -1475,10 +1572,13 @@ class VideoDownloader:
         # CDNs streaming media usually want a "media" Accept rather than HTML.
         headers["Accept"] = "*/*"
 
-        self._parallel = ParallelDownloader(
-            connections=self.parallel_connections,
-            lane_limiter=self._lane_limiter,
-        )
+        with self._process_lock:
+            self._raise_if_cancelled()
+            parallel = ParallelDownloader(
+                connections=self.parallel_connections,
+                lane_limiter=self._lane_limiter,
+            )
+            self._parallel = parallel
 
         def relay(downloaded: int, total: int, speed: float) -> None:
             if on_progress is None:
@@ -1498,15 +1598,19 @@ class VideoDownloader:
             )
 
         try:
-            result = self._parallel.download(
+            result = parallel.download(
                 url=item.url,
                 output_path=output_path,
                 headers=headers,
                 progress=relay,
             )
         finally:
-            self._parallel.close()
-            self._parallel = None
+            parallel.close()
+            with self._process_lock:
+                if self._parallel is parallel:
+                    self._parallel = None
+
+        self._raise_if_cancelled()
 
         if on_progress is not None:
             on_progress(
@@ -1578,19 +1682,12 @@ class VideoDownloader:
                 )
             )
 
-        proc = subprocess.Popen(
-            cmd,
-            stderr=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-        )
-        self._ffmpeg_proc = proc
         stderr_tail: list[str] = []
         last_ms = 0
-        try:
+        with self._ffmpeg_process(cmd, bufsize=1) as proc:
             assert proc.stderr is not None
             for raw_line in proc.stderr:
+                self._raise_if_cancelled()
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -1622,11 +1719,10 @@ class VideoDownloader:
                     )
 
             code = proc.wait()
+            self._raise_if_cancelled()
             if code != 0:
                 tail = "\n".join(stderr_tail[-8:]) or f"ffmpeg exited with {code}"
                 raise RuntimeError(tail)
-        finally:
-            self._ffmpeg_proc = None
 
         if on_progress is not None:
             on_progress(

@@ -7,3 +7,4 @@ lxml>=5.0.0
 Pillow>=10.0.0
 pycryptodome>=3.20.0
 imageio-ffmpeg==0.6.0
+psutil==7.2.2
