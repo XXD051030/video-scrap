@@ -120,9 +120,10 @@ class HlsByteRangeTests(unittest.TestCase):
         )
 
     @staticmethod
-    def remux(_ffmpeg, concat_list, output, *, allow_cancelled=False):
+    def remux(_ffmpeg, concat_list, output, *, allow_cancelled=False, **_kwargs):
         sources = [Path(shlex.split(line)[1])
-                   for line in concat_list.read_text("utf-8").splitlines()]
+                   for line in concat_list.read_text("utf-8").splitlines()
+                   if line.startswith("file ")]
         output.write_bytes(b"".join(source.read_bytes() for source in sources))
 
     def test_explicit_and_implicit_ranges_preserve_segment_order(self):
@@ -449,10 +450,12 @@ other.m3u8
         with mock.patch("src.downloader.resolve_ffmpeg", return_value="/fake/ffmpeg"), \
                 mock.patch.object(downloader, "_download_hls_segments_parallel", side_effect=RuntimeError("native failed")), \
                 mock.patch.object(downloader, "_download_hls_ytdlp", side_effect=RuntimeError("yt-dlp failed")) as ytdlp, \
-                mock.patch.object(downloader, "_download_hls_ffmpeg", side_effect=finished):
+                mock.patch.object(downloader, "_download_hls_ffmpeg", side_effect=finished), \
+                mock.patch.object(downloader, "_verify_hls_output") as verify:
             result = downloader.download(self.item())
         self.assertEqual(result.read_bytes(), b"verified video with audio")
         self.assertEqual(ytdlp.call_args.args[0].url, MANIFEST_URL)
+        self.assertTrue(verify.call_args.kwargs["require_av"])
         self.assertTrue(set(candidates).issubset({url for url, _ in downloader._session.media_requests}))
 
     def test_external_audio_master_rejects_unchecked_video_or_audio_ranges(self):
@@ -493,7 +496,7 @@ other.m3u8
     def test_range_remux_failure_cleans_staged_file_without_fallback(self):
         downloader = self.downloader()
 
-        def failed_remux(_ffmpeg, _concat, target):
+        def failed_remux(_ffmpeg, _concat, target, **_kwargs):
             target.write_bytes(b"incomplete output")
             raise RuntimeError("remux failed")
 

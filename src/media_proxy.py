@@ -296,8 +296,9 @@ def _validated_partial_range(
 class _Entry:
     """One registered upstream URL plus its on-disk cache state.
 
-    Each entry owns a sparse temp file. Bytes fetched from upstream are
-    written at their absolute offset, and a list of cached
+    Each entry owns a sparse temp file, without keeping its handle open.
+    Bytes fetched from upstream are written at their absolute offset, and
+    a list of cached
     ``[start, end_exclusive)`` intervals lets us answer "do we already
     have these bytes?" without scanning the file.
     """
@@ -323,8 +324,10 @@ class _Entry:
         fd, path = tempfile.mkstemp(
             dir=str(cache_dir), prefix="vs_", suffix=".bin"
         )
+        # A manifest can register thousands of segments before any is played.
+        # Keep the stable, private path but open it only during cache I/O.
+        os.close(fd)
         self.cache_path = Path(path)
-        self._file = os.fdopen(fd, "r+b")
         self._file_lock = threading.Lock()
 
         # Sorted, non-overlapping cached byte intervals [start, end_exclusive).
@@ -466,10 +469,13 @@ class _Entry:
         with self._file_lock:
             if self.closed:
                 return
-            self._file.seek(offset)
-            self._file.write(data)
-            self._file.flush()
-        self.merge_interval(offset, offset + len(data))
+            # r+b never recreates a removed cache. Holding the lock until
+            # the handle is closed also lets unregister safely unlink it on
+            # Windows, and prevents close racing the interval publication.
+            with self.cache_path.open("r+b") as cache_file:
+                cache_file.seek(offset)
+                cache_file.write(data)
+            self.merge_interval(offset, offset + len(data))
 
     def read_at(self, offset: int, length: int) -> bytes:
         if length <= 0 or self.closed:
@@ -477,8 +483,9 @@ class _Entry:
         with self._file_lock:
             if self.closed:
                 return b""
-            self._file.seek(offset)
-            return self._file.read(length)
+            with self.cache_path.open("rb") as cache_file:
+                cache_file.seek(offset)
+                return cache_file.read(length)
 
     def update_player_offset(self, offset: int) -> None:
         if offset < 0:
@@ -488,16 +495,12 @@ class _Entry:
         self.player_event.set()
 
     def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        self.player_event.set()
-        self.hls_child_by_upstream.clear()
         with self._file_lock:
-            try:
-                self._file.close()
-            except OSError:
-                pass
+            if self.closed:
+                return
+            self.closed = True
+            self.player_event.set()
+            self.hls_child_by_upstream.clear()
             try:
                 self.cache_path.unlink()
             except OSError:

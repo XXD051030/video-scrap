@@ -186,6 +186,10 @@ class _HlsByteRangeError(RuntimeError):
     """A ranged playlist cannot safely use an unvalidated fallback backend."""
 
 
+class _HlsIntegrityError(RuntimeError):
+    """Do not retry missing media with a backend that may skip fragments."""
+
+
 @dataclass
 class _HlsMasterContext:
     url: str
@@ -200,10 +204,15 @@ class _HlsFallbackError(RuntimeError):
         message: str,
         manifest_url: str,
         master_context: Optional[_HlsMasterContext] = None,
+        *,
+        require_av: bool = False,
+        expected_duration: float = 0.0,
     ) -> None:
         super().__init__(message)
         self.manifest_url = manifest_url
         self.master_context = master_context
+        self.require_av = require_av
+        self.expected_duration = expected_duration
 
 
 def _is_hls_tag(line: str, tag: str) -> bool:
@@ -533,7 +542,7 @@ class VideoDownloader:
                 if quality == "audio only":
                     return self._download_hls_parallel(item, on_progress, audio_only=True)
                 return self._download_hls_parallel(item, on_progress)
-            except _HlsByteRangeError:
+            except (_HlsByteRangeError, _HlsIntegrityError):
                 # yt-dlp's HTTP backend can accept a whole-file 200 or an
                 # incorrect 206 for a Range request. Do not publish those
                 # bytes by retrying a ranged playlist with that backend.
@@ -559,7 +568,15 @@ class VideoDownloader:
                         )
                     )
                 try:
-                    return self._download_hls_ytdlp(fallback_item, on_progress)
+                    result = self._download_hls_ytdlp(fallback_item, on_progress)
+                    if exc.require_av:
+                        ffmpeg = resolve_ffmpeg()
+                        if not ffmpeg:
+                            raise RuntimeError("FFmpeg is required to verify HLS audio and video")
+                        self._verify_hls_output(
+                            ffmpeg, result, exc.expected_duration, require_av=True
+                        )
+                    return result
                 except Exception:
                     if self._cancelled:
                         raise
@@ -574,7 +591,12 @@ class VideoDownloader:
                                 message="Native HLS failed; retrying with ffmpeg...",
                             )
                         )
-                    return self._download_hls_ffmpeg(fallback_item, ffmpeg, on_progress)
+                    result = self._download_hls_ffmpeg(fallback_item, ffmpeg, on_progress)
+                    if exc.require_av:
+                        self._verify_hls_output(
+                            ffmpeg, result, exc.expected_duration, require_av=True
+                        )
+                    return result
         if item.is_direct and not item.is_hls:
             return self._download_direct(item, on_progress)
 
@@ -741,25 +763,70 @@ class VideoDownloader:
             raise _HlsByteRangeError(
                 f"Could not safely inspect the HLS media manifest: {exc}"
             ) from exc
-        has_byte_ranges = _hls_has_byte_ranges(manifest_text)
+        audio_segments: Optional[list[_HlsSegment]] = None
+        audio_url: Optional[str] = None
+        audio_text = ""
+        if master_context is not None:
+            selected_variant = self._pick_hls_variant(
+                master_context.text, master_context.url
+            )
+            audio_url = self._pick_hls_audio_rendition(
+                master_context.text, master_context.url, selected_variant
+            ) if selected_variant else None
+            if audio_url is not None:
+                try:
+                    audio_url, audio_text, _context = self._fetch_hls_manifest(
+                        audio_url, headers, media_only=True
+                    )
+                except Exception as exc:
+                    # An uninspected audio playlist could contain ranges. A
+                    # master fallback must not hide a failed safety inspection.
+                    raise _HlsByteRangeError(
+                        f"Could not safely inspect the HLS audio manifest: {exc}"
+                    ) from exc
+        has_byte_ranges = (
+            _hls_has_byte_ranges(manifest_text) or _hls_has_byte_ranges(audio_text)
+        )
+        verify_duration = "#EXT-X-ENDLIST" in manifest_text and (
+            not audio_text or "#EXT-X-ENDLIST" in audio_text
+        )
+        segments: list[_HlsSegment] = []
         try:
             segments = self._parse_hls_segments(manifest_text, manifest_url, headers)
             if not segments:
                 raise RuntimeError("HLS manifest did not contain media segments")
+            if audio_text:
+                audio_segments = self._parse_hls_segments(audio_text, audio_url, headers)
+                if not audio_segments:
+                    raise _HlsIntegrityError("HLS audio manifest did not contain media segments")
             ffmpeg = resolve_ffmpeg()
             if not ffmpeg:
                 raise RuntimeError("ffmpeg is required for HLS remuxing")
+            if audio_segments is not None:
+                return self._download_hls_segments_parallel(
+                    item, on_progress, segments, headers, ffmpeg,
+                    audio_segments=audio_segments,
+                    verify_duration=verify_duration,
+                )
             return self._download_hls_segments_parallel(
-                item, on_progress, segments, headers, ffmpeg
+                item, on_progress, segments, headers, ffmpeg,
+                verify_duration=verify_duration,
             )
-        except _HlsByteRangeError:
+        except (_HlsByteRangeError, _HlsIntegrityError):
             raise
         except Exception as exc:
             if has_byte_ranges:
                 raise _HlsByteRangeError(
                     f"HLS byte-range download failed safely: {exc}"
                 ) from exc
-            raise _HlsFallbackError(str(exc), manifest_url, master_context) from exc
+            raise _HlsFallbackError(
+                str(exc), manifest_url, master_context,
+                require_av=audio_url is not None,
+                expected_duration=max(
+                    sum(segment.duration for segment in segments),
+                    sum(segment.duration for segment in audio_segments or []),
+                ) if verify_duration else 0.0,
+            ) from exc
 
     def _download_hls_segments_parallel(
         self,
@@ -768,12 +835,20 @@ class VideoDownloader:
         segments: list[_HlsSegment],
         headers: Dict[str, str],
         ffmpeg: str,
+        *,
+        audio_segments: Optional[list[_HlsSegment]] = None,
+        verify_duration: bool = False,
     ) -> Path:
         """Keep the ordinary HLS transfer, cancellation and remux flow."""
         title = safe_filename(item.title)
         output_path = self.output_dir / f"{title}.mp4"
 
-        total = len(segments)
+        video_count = len(segments)
+        all_segments = segments + [
+            replace(segment, index=video_count + index)
+            for index, segment in enumerate(audio_segments or [])
+        ]
+        total = len(all_segments)
         started = time.monotonic()
         transfer_started = time.monotonic()
         completed = 0
@@ -787,12 +862,14 @@ class VideoDownloader:
                 if self._cancelled:
                     raise RuntimeError("Download cancelled")
                 data = self._download_hls_segment(seg, headers)
+                if not data:
+                    raise _HlsIntegrityError("HLS segment contains no media bytes")
                 paths[seg.index].write_bytes(data)
                 return seg.index, len(data)
 
-            def contiguous_count() -> int:
+            def contiguous_count(track_paths: list[Path]) -> int:
                 count = 0
-                for path in paths:
+                for path in track_paths:
                     try:
                         if path.exists() and path.stat().st_size > 0:
                             count += 1
@@ -803,25 +880,40 @@ class VideoDownloader:
                 return count
 
             def merge_downloaded(
-                count: int, destination: Path, *, allow_cancelled: bool = False
+                count: int, destination: Path, *, allow_cancelled: bool = False,
+                audio_count: int = 0,
             ) -> float:
                 self._raise_if_cancelled(allow_cancelled=allow_cancelled)
                 merge_started = time.monotonic()
                 concat_list = tmp_dir / f"{destination.stem}.concat.txt"
-                self._write_ffmpeg_concat_list(paths[:count], concat_list)
-                self._raise_if_cancelled(allow_cancelled=allow_cancelled)
-                if allow_cancelled:
-                    self._remux_hls_segments(
-                        ffmpeg, concat_list, destination, allow_cancelled=True
+                self._write_ffmpeg_concat_list(
+                    paths[:count], concat_list,
+                    durations=([segment.duration for segment in segments[:count]]
+                               if audio_segments is not None else None),
+                )
+                audio_concat = None
+                if audio_segments is not None:
+                    audio_concat = tmp_dir / f"{destination.stem}.audio.concat.txt"
+                    self._write_ffmpeg_concat_list(
+                        paths[video_count:video_count + audio_count], audio_concat,
+                        durations=[segment.duration for segment in audio_segments[:audio_count]],
                     )
-                else:
-                    self._remux_hls_segments(ffmpeg, concat_list, destination)
+                expected_duration = max(
+                    sum(segment.duration for segment in segments[:count]),
+                    sum(segment.duration for segment in (audio_segments or [])[:audio_count]),
+                ) if verify_duration else 0.0
+                self._raise_if_cancelled(allow_cancelled=allow_cancelled)
+                self._remux_hls_segments(
+                    ffmpeg, concat_list, destination, allow_cancelled=allow_cancelled,
+                    expected_duration=expected_duration, audio_concat=audio_concat,
+                )
                 self._raise_if_cancelled(allow_cancelled=allow_cancelled)
                 return time.monotonic() - merge_started
 
             def build_partial() -> Path:
-                partial_count = contiguous_count()
-                if partial_count <= 0:
+                partial_count = contiguous_count(paths[:video_count])
+                partial_audio_count = contiguous_count(paths[video_count:])
+                if partial_count <= 0 or (audio_segments is not None and partial_audio_count <= 0):
                     raise RuntimeError(
                         "Download cancelled before any initial HLS segments finished"
                     )
@@ -830,27 +922,28 @@ class VideoDownloader:
                     on_progress(
                         DownloadProgress(
                             status="finalizing",
-                            downloaded_bytes=partial_count,
+                            downloaded_bytes=partial_count + partial_audio_count,
                             total_bytes=total,
                             filename=str(partial_path),
                             message=(
                                 f"Merging partial file "
-                                f"({partial_count}/{total} segments)..."
+                                f"({partial_count + partial_audio_count}/{total} segments)..."
                             ),
                         )
                     )
                 merge_seconds = merge_downloaded(
-                    partial_count, partial_path, allow_cancelled=True
+                    partial_count, partial_path, allow_cancelled=True,
+                    audio_count=partial_audio_count,
                 )
                 if on_progress is not None:
                     on_progress(
                         DownloadProgress(
                             status="partial",
-                            downloaded_bytes=partial_count,
+                            downloaded_bytes=partial_count + partial_audio_count,
                             total_bytes=total,
                             filename=str(partial_path),
                             message=(
-                                f"Partial saved ({partial_count}/{total} segments); "
+                                f"Partial saved ({partial_count + partial_audio_count}/{total} segments); "
                                 f"merge {merge_seconds:.1f}s"
                             ),
                         )
@@ -859,7 +952,7 @@ class VideoDownloader:
 
             workers = max(1, min(self.parallel_connections, total))
             pool = ThreadPoolExecutor(max_workers=workers)
-            futures = [pool.submit(fetch, seg) for seg in segments]
+            futures = [pool.submit(fetch, seg) for seg in all_segments]
             make_partial = False
             pending_error: Optional[Exception] = None
             try:
@@ -924,7 +1017,9 @@ class VideoDownloader:
                     )
                 )
             transfer_seconds = time.monotonic() - transfer_started
-            merge_seconds = merge_downloaded(total, output_path)
+            merge_seconds = merge_downloaded(
+                video_count, output_path, audio_count=len(audio_segments or [])
+            )
 
         if on_progress is not None:
             final_size = output_path.stat().st_size if output_path.exists() else 0
@@ -1313,6 +1408,7 @@ class VideoDownloader:
             )
             request_headers["Accept-Encoding"] = "identity"
         last_error: Optional[Exception] = None
+        saw_empty_media = False
         for _attempt in range(1, 11):
             if self._cancelled:
                 raise RuntimeError("Download cancelled")
@@ -1351,17 +1447,25 @@ class VideoDownloader:
                 if segment.key and segment.iv:
                     data = _aes_cbc_decrypt_bytes(data, segment.key, segment.iv)
                     data = _strip_pkcs7_padding(data)
+                if not data:
+                    # A 200 with an empty body (or padding-only plaintext) is
+                    # not a downloaded segment. FFmpeg may stop at that file
+                    # while still returning success and omitting later media.
+                    raise _HlsIntegrityError("HLS segment contains no media bytes")
                 return data
             except _HlsByteRangeError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 if self._cancelled:
                     raise
+                saw_empty_media = saw_empty_media or isinstance(exc, _HlsIntegrityError)
                 last_error = exc
             finally:
                 if acquired and self._lane_limiter is not None:
                     self._lane_limiter.release()
-        error_class = _HlsByteRangeError if is_ranged else RuntimeError
+        error_class = (_HlsByteRangeError if is_ranged else
+                       _HlsIntegrityError if saw_empty_media
+                       else RuntimeError)
         raise error_class(f"Failed to download HLS segment {segment.index}: {last_error}")
 
     @staticmethod
@@ -1393,11 +1497,19 @@ class VideoDownloader:
         ):
             raise _HlsByteRangeError("Incorrect HLS byte-range Content-Length")
 
-    def _write_ffmpeg_concat_list(self, sources: list[Path], target: Path) -> None:
+    def _write_ffmpeg_concat_list(
+        self, sources: list[Path], target: Path, *,
+        durations: Optional[list[float]] = None,
+    ) -> None:
         with open(target, "w", encoding="utf-8") as file:
-            for source in sources:
+            for index, source in enumerate(sources):
                 escaped = str(source).replace("\\", "\\\\").replace("'", "\\'")
                 file.write(f"file '{escaped}'\n")
+                if durations is not None and durations[index] > 0:
+                    # TS probing can underestimate AAC segment durations. Use
+                    # the playlist's boundary to avoid overlapping DTS when
+                    # concatenating a separate audio rendition without reencoding.
+                    file.write(f"duration {durations[index]:.9f}\n")
 
     def _remux_hls_segments(
         self,
@@ -1406,6 +1518,8 @@ class VideoDownloader:
         output: Path,
         *,
         allow_cancelled: bool = False,
+        expected_duration: float = 0.0,
+        audio_concat: Optional[Path] = None,
     ) -> None:
         cmd = [
             ffmpeg,
@@ -1413,21 +1527,59 @@ class VideoDownloader:
             "-hide_banner",
             "-loglevel",
             "error",
+            "-err_detect",
+            "explode",
             "-f",
             "concat",
             "-safe",
             "0",
             "-i",
             str(concat_list),
-            "-c",
-            "copy",
-            "-bsf:a",
-            "aac_adtstoasc",
-            str(output),
         ]
+        if audio_concat is not None:
+            cmd.extend([
+                "-err_detect", "explode", "-f", "concat", "-safe", "0", "-i", str(audio_concat),
+                "-map", "0:v:0", "-map", "1:a:0",
+            ])
+        cmd.extend(["-c", "copy", "-bsf:a", "aac_adtstoasc", str(output)])
         code, stderr = self._run_audio_ffmpeg(cmd, allow_cancelled=allow_cancelled)
-        if code != 0:
+        if code != 0 or stderr.strip():
             raise RuntimeError(stderr.strip() or f"ffmpeg exited with {code}")
+        self._verify_hls_output(
+            ffmpeg, output, expected_duration,
+            require_av=audio_concat is not None, allow_cancelled=allow_cancelled,
+        )
+
+    def _verify_hls_output(
+        self, ffmpeg: str, output: Path, expected_duration: float, *,
+        require_av: bool = False, allow_cancelled: bool = False,
+    ) -> None:
+        """Probe the finished container without decoding the full download."""
+        if not output.is_file() or output.stat().st_size == 0:
+            raise _HlsIntegrityError("HLS merge did not produce a nonempty media file")
+        _code, details = self._run_audio_ffmpeg(
+            [ffmpeg, "-hide_banner", "-nostdin", "-i", str(output)],
+            allow_cancelled=allow_cancelled,
+        )
+        # This inspection-only FFmpeg command exits 1 because it has no output.
+        duration = re.search(r"Duration:\s*(\d+:\d+:\d+(?:\.\d+)?)", details)
+        actual_duration = _parse_ffmpeg_time(duration.group(1)) if duration else None
+        if actual_duration is None and expected_duration > 0:
+            raise _HlsIntegrityError("Could not confirm the duration of the merged HLS file")
+        # Container rounding, AAC priming and rounded EXTINF values can differ.
+        # This is a truncation guard, not a frame-exact validation promise.
+        tolerance = max(0.5, expected_duration * 0.01)
+        if expected_duration > 0 and actual_duration + tolerance < expected_duration:
+            raise _HlsIntegrityError(
+                f"HLS output is shorter than its playlist "
+                f"({actual_duration:.2f}s of {expected_duration:.2f}s)"
+            )
+        if not re.search(r"Stream #\d+:\d+.*\b(?:Video|Audio):", details):
+            raise _HlsIntegrityError("HLS output does not contain a media stream")
+        if require_av and not all(re.search(
+            rf"Stream #\d+:\d+.*\b{kind}:", details
+        ) for kind in ("Video", "Audio")):
+            raise _HlsIntegrityError("HLS output is missing its video or audio stream")
 
     def _download_hls_ytdlp(
         self,
@@ -1515,7 +1667,7 @@ class VideoDownloader:
 
         ydl_opts = {
             "outtmpl": outtmpl,
-            "format": "best",
+            "format": "bestvideo*+bestaudio/best",
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
@@ -1528,6 +1680,7 @@ class VideoDownloader:
             "concurrent_fragment_downloads": 4,
             "retries": 5,
             "fragment_retries": 10,
+            "skip_unavailable_fragments": False,
             "extractor_retries": 5,
             "socket_timeout": 60,
             "http_headers": build_request_headers(item.referer),

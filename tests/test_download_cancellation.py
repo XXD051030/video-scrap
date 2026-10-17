@@ -281,7 +281,7 @@ class DownloadCancellationTests(unittest.TestCase):
             with self.subTest(keep_partial=keep_partial):
                 downloader = self.downloader()
 
-                def remux(_ffmpeg, _concat, target):
+                def remux(_ffmpeg, _concat, target, **_kwargs):
                     target.write_bytes(PAYLOAD)
                     downloader.cancel(keep_partial=keep_partial)
 
@@ -304,7 +304,7 @@ class DownloadCancellationTests(unittest.TestCase):
                     if value.message == "Segment 1/1":
                         downloader.cancel(keep_partial=keep_partial)
 
-                def remux(_ffmpeg, _concat, target, *, allow_cancelled=False):
+                def remux(_ffmpeg, _concat, target, *, allow_cancelled=False, **_kwargs):
                     self.assertTrue(allow_cancelled)
                     self.assertIn(".partial", target.name)
                     target.write_bytes(PAYLOAD)

@@ -289,11 +289,12 @@ class DownloadNameReservationTests(unittest.TestCase):
             raise RuntimeError("stopped after the first segment")
 
         def remux_partial(
-            _ffmpeg: str, _concat: Path, target: Path, *, allow_cancelled: bool = False
+            _ffmpeg: str, _concat: Path, target: Path, *, allow_cancelled: bool = False,
+            **_kwargs,
         ) -> None:
             target.write_bytes(b"partial from A")
 
-        def remux_full(_ffmpeg: str, _concat: Path, target: Path) -> None:
+        def remux_full(_ffmpeg: str, _concat: Path, target: Path, **_kwargs) -> None:
             target.write_bytes(b"complete from A.partial")
 
         try:
@@ -337,7 +338,7 @@ class DownloadNameReservationTests(unittest.TestCase):
         old.write_bytes(b"previous complete video")
         downloader = VideoDownloader(self.output_dir, parallel_connections=1)
 
-        def fail_remux(_ffmpeg: str, _concat: Path, target: Path) -> None:
+        def fail_remux(_ffmpeg: str, _concat: Path, target: Path, **_kwargs) -> None:
             target.write_bytes(b"incomplete remux")
             raise RuntimeError("simulated remux failure")
 
