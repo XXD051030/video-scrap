@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover - optional dep
     WEBENGINE_AVAILABLE = False
 
 try:
-    from .interactive_scraper import get_shared_profile
+    from .interactive_scraper import get_shared_profile, snapshot_browser_cookies
 except Exception:  # pragma: no cover - optional dep
     get_shared_profile = None  # type: ignore[assignment]
 
@@ -89,9 +89,15 @@ class JSPageScraper(QObject):
         self._wait_timer.setSingleShot(True)
         self._wait_timer.timeout.connect(self._extract)
         self._done = False
+        self._profile = None
+        self.page_url = ""
+        self.browser_cookies: list[dict] = []
 
     def scrape(self, url: str) -> None:
+        self.dispose()
         self._done = False
+        self.page_url = url
+        self.browser_cookies = []
         self.log.emit(f"WebEngine: loading {url}")
         # Reuse the persistent profile so any cookies the user established
         # via the interactive dialog (after clearing a CAPTCHA / logging in)
@@ -106,6 +112,7 @@ class JSPageScraper(QObject):
             QWebEnginePage(profile, self) if profile is not None
             else QWebEnginePage(self)
         )
+        self._profile = profile
         self._page.loadFinished.connect(self._on_loaded)
         self._timeout_timer.start(self.load_timeout_ms)
         self._page.load(QUrl(url))
@@ -137,9 +144,16 @@ class JSPageScraper(QObject):
         videos = list(result.get("videos") or [])
         iframes = list(result.get("iframes") or [])
         title = result.get("pageTitle") or ""
+        if self._page is not None:
+            self.page_url = self._page.url().toString() or self.page_url
+        if self._profile is not None:
+            self.browser_cookies = snapshot_browser_cookies(
+                self._profile, [self.page_url, *videos, *iframes]
+            )
         self.log.emit(
             f"WebEngine: found {len(videos)} video URL(s), {len(iframes)} iframe(s)"
         )
+        self.dispose()
         self.finished.emit(videos, iframes, title)
 
     def _on_timeout(self) -> None:
@@ -148,7 +162,14 @@ class JSPageScraper(QObject):
         self._fail("WebEngine load timed out")
 
     def _fail(self, message: str) -> None:
+        self.dispose()
+        self.failed.emit(message)
+
+    def dispose(self) -> None:
         self._done = True
         self._timeout_timer.stop()
         self._wait_timer.stop()
-        self.failed.emit(message)
+        page, self._page = self._page, None
+        if page is not None:
+            page.triggerAction(QWebEnginePage.WebAction.Stop)
+            page.deleteLater()

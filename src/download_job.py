@@ -43,7 +43,8 @@ class DownloadCleanupError(RuntimeError):
 
 _ITEM_FIELDS = (
     "title", "url", "source_url", "referer", "duration", "ext", "is_direct",
-    "is_hls", "x_playlist_index", "x_auth_browser", "hls_png_wrapped",
+    "is_hls", "x_playlist_index", "x_auth_browser", "hls_png_wrapped", "is_dash",
+    "browser_cookies",
 )
 _TERMINAL_STATES = {"cancelled", "completed", "failed"}
 _MESSAGE_LIMIT = 4096
@@ -84,14 +85,17 @@ def _download_child(
 
     send_lock = threading.Lock()  # Child-local, never acquired by the parent.
     last_progress = 0.0
+    last_status = ""
 
     def relay(progress: DownloadProgress) -> None:
-        nonlocal last_progress
+        nonlocal last_progress, last_status
         now = time.monotonic()
         with send_lock:
-            if progress.status == "downloading" and now - last_progress < 0.1:
+            if (progress.status == "downloading" and last_status == "downloading"
+                    and now - last_progress < 0.1):
                 return
             last_progress = now
+            last_status = progress.status
             event = asdict(progress)
             # Windows paths and backend diagnostics must remain small enough
             # for a supervisor to consume without a partially received packet.
@@ -376,6 +380,15 @@ class DownloadJob:
         with self._lock:
             return self._cancelled, self._want_paused
 
+    def _update_progress_state(self, event: DownloadProgress) -> None:
+        """A fallback may resume network transfers after a failed merge."""
+        if event.status == "finalizing":
+            with self._lock:
+                self._want_paused = False
+            self._state_to("finalizing")
+        elif event.status == "downloading" and self.state == "finalizing":
+            self._state_to("downloading")
+
     @staticmethod
     def _validate_result(result: str, work_dir: Path) -> Path:
         path = Path(result)
@@ -546,10 +559,7 @@ class DownloadJob:
                     kind = message.get("kind")
                     if kind == "progress":
                         event = DownloadProgress(**message["value"])
-                        if event.status == "finalizing":
-                            with self._lock:
-                                self._want_paused = False
-                            self._state_to("finalizing")
+                        self._update_progress_state(event)
                         if (
                             event.status not in {"completed", "partial"}
                             and not self._requests()[0]

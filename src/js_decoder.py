@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import List, Tuple
+from dataclasses import dataclass
+from typing import List
 from urllib.parse import unquote
 
 
@@ -38,8 +39,17 @@ _STRING_ARRAY_RE = re.compile(
 _INT_ARRAY_RE = re.compile(
     r"const\s+(_[a-zA-Z0-9_]+)\s*=\s*(\[\s*\d+(?:\s*,\s*\d+)*\s*\])\s*;",
 )
+_IDENTIFIER = r"[A-Za-z_$][\w$]*"
+_STRING_LITERAL = r'''(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')'''
 _REPLACE_RE = re.compile(
-    r"\.replace\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]*)['\"]\s*\)"
+    rf"\s*\.replace\(\s*({_STRING_LITERAL})\s*,\s*({_STRING_LITERAL})\s*\)"
+)
+_ASSIGNMENT_RE = re.compile(
+    rf"(?P<target>{_IDENTIFIER})\s*=(?!=)\s*"
+    rf"(?P<value>(?:{_STRING_LITERAL}|[^;\n\"'])+)(?:;|\n|$)"
+)
+_COMMENT_OR_STRING_RE = re.compile(
+    rf"{_STRING_LITERAL}|//[^\n]*|/\*.*?\*/", re.DOTALL
 )
 _MEDIA_EXT_RE = re.compile(r"\.(mp4|webm|m3u8|mov|m4v|mkv|mpd)(?:\?|$)", re.IGNORECASE)
 
@@ -64,52 +74,205 @@ def _try_parse_int_array(literal: str) -> List[int] | None:
     return value
 
 
-def _candidate_pairs(html: str) -> List[Tuple[List[str], List[int], int]]:
-    """Find every (string_array, int_array) pair that share the same length.
+@dataclass
+class _ArrayPair:
+    strings: List[str]
+    indices: List[int]
+    strings_name: str
+    indices_name: str
+    position: int
 
-    Returns triplets of (strings, ints, position_in_html) so that callers
-    can apply nearby ``.replace`` cleanups.
-    """
-    string_arrays: List[Tuple[List[str], int]] = []
+
+def _candidate_pairs(html: str) -> List[_ArrayPair]:
+    """Find adjacent compatible arrays belonging to the same script block."""
+    string_arrays = []
     for m in _STRING_ARRAY_RE.finditer(html):
         parsed = _try_parse_string_array(m.group(2))
         if parsed:
-            string_arrays.append((parsed, m.start()))
+            string_arrays.append((parsed, m.group(1), m.start(), m.end()))
 
-    int_arrays: List[Tuple[List[int], int]] = []
+    int_arrays = []
     for m in _INT_ARRAY_RE.finditer(html):
         parsed = _try_parse_int_array(m.group(2))
         if parsed:
-            int_arrays.append((parsed, m.start()))
+            int_arrays.append((parsed, m.group(1), m.start(), m.end()))
 
-    pairs: List[Tuple[List[str], List[int], int]] = []
-    for strings, s_pos in string_arrays:
-        for ints, i_pos in int_arrays:
+    pairs: List[_ArrayPair] = []
+    for strings, strings_name, s_pos, s_end in string_arrays:
+        # Independent scripts/blocks often reuse equally sized arrays. Pair
+        # adjacent declarations, preferring a following index array, rather
+        # than applying one block's transforms to another block's fragments.
+        script_start = html.rfind("<script", 0, s_pos)
+        script_end = html.find("</script", s_pos)
+        script_end = script_end if script_end >= 0 else len(html)
+        next_string = min(
+            (position for _, _, position, _ in string_arrays if position > s_pos),
+            default=script_end,
+        )
+        following = [position for _, _, position, _ in int_arrays if s_pos < position < min(next_string, script_end)]
+        for ints, indices_name, i_pos, i_end in int_arrays:
             if len(strings) != len(ints):
                 continue
             if abs(i_pos - s_pos) > 4000:
                 continue
+            if not script_start < i_pos < script_end:
+                continue
+            if following and i_pos != min(following):
+                continue
+            low, high = sorted((s_pos, i_pos))
+            if any(low < position < high for _, _, position, _ in string_arrays + int_arrays):
+                continue
             n = len(ints)
             if sorted(ints) != list(range(n)):
                 continue
-            pairs.append((strings, ints, max(s_pos, i_pos)))
+            pairs.append(_ArrayPair(strings, ints, strings_name, indices_name, max(s_end, i_end)))
     return pairs
 
 
-def _apply_nearby_replaces(html: str, anchor_pos: int, value: str) -> str:
-    """Apply any ``.replace('a', 'b')`` calls that appear shortly after the
-    obfuscation block - that's where typical cleanup lives.
-    """
-    window = html[anchor_pos : anchor_pos + 2000]
-    for needle, repl in _REPLACE_RE.findall(window):
-        value = value.replace(needle, repl)
+def _parse_js_string(literal: str) -> str | None:
+    """Read only string literals, without evaluating JavaScript/Python code."""
+    body = literal[1:-1]
+    out: List[str] = []
+    i = 0
+    escapes = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+    while i < len(body):
+        char = body[i]
+        i += 1
+        if char != "\\":
+            out.append(char)
+            continue
+        if i == len(body):
+            return None
+        char = body[i]
+        i += 1
+        if char in {"u", "x"}:
+            size = 4 if char == "u" else 2
+            digits = body[i:i + size]
+            if len(digits) != size or not re.fullmatch(r"[0-9a-fA-F]+", digits):
+                return None
+            out.append(chr(int(digits, 16)))
+            i += size
+        elif char in {"\r", "\n"}:
+            if char == "\r" and body[i:i + 1] == "\n":
+                i += 1
+        elif char.isdigit() and char != "0":
+            return None  # Legacy octal escapes are outside this decoder.
+        else:
+            out.append(escapes.get(char, char))
+    return "".join(out)
+
+
+def _js_string_replace(value: str, needle: str, replacement: str) -> str:
+    """String-search JS replace changes one match and expands JS $ tokens."""
+    index = value.find(needle)
+    if index < 0:
+        return value
+    prefix, suffix = value[:index], value[index + len(needle):]
+    replacement = re.sub(
+        r"\$([$&`'])",
+        lambda match: {"$": "$", "&": needle, "`": prefix, "'": suffix}[match[1]],
+        replacement,
+    )
+    return prefix + replacement + suffix
+
+
+def _apply_expression(expression: str, target: str, value: str) -> str | None:
+    """Evaluate the supported self-assignment chain, rejecting extra code."""
+    expression = expression.strip()
+    decoded = re.match(rf"decodeURIComponent\(\s*{re.escape(target)}\s*\)", expression)
+    if decoded:
+        if re.search(r"%(?![0-9a-fA-F]{2})", value):
+            return None
+        try:
+            value = unquote(value, errors="strict")
+        except UnicodeDecodeError:
+            return None
+        position = decoded.end()
+    else:
+        identity = re.match(rf"{re.escape(target)}(?![\w$])", expression)
+        if not identity:
+            return None
+        position = identity.end()
+    while expression[position:].strip():
+        match = _REPLACE_RE.match(expression, position)
+        if not match:
+            return None
+        needle, replacement = (_parse_js_string(part) for part in match.groups())
+        if needle is None or replacement is None:
+            return None
+        value = _js_string_replace(value, needle, replacement)
+        position = match.end()
+    return value
+
+
+def _decode_pipeline(html: str, pair: _ArrayPair, joined: str) -> str | None:
+    window = re.split(r"</script\b", html[pair.position:pair.position + 2000], maxsplit=1, flags=re.IGNORECASE)[0]
+    window = _COMMENT_OR_STRING_RE.sub(
+        lambda match: " " * len(match[0]) if match[0].startswith(("//", "/*")) else match[0],
+        window,
+    )
+    # Stop before another obfuscation block, so its transforms cannot leak in.
+    next_array = _STRING_ARRAY_RE.search(window)
+    if next_array:
+        window = window[:next_array.start()]
+    # Keep literal contents available to parse supported replacement arguments,
+    # but use an offset-preserving mask when identifying executable targets.
+    # A property assignment such as window.url does not reassign local url.
+    code_mask = _COMMENT_OR_STRING_RE.sub(lambda match: " " * len(match[0]), window)
+
+    def is_variable_target(match: re.Match) -> bool:
+        start, end = match.span("target")
+        return (
+            code_mask[start:end] == match["target"]
+            and not code_mask[:start].rstrip().endswith(".")
+        )
+
+    assembly_pattern = re.compile(
+        rf"(?P<target>{_IDENTIFIER})\s*\+=\s*{re.escape(pair.strings_name)}\s*\[\s*"
+        rf"{re.escape(pair.indices_name)}\s*\.indexOf\s*\("
+    )
+    assembly = next((
+        match for match in assembly_pattern.finditer(window) if is_variable_target(match)
+    ), None)
+    assignments = [
+        match for match in _ASSIGNMENT_RE.finditer(window) if is_variable_target(match)
+    ]
+    if assembly:
+        target = assembly["target"]
+        assignments = [match for match in assignments if match.start() > assembly.start()]
+    else:
+        # Some compact pages omit the loop in the captured snippet. A single
+        # unambiguous self-transform still establishes the result variable.
+        targets = {
+            match["target"] for match in assignments
+            if re.match(rf"(?:decodeURIComponent\(\s*)?{re.escape(match['target'])}(?![\w$])", match["value"].strip())
+            and ("decodeURIComponent" in match["value"] or ".replace(" in match["value"])
+        }
+        if len(targets) > 1:
+            return None
+        target = next(iter(targets), None)
+    value = joined
+    transformed = False
+    for match in assignments:
+        if target is None or match["target"] != target:
+            continue
+        value = _apply_expression(match["value"], target, value)
+        if value is None:
+            return None
+        transformed = True
+    if not transformed and not value.lower().startswith(("http://", "https://")):
+        try:
+            value = unquote(value, errors="strict")
+        except UnicodeDecodeError:
+            return None
     return value
 
 
 def decode_obfuscated_urls(html: str) -> List[str]:
     """Return any media URLs that can be recovered from JS-array obfuscation."""
     out: List[str] = []
-    for strings, ints, pos in _candidate_pairs(html):
+    for pair in _candidate_pairs(html):
+        strings, ints = pair.strings, pair.indices
         n = len(ints)
         positions: dict[int, int] = {}
         for index, value in enumerate(ints):
@@ -120,19 +283,9 @@ def decode_obfuscated_urls(html: str) -> List[str]:
             joined = "".join(strings[positions[i]] for i in range(n))
         except KeyError:
             continue
-        decoded_once = unquote(joined)
-        candidates = {joined, decoded_once}
-        for candidate in list(candidates):
-            cleaned = _apply_nearby_replaces(html, pos, candidate)
-            candidates.add(cleaned)
-            candidates.add(unquote(cleaned))
-        for candidate in candidates:
-            if not candidate:
-                continue
-            if not candidate.lower().startswith(("http://", "https://")):
-                continue
-            if _MEDIA_EXT_RE.search(candidate):
-                out.append(candidate)
+        candidate = _decode_pipeline(html, pair, joined)
+        if candidate and candidate.lower().startswith(("http://", "https://")) and _MEDIA_EXT_RE.search(candidate):
+            out.append(candidate)
     seen: set[str] = set()
     unique: List[str] = []
     for url in out:

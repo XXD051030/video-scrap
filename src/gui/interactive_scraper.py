@@ -20,9 +20,11 @@ site skip the CAPTCHA as long as the session is still valid server-side.
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Callable, List, Optional, Set
+from urllib.parse import urlparse
 
-from PyQt6.QtCore import QObject, QUrl, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QObject, QUrl, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -57,8 +59,6 @@ _MEDIA_EXTENSIONS = (
     "m3u8",
     "mpd",
     "mkv",
-    "ts",
-    "m4s",
 )
 
 
@@ -115,7 +115,8 @@ def get_shared_profile(
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     # A named profile (non-empty storage name) is persistent by default.
-    profile = QWebEngineProfile("video-scraper-persistent", parent)
+    # Pages/dialogs are short-lived. The application owns their shared profile.
+    profile = QWebEngineProfile("video-scraper-persistent", QCoreApplication.instance())
     profile.setPersistentStoragePath(str(profile_dir))
     profile.setCachePath(str(profile_dir / "cache"))
     profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
@@ -129,8 +130,53 @@ def get_shared_profile(
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     )
+    profile._media_cookies = {}
+    store = profile.cookieStore()
+    store.cookieAdded.connect(lambda cookie: _remember_cookie(profile, cookie))
+    store.cookieRemoved.connect(lambda cookie: profile._media_cookies.pop(_cookie_key(cookie), None))
+    store.loadAllCookies()
     _SHARED_PROFILE = profile
     return profile
+
+
+def _cookie_key(cookie) -> tuple:
+    return (cookie.domain(), cookie.path(), bytes(cookie.name()))
+
+
+def _remember_cookie(profile, cookie) -> None:
+    domain = cookie.domain().lower()
+    if not domain:
+        return  # No origin information is available; never create a global cookie.
+    profile._media_cookies[_cookie_key(cookie)] = {
+        "name": bytes(cookie.name()).decode("latin-1"),
+        "value": bytes(cookie.value()).decode("latin-1"),
+        "domain": domain,
+        "path": cookie.path() or "/",
+        "secure": cookie.isSecure(),
+        "expires": None if cookie.isSessionCookie() else cookie.expirationDate().toSecsSinceEpoch(),
+        "host_only": not domain.startswith("."),
+    }
+
+
+def snapshot_browser_cookies(profile, urls: list[str]) -> list[dict]:
+    """Copy only cookies relevant to the document or discovered media hosts."""
+    hosts = set()
+    for url in urls:
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme.lower() in {"http", "https"} and parsed.hostname:
+                hosts.add(parsed.hostname.lower())
+        except (TypeError, ValueError, AttributeError):
+            continue
+    result = []
+    for cookie in getattr(profile, "_media_cookies", {}).values():
+        domain = cookie["domain"].lstrip(".")
+        if cookie["expires"] is not None and cookie["expires"] <= time.time():
+            continue
+        if any(host == domain or (not cookie["host_only"] and host.endswith("." + domain))
+               for host in hosts if host):
+            result.append(dict(cookie))
+    return result
 
 
 class _MediaInterceptor(QWebEngineUrlRequestInterceptor):  # type: ignore[misc]
@@ -174,6 +220,9 @@ class InteractiveScrapeDialog(QDialog):
         self.resize(1040, 760)
 
         self._initial_url = url
+        self.page_url = url
+        self.browser_cookies: list[dict] = []
+        self._disposed = False
         self._captured_media: Set[str] = set()
         self._captured_iframes: Set[str] = set()
         self._page_title: str = ""
@@ -243,6 +292,8 @@ class InteractiveScrapeDialog(QDialog):
     # ---------------------------------------------------------------- hooks
 
     def _capture_url(self, url: str) -> None:
+        if self._disposed:
+            return
         if url in self._captured_media:
             return
         self._captured_media.add(url)
@@ -251,6 +302,7 @@ class InteractiveScrapeDialog(QDialog):
 
     def _on_url_changed(self, qurl: QUrl) -> None:
         text = qurl.toString()
+        self.page_url = text
         self._status.setText(f"At {text}")
 
     def _on_title_changed(self, title: str) -> None:
@@ -258,18 +310,20 @@ class InteractiveScrapeDialog(QDialog):
             self._page_title = title
 
     def _on_load_finished(self, ok: bool) -> None:
-        if not ok:
+        if self._disposed or not ok:
             return
         self._run_extract()
 
     def _run_extract(self) -> None:
+        if self._disposed:
+            return
         try:
             self._page.runJavaScript(EXTRACT_SCRIPT, self._on_extract_result)
         except Exception as exc:  # noqa: BLE001
             self.log.emit(f"[interactive] extract failed: {exc}")
 
     def _on_extract_result(self, result) -> None:
-        if not isinstance(result, dict):
+        if self._disposed or not isinstance(result, dict):
             return
         for link in result.get("videos") or []:
             if isinstance(link, str) and link.startswith("http"):
@@ -293,10 +347,29 @@ class InteractiveScrapeDialog(QDialog):
     # ---------------------------------------------------------------- exit
 
     def _finish(self) -> None:
+        if self._disposed:
+            return
         videos = sorted(self._captured_media)
         iframes = sorted(self._captured_iframes)
+        self.browser_cookies = snapshot_browser_cookies(
+            self._profile, [self.page_url, *videos, *iframes]
+        )
         self.finished_with_results.emit(videos, iframes, self._page_title)
         self.accept()
+
+    def dispose(self) -> None:
+        if self._disposed:
+            return
+        self._disposed = True
+        self._detach_interceptor()
+        self._view.stop()
+        self._page.triggerAction(QWebEnginePage.WebAction.Stop)
+        self._view.deleteLater()
+        self._page.deleteLater()
+
+    def done(self, result: int) -> None:
+        self.dispose()
+        super().done(result)
 
     def _detach_interceptor(self, *_args) -> None:
         # Detach our interceptor so the next dialog / headless fallback
@@ -308,5 +381,5 @@ class InteractiveScrapeDialog(QDialog):
             pass
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
-        self._detach_interceptor()
+        self.dispose()
         super().closeEvent(event)

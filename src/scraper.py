@@ -32,7 +32,7 @@ from bs4 import BeautifulSoup
 from .js_decoder import decode_obfuscated_urls
 
 
-HLS_EXTS = {"m3u8", "mpd"}
+HLS_EXTS = {"m3u8"}
 
 _X_POST_HOSTS = {
     "x.com",
@@ -102,14 +102,15 @@ def _x_full_post_url(url: str) -> str:
 
 
 def _is_hls(url: str, ext: Optional[str] = None) -> bool:
-    if ext and ext.lower() in HLS_EXTS:
-        return True
-    lower = url.lower()
-    return ".m3u8" in lower or ".mpd" in lower
+    return (ext or _ext_of(url) or "").lower() in HLS_EXTS
+
+
+def _is_dash(url: str, ext: Optional[str] = None) -> bool:
+    return (ext or _ext_of(url) or "").lower() == "mpd"
 
 
 def _ext_of(url: str) -> Optional[str]:
-    tail = url.rsplit("/", 1)[-1].split("?", 1)[0]
+    tail = urlparse(url).path.rsplit("/", 1)[-1]
     if "." in tail:
         ext = tail.rsplit(".", 1)[-1].lower()
         if 1 <= len(ext) <= 5 and ext.isalnum():
@@ -120,9 +121,9 @@ def _ext_of(url: str) -> Optional[str]:
 def _is_known_player_placeholder(url: str) -> bool:
     """Ignore demo assets bundled by web players, not the page's real media."""
     parsed = urlparse(url)
-    host = parsed.netloc.lower()
+    host = (parsed.hostname or "").lower()
     path = parsed.path.lower()
-    return host.endswith("artplayer.org") and path.startswith("/assets/sample/")
+    return (host == "artplayer.org" or host.endswith(".artplayer.org")) and path.startswith("/assets/sample/")
 
 
 HTTP_HEADERS = {
@@ -133,7 +134,7 @@ HTTP_HEADERS = {
 }
 
 DIRECT_VIDEO_PATTERNS = re.compile(
-    r"https?://[^\s\"'<>]+?\.(?:mp4|webm|mov|m4v|m3u8|mpd|mkv)"
+    r"(?<![\w:])https?://[^\s\"'<>]+?\.(?:mp4|webm|mov|m4v|m3u8|mpd|mkv)"
     r"(?:\?[^\s\"'<>]*)?",
     re.IGNORECASE,
 )
@@ -182,9 +183,12 @@ EMBED_PATH_KEYWORDS = (
 
 def _is_embed_iframe(url: str) -> bool:
     """True if this iframe URL looks like a video player embed."""
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    if any(h in host for h in EMBED_HOSTS):
+    valid = _resolve_player_media_url(url, url)
+    if not valid:
+        return False
+    parsed = urlparse(valid)
+    host = (parsed.hostname or "").lower()
+    if any(host == h or host.endswith(f".{h}") for h in EMBED_HOSTS):
         return True
     path = parsed.path.lower()
     return any(k in path for k in EMBED_PATH_KEYWORDS)
@@ -289,10 +293,13 @@ def _extract_next_data_ev_hls(html: str) -> Optional[Tuple[str, Optional[str]]]:
     decoded = _decrypt_next_ev(ev)
     if not decoded:
         return None
-    video_url = decoded.get("videoUrl") or decoded.get("url")
-    if not isinstance(video_url, str) or not video_url.lower().startswith(
-        ("http://", "https://")
-    ):
+    # Preserve this extractor's absolute-URL contract while applying the same
+    # origin/port/scheme checks as the HTML and streamed-player paths. Invalid
+    # Next data must not suppress a later valid TanStack player config.
+    video_url = _resolve_player_media_url(
+        decoded.get("videoUrl") or decoded.get("url"), ""
+    )
+    if not video_url:
         return None
     video = page_props.get("video") or {}
     title = video.get("nameZh") or video.get("name")
@@ -414,6 +421,10 @@ class VideoItem:
     x_auth_browser: Optional[str] = None
     x_cookiejar: Optional[CookieJar] = field(default=None, repr=False)
     hls_png_wrapped: bool = False
+    is_dash: bool = False
+    # Structured cookies keep their original origin/path/expiry restrictions.
+    # Never turn this into a global Cookie header shared across media hosts.
+    browser_cookies: List[Dict] = field(default_factory=list, repr=False)
 
     @property
     def resolution(self) -> str:
@@ -423,6 +434,21 @@ class VideoItem:
 
 
 ProgressCallback = Callable[[str], None]
+
+
+@dataclass
+class _HtmlScanResult:
+    items: List[VideoItem]
+    iframes: List[str]
+    html: str
+    title: str
+    poster: Optional[str]
+    document_url: str
+    base_url: str
+
+    def __iter__(self):
+        # Retain the five-value private scan API used by integrations/tests.
+        return iter((self.items, self.iframes, self.html, self.title, self.poster))
 
 
 class VideoScraper:
@@ -456,10 +482,14 @@ class VideoScraper:
             seen_urls.add(item.url)
 
         log("Scanning page HTML for direct video links...")
+        document_url = base_url = url
         try:
+            scan = self._scrape_html(url, log)
             html_items, embed_iframes, html_text, page_title, poster = (
-                self._scrape_html(url, log)
+                scan
             )
+            document_url = getattr(scan, "document_url", url)
+            base_url = getattr(scan, "base_url", document_url)
         except Exception as exc:  # noqa: BLE001
             log(f"HTML scan failed: {exc}")
             html_items, embed_iframes, html_text, page_title, poster = (
@@ -511,7 +541,7 @@ class VideoScraper:
                         source_url=url,
                         thumbnail=poster,
                         is_direct=False,
-                        referer=url,
+                        referer=document_url,
                     )
                 )
 
@@ -529,7 +559,8 @@ class VideoScraper:
                 log(f"JS decoder failed: {exc}")
                 hidden_urls = []
             for idx, link in enumerate(hidden_urls, 1):
-                if _is_known_player_placeholder(link) or link in seen_urls:
+                link = _resolve_player_media_url(link, base_url)
+                if not link or _is_known_player_placeholder(link) or link in seen_urls:
                     continue
                 seen_urls.add(link)
                 ext = _ext_of(link)
@@ -542,7 +573,8 @@ class VideoScraper:
                         ext=ext,
                         is_direct=True,
                         is_hls=_is_hls(link, ext),
-                        referer=url,
+                        is_dash=_is_dash(link, ext),
+                        referer=document_url,
                     )
                 )
             if hidden_urls:
@@ -551,7 +583,7 @@ class VideoScraper:
         if html_text:
             log("Trying inline player-config HLS extractor...")
             try:
-                config_hls = _extract_config_hls(html_text, url)
+                config_hls = _extract_config_hls(html_text, base_url)
             except Exception as exc:  # noqa: BLE001
                 log(f"Config HLS extractor failed: {exc}")
                 config_hls = []
@@ -561,7 +593,7 @@ class VideoScraper:
                     continue
                 seen_urls.add(link)
                 new_hls.append(
-                    self._item_from_hls(link, url, page_title, poster)
+                    self._item_from_hls(link, url, page_title, poster, document_url)
                 )
             if new_hls:
                 # Real full-length streams go first so the UI selects one by
@@ -571,13 +603,17 @@ class VideoScraper:
                     f"Player-config extractor recovered {len(new_hls)} "
                     f"HLS stream(s)"
                 )
+            if config_hls and any(item.url in config_hls for item in results):
+                # Only this recognized player config establishes that a
+                # preview-named asset is a teaser, rather than real media.
+                results = [item for item in results if not _is_preview_teaser(item.url)]
 
         if html_text:
             streamed_player = False
             try:
                 ev_hls = _extract_next_data_ev_hls(html_text)
                 if not ev_hls:
-                    streamed_url = _extract_tanstack_ev_hls(html_text, url)
+                    streamed_url = _extract_tanstack_ev_hls(html_text, base_url)
                     ev_hls = (streamed_url, None) if streamed_url else None
                     streamed_player = bool(streamed_url)
             except Exception as exc:  # noqa: BLE001
@@ -594,19 +630,21 @@ class VideoScraper:
                     results = [item for item in results if item.url != ev_url]
                     existing.title = ev_title or page_title
                     existing.source_url = url
-                    existing.referer = url
+                    existing.referer = document_url
                     existing.ext = "m3u8"
                     existing.is_direct = True
                     existing.is_hls = True
+                    existing.is_dash = False
                     if not existing.thumbnail:
                         existing.thumbnail = poster
                     main_video = existing
                 else:
                     main_video = self._item_from_hls(
-                        ev_url, url, ev_title or page_title, poster
+                        ev_url, url, ev_title or page_title, poster, document_url
                     )
                 main_video.hls_png_wrapped = streamed_player
                 results.insert(0, main_video)
+                results = [item for item in results if item is main_video or not _is_preview_teaser(item.url)]
                 log("Encrypted player-config extractor recovered the HLS stream")
 
         log(f"Found {len(results)} video(s).")
@@ -722,6 +760,7 @@ class VideoScraper:
         source_url: str,
         title: str,
         poster: Optional[str],
+        referer: Optional[str] = None,
     ) -> VideoItem:
         return VideoItem(
             title=title,
@@ -731,7 +770,7 @@ class VideoScraper:
             ext="m3u8",
             is_direct=True,
             is_hls=True,
-            referer=source_url,
+            referer=referer or source_url,
         )
 
     def _scrape_with_ytdlp(
@@ -807,12 +846,19 @@ class VideoScraper:
         self,
         url: str,
         log: ProgressCallback,
-    ) -> tuple[List[VideoItem], List[str], str, str, Optional[str]]:
+    ) -> _HtmlScanResult:
         resp = requests.get(url, headers=HTTP_HEADERS, timeout=self.timeout)
         resp.raise_for_status()
         html = resp.text
+        # requests follows redirects. Relative resources belong to the final
+        # document; <base> affects URL resolution, never the HTTP Referer.
+        document_url = resp.url if isinstance(resp.url, str) else url
 
         soup = BeautifulSoup(html, "lxml")
+        base = soup.find("base", href=True)
+        base_url = (
+            _resolve_player_media_url(base.get("href"), document_url) if base else None
+        ) or document_url
         candidates: List[str] = []
         embed_iframes: List[str] = []
         poster: Optional[str] = None
@@ -824,26 +870,28 @@ class VideoScraper:
             if not poster:
                 p = video.get("poster") or video.get("data-poster")
                 if p:
-                    poster = urljoin(url, p)
+                    poster = _resolve_player_media_url(p, base_url)
             for attr in media_attrs:
                 value = video.get(attr)
                 if value:
-                    candidates.append(urljoin(url, value))
+                    candidates.append(value)
             for source in video.find_all("source"):
                 for attr in media_attrs:
                     value = source.get(attr)
                     if value:
-                        candidates.append(urljoin(url, value))
+                        candidates.append(value)
 
-        page_host = urlparse(url).netloc.lower()
+        page_host = (urlparse(document_url).hostname or "").lower()
         skipped_hosts: set[str] = set()
         for iframe in soup.find_all("iframe"):
             src = iframe.get("src") or iframe.get("data-src")
             if not src:
                 continue
-            full = urljoin(url, src)
+            full = _resolve_player_media_url(src, base_url)
+            if not full:
+                continue
             parsed = urlparse(full)
-            host = parsed.netloc.lower()
+            host = (parsed.hostname or "").lower()
             if not host:
                 continue
             # Same-domain iframes are usually just self-referential players
@@ -881,20 +929,17 @@ class VideoScraper:
             content = (meta.get("content") or "").strip()
             if not content:
                 continue
-            if prop in video_meta_props and content.startswith(
-                ("http://", "https://", "//")
-            ):
+            if prop in video_meta_props:
                 # Only count og:video if it actually points to a media file;
                 # many sites use og:video as an embed page URL, which would
                 # produce duplicate / un-downloadable list entries.
                 if media_ext_re.search(content):
-                    candidates.append(urljoin(url, content))
+                    candidates.append(content)
             elif (
                 not poster
                 and prop in image_meta_props
-                and content.startswith(("http://", "https://", "//"))
             ):
-                poster = urljoin(url, content)
+                poster = _resolve_player_media_url(content, base_url)
 
         for match in DIRECT_VIDEO_PATTERNS.finditer(html):
             candidates.append(match.group(0))
@@ -904,8 +949,8 @@ class VideoScraper:
         for cand in candidates:
             if not cand:
                 continue
-            cand = html_module.unescape(cand).strip()
-            if _is_known_player_placeholder(cand) or _is_preview_teaser(cand):
+            cand = _resolve_player_media_url(html_module.unescape(cand), base_url)
+            if not cand or _is_known_player_placeholder(cand):
                 continue
             if cand and cand not in seen:
                 seen.add(cand)
@@ -938,10 +983,13 @@ class VideoScraper:
                     ext=ext,
                     is_direct=True,
                     is_hls=_is_hls(link, ext),
-                    referer=url,
+                    is_dash=_is_dash(link, ext),
+                    referer=document_url,
                 )
             )
-        return items, unique_iframes, html, page_title, poster
+        return _HtmlScanResult(
+            items, unique_iframes, html, page_title, poster, document_url, base_url
+        )
 
 
 def build_items_from_urls(
@@ -955,7 +1003,12 @@ def build_items_from_urls(
     seen: set[str] = set()
 
     def push(link: str, label_idx: int, kind: str, is_direct: bool) -> None:
+        link = _resolve_player_media_url(link, source_url)
         if not link or link in seen:
+            return
+        if is_direct and _ext_of(link) in {"ts", "m4s"}:
+            # A network request for one streaming fragment is not evidence
+            # of a complete movie; retain manifests/full media candidates.
             return
         seen.add(link)
         ext = _ext_of(link) if is_direct else None
@@ -967,6 +1020,7 @@ def build_items_from_urls(
                 ext=ext,
                 is_direct=is_direct,
                 is_hls=_is_hls(link, ext) if is_direct else False,
+                is_dash=_is_dash(link, ext) if is_direct else False,
                 referer=source_url,
             )
         )

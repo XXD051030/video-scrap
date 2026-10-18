@@ -49,7 +49,7 @@ from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 
-from .net import build_session
+from .browser_cookies import browser_cookiejar, build_scoped_session
 from .hls_payload import MAX_HLS_PAYLOAD_BYTES, decode_hls_payload
 
 
@@ -222,22 +222,19 @@ def _derive_ext(url: str) -> str:
 
 def _parse_range_header(value: Optional[str]) -> Optional[Tuple[Optional[int], Optional[int]]]:
     """Parse a single ``bytes=`` range header into (start, end_inclusive)."""
-    if not value:
+    if value is None:
         return None
-    value = value.strip()
-    if not value.lower().startswith("bytes="):
-        return None
-    spec = value[len("bytes="):].split(",")[0].strip()
-    if "-" not in spec:
-        return None
-    a, _, b = spec.partition("-")
-    try:
-        start = int(a) if a else None
-        end = int(b) if b else None
-    except ValueError:
-        return None
-    if start is None and end is None:
-        return None
+    match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", value.strip(), re.IGNORECASE)
+    if match is None:
+        raise ValueError("Only a valid single byte range is supported")
+    a, b = match.groups()
+    start = int(a) if a else None
+    end = int(b) if b else None
+    if (
+        (start is None and (end is None or end == 0))
+        or (start is not None and end is not None and end < start)
+    ):
+        raise ValueError("Unsatisfiable byte range")
     return start, end
 
 
@@ -833,7 +830,7 @@ class MediaProxyServer:
         self._cache_dir: Path = Path(
             tempfile.mkdtemp(prefix="video_scraper_cache_")
         )
-        self._session = build_session(pool=32)
+        self._session = build_scoped_session(pool=32)
         self._settings_store = settings_store
         self._on_status = on_status
         self._buffer_seconds: int = DEFAULT_BUFFER_SECONDS
@@ -969,9 +966,13 @@ class MediaProxyServer:
         cookiejar: Optional[CookieJar] = None,
         hls_variant_url: Optional[str] = None,
         hls_png_wrapped: bool = False,
+        browser_cookies: Optional[List[dict]] = None,
+        is_dash: bool = False,
     ) -> str:
         if not upstream:
             raise ValueError("upstream URL required")
+        if is_dash or _derive_ext(upstream) == "mpd":
+            raise ValueError("DASH/MPD preview is not supported; download the video to play it locally.")
         from .downloader import build_request_headers
 
         token = secrets.token_urlsafe(12)
@@ -995,7 +996,10 @@ class MediaProxyServer:
             referer=referer,
             parent=parent,
             extra_headers=safe_extra_headers,
-            cookiejar=cookiejar,
+            cookiejar=(
+                browser_cookiejar(browser_cookies, base=cookiejar)
+                if browser_cookies else cookiejar
+            ),
         )
         entry.force_manifest = is_hls
         entry.hls_variant_url = hls_variant_url
@@ -1023,16 +1027,12 @@ class MediaProxyServer:
                 self._prefetchers[token] = prefetcher
             prefetcher.start()
 
-        ext = _derive_ext(upstream)
-        if ext == "bin":
+        ext = "m3u8" if is_hls else _derive_ext(upstream)
+        if ext == "bin" and parent is not None:
             # FFmpeg's HLS demuxer rejects segment/manifest URLs whose
             # extension isn't on its allow-list, so a .jpg-disguised stream
             # would download but never play. Give it a media extension.
-            if is_hls:
-                ext = "m3u8"
-            elif parent is not None:
-                # Unknown-extension child of a manifest -> treat as a segment.
-                ext = "ts"
+            ext = "ts"
         entry.proxy_ext = ext
         return f"{self.base_url}/play/{token}.{ext}"
 
@@ -1155,7 +1155,7 @@ class MediaProxyServer:
         if entry.force_manifest:
             return True
         path = urlparse(entry.upstream).path.lower()
-        return path.endswith(".m3u8") or path.endswith(".mpd")
+        return path.endswith(".m3u8")
 
     # ----- manifest --------------------------------------------------------
 
@@ -1407,7 +1407,12 @@ class MediaProxyServer:
     def _serve_range(
         self, request: BaseHTTPRequestHandler, entry: _Entry
     ) -> None:
-        rng = _parse_range_header(request.headers.get("Range"))
+        range_header = request.headers.get("Range")
+        try:
+            rng = _parse_range_header(range_header)
+        except ValueError:
+            self._send_range_error(request, entry.total_size)
+            return
 
         # Make sure we know the total size. If we don't, ask upstream
         # cheaply via a 0-0 range request.
@@ -1426,7 +1431,7 @@ class MediaProxyServer:
             if r_start is None and r_end is not None:
                 # Suffix range - we need total to satisfy this.
                 if total is None:
-                    self._proxy_passthrough(request, entry)
+                    self._proxy_passthrough(request, entry, range_header=range_header)
                     return
                 start = max(0, total - r_end)
                 end = total - 1
@@ -1440,9 +1445,7 @@ class MediaProxyServer:
 
         if total is not None:
             if start >= total:
-                request.send_response(416)
-                request.send_header("Content-Range", f"bytes */{total}")
-                request.end_headers()
+                self._send_range_error(request, total)
                 return
             if end is None or end >= total:
                 end = total - 1
@@ -1697,6 +1700,7 @@ class MediaProxyServer:
     ) -> None:
         """Last-resort streaming when caching can't help (unknown size)."""
         headers = dict(entry.headers)
+        headers["Accept-Encoding"] = "identity"
         if range_header:
             headers["Range"] = range_header
         try:
@@ -1724,7 +1728,10 @@ class MediaProxyServer:
                     continue
                 request.send_header(key, value)
             request.end_headers()
-            for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+            # Preserve upstream representation bytes, even if the server
+            # ignores identity and sends gzip. iter_content would decompress
+            # while leaving Content-Encoding/Length/Range describing gzip.
+            for chunk in resp.raw.stream(CHUNK_SIZE, decode_content=False):
                 if not chunk:
                     continue
                 try:
@@ -1738,6 +1745,15 @@ class MediaProxyServer:
                 pass
 
     # ----- helpers ---------------------------------------------------------
+
+    @staticmethod
+    def _send_range_error(request: BaseHTTPRequestHandler, total: Optional[int]) -> None:
+        request.send_response(416)
+        if total is not None:
+            request.send_header("Content-Range", f"bytes */{total}")
+        request.send_header("Content-Length", "0")
+        request.send_header("Accept-Ranges", "bytes")
+        request.end_headers()
 
     def _guess_content_type(self, entry: _Entry) -> str:
         path = urlparse(entry.upstream).path.lower()
@@ -1804,8 +1820,8 @@ class MediaProxyServer:
                         pending_duration = duration if math.isfinite(duration) else None
                     except ValueError:
                         pending_duration = None
-                manifest_uri = manifest_entry.hls_png_wrapped and stripped.startswith(
-                    ("#EXT-X-MEDIA:", "#EXT-X-I-FRAME-STREAM-INF:")
+                manifest_uri = stripped.upper().startswith(
+                    ("#EXT-X-MEDIA:", "#EXT-X-I-FRAME-STREAM-INF:", "#EXT-X-RENDITION-REPORT:")
                 )
                 rewritten = _M3U8_URI_ATTR_RE.sub(
                     lambda mm: f'URI="{self._wrap_relative(mm.group(1), manifest_url, manifest_entry, is_manifest=manifest_uri)[0]}"',
@@ -1815,7 +1831,7 @@ class MediaProxyServer:
             else:
                 wrapped, child_entry = self._wrap_relative(
                     stripped, manifest_url, manifest_entry,
-                    is_manifest=manifest_entry.hls_png_wrapped and pending_variant,
+                    is_manifest=pending_variant,
                 )
                 out_lines.append(wrapped)
                 if child_entry is not None and pending_duration is not None:

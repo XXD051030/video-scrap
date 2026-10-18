@@ -112,6 +112,12 @@ class SettingsDialog(QDialog):
         note.addWidget(cache_note, stretch=1)
         root.addLayout(note)
 
+        self.save_error_label = QLabel()
+        self.save_error_label.setWordWrap(True)
+        self.save_error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.save_error_label.hide()
+        root.addWidget(self.save_error_label)
+
         root.addStretch(1)
 
         separator = QFrame()
@@ -167,5 +173,13 @@ class SettingsDialog(QDialog):
     def _on_accept(self) -> None:
         settings = self._store.get()
         settings.playback_buffer_seconds = self.buffer_spin.value()
-        self._store.update(settings)
+        if not self._store.update(settings):
+            self.save_error_label.setText(
+                "These preferences apply for this session, but could not be saved. "
+                "Fix the storage problem and click Save to retry.\n"
+                + self._store.last_save_error
+            )
+            self.save_error_label.show()
+            self.adjustSize()
+            return
         self.accept()

@@ -7,7 +7,7 @@ The interface uses PyQt6, with extraction handled by yt-dlp, HTML parsing, and Q
 
 ## Current Status
 
-Current version: **0.3.2**, targeting macOS Apple Silicon and Windows x64. Windows runtime testing for this version is pending.
+Current version: **0.3.3**, targeting macOS Apple Silicon and Windows x64. Windows runtime testing for this version is pending.
 
 See [GitHub Releases](https://github.com/XXD051030/video-scrap/releases) for published packages and release notes.
 
@@ -249,4 +249,4 @@ Third-party license texts are bundled in the `third-party/` resource directory.
 - Some yt-dlp sources provide streams that cannot be previewed directly in Qt, although downloading may still work.
 - A long pause may outlive the source's network session or signed link. Resume can then fail and require a new download; progress is not restored after closing the app.
 - The current HLS implementation does not support some combinations of initialization segments and byte ranges, or special encrypted range formats. It reports an error rather than continuing when it cannot handle them safely.
-- Earlier Windows builds were tested for startup, playback, and downloads; automated Windows regression and smoke-test reports have not been collected for 0.3.2.
+- Earlier Windows builds were tested for startup, playback, and downloads; automated Windows regression and smoke-test reports have not been collected for 0.3.3.

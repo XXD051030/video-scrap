@@ -186,7 +186,9 @@ def test_input_and_download_controls_keep_independent_callbacks():
         window.url_input.setText("https://example.invalid/watch")
         assert window.x_auth_combo.isHidden()
         assert window.x_auth_combo.currentData() == "firefox"
-        folder = str(Path(tempfile.gettempdir()) / ("long-folder-name-" * 20))
+        # Exercise a long display path with valid per-component lengths. The
+        # folder picker now validates/creates the chosen directory as well.
+        folder = str(window.output_dir.joinpath(*(["long-folder-name-" * 5] * 4)))
         with mock.patch.object(main_window.QFileDialog, "getExistingDirectory", return_value=folder):
             window.choose_dir_button.click()
         assert window.output_dir == Path(folder)
@@ -201,7 +203,7 @@ def test_minimum_window_fits_long_metadata_paths_and_x_login_controls():
         # Exercise the decoded PNG path: a large bitmap must not impose its
         # previous scaled dimensions as the widget's new minimum size.
         window.preview_panel._apply_thumbnail(0, _thumbnail_png())
-        folder = str(Path(tempfile.gettempdir()) / ("long-folder-name-" * 20))
+        folder = str(window.output_dir.joinpath(*(["long-folder-name-" * 5] * 4)))
         with mock.patch.object(main_window.QFileDialog, "getExistingDirectory", return_value=folder):
             window.choose_dir_button.click()
         for theme in ("dark", "light"):

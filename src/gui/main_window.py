@@ -149,6 +149,8 @@ class MainWindow(QMainWindow):
         self.interactive_dialog: Optional["InteractiveScrapeDialog"] = None
         self._current_url: str = ""
         self._current_x_auth_browser: Optional[str] = None
+        self._scrape_generation = 0
+        self._scrape_active = False
         self._logs_expanded: bool = False
         self._logs_window_growth: int = 0
         self._video_list_collapsed: bool = False
@@ -159,7 +161,11 @@ class MainWindow(QMainWindow):
         self._close_retry_pending: bool = False
         self._ui_icon_bindings: list[tuple[object, str, bool]] = []
         self.output_dir: Path = DEFAULT_DOWNLOAD_DIR
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        startup_messages = []
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            startup_messages.append(f"Download folder unavailable: {self.output_dir}: {exc}. Choose another folder before downloading.")
 
         self.settings_store = SettingsStore()
         self._theme_name = self.settings_store.get().theme
@@ -173,6 +179,10 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._apply_theme(self._theme_name, persist=False)
+        for message in startup_messages + self.settings_store.diagnostics:
+            self.log(message)
+        if startup_messages or self.settings_store.diagnostics:
+            self.statusBar().showMessage("Startup settings/folder warning — see Logs.")
 
     # ------------------------------------------------------------------ UI
 
@@ -517,6 +527,14 @@ class MainWindow(QMainWindow):
                  "pause": pause, "cancel": cancel, "bar": bar}
             )
             self._refresh_download_controls(_slot)
+        self.queued_downloads_button = QToolButton()
+        self.queued_downloads_button.setObjectName("Ghost")
+        self.queued_downloads_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.queued_downloads_menu = QMenu(self.queued_downloads_button)
+        self.queued_downloads_button.setMenu(self.queued_downloads_menu)
+        self.queued_downloads_button.setToolTip("Review and remove downloads that have not started")
+        self.queued_downloads_button.hide()
+        layout.addWidget(self.queued_downloads_button, alignment=Qt.AlignmentFlag.AlignLeft)
         return wrap
 
     def _build_logs_section(self) -> QWidget:
@@ -753,7 +771,25 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- scraping
 
+    def _begin_scrape(self, url: str, x_auth_browser: Optional[str] = None) -> int:
+        self._scrape_generation += 1
+        self._scrape_active = True
+        self._current_url = url
+        self._current_x_auth_browser = x_auth_browser
+        self.scrape_button.setEnabled(False)
+        self.scrape_button.setText("Scraping…")
+        return self._scrape_generation
+
+    def _guard_scrape(self, generation: int, callback):
+        def deliver(*args):
+            if (not self._closing and self._scrape_active
+                    and generation == self._scrape_generation):
+                callback(*args)
+        return deliver
+
     def start_scrape(self) -> None:
+        if self._closing or self._scrape_active:
+            return
         url = self.url_input.text().strip()
         if not is_valid_url(url):
             QMessageBox.warning(
@@ -774,25 +810,45 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Scraping...")
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFormat("Scraping...")
-        self._current_url = url
-
         x_auth_browser = (
             self.x_auth_combo.currentData() if is_x_post_url(url) else None
         )
-        self._current_x_auth_browser = x_auth_browser
-        self.scrape_worker = ScrapeWorker(
-            url, self, x_auth_browser=x_auth_browser
-        )
-        self.scrape_worker.log.connect(self.log)
-        self.scrape_worker.finished_with_results.connect(self._on_scrape_done)
-        self.scrape_worker.failed.connect(self._on_scrape_failed)
-        self.scrape_worker.start()
+        generation = self._begin_scrape(url, x_auth_browser)
+        try:
+            self.scrape_worker = ScrapeWorker(url, self, x_auth_browser=x_auth_browser)
+        except Exception as exc:  # noqa: BLE001
+            self._on_scrape_failed(str(exc), url, x_auth_browser)
+            return
+        worker = self.scrape_worker
+        worker.log.connect(self._guard_scrape(generation, self.log))
+        worker.finished_with_results.connect(self._guard_scrape(
+            generation, lambda videos: self._on_scrape_done(videos, url, x_auth_browser)
+        ))
+        worker.failed.connect(self._guard_scrape(
+            generation, lambda message: self._on_scrape_failed(message, url, x_auth_browser)
+        ))
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda: self._release_scrape_worker(worker))
+        try:
+            worker.start()
+        except Exception as exc:  # noqa: BLE001
+            if not worker.isRunning():
+                self._release_scrape_worker(worker)
+                worker.deleteLater()
+            self._on_scrape_failed(str(exc), url, x_auth_browser)
+
+    def _release_scrape_worker(self, worker) -> None:
+        if self.scrape_worker is worker:
+            self.scrape_worker = None
 
     def _reset_scrape_button(self) -> None:
+        self._scrape_active = False
         self.scrape_button.setEnabled(True)
         self.scrape_button.setText("Scrape")
 
-    def _on_scrape_done(self, videos: List[VideoItem]) -> None:
+    def _on_scrape_done(self, videos: List[VideoItem], source_url: Optional[str] = None,
+                        x_auth_browser: Optional[str] = None) -> None:
+        source_url = source_url or self._current_url
         self.video_list.set_videos(videos)
         self._update_video_count_badge(len(videos))
         self.progress_bar.setRange(0, 100)
@@ -803,14 +859,14 @@ class MainWindow(QMainWindow):
             self._reset_scrape_button()
             return
 
-        if is_x_post_url(self._current_url):
+        if is_x_post_url(source_url):
             self._reset_scrape_button()
             self.progress_bar.setFormat("No X videos found")
             self.statusBar().showMessage("No X videos found")
             suggestion = (
                 " If it plays in a browser where you are signed in, choose "
                 "that browser in X session and scrape again."
-                if self._current_x_auth_browser is None
+                if x_auth_browser is None
                 else " Check that the selected browser is signed in to X."
             )
             QMessageBox.information(
@@ -820,12 +876,12 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if WEBENGINE_AVAILABLE and self._current_url:
+        if WEBENGINE_AVAILABLE and source_url:
             self.log("Static analysis found nothing - escalating to WebEngine render...")
             self.progress_bar.setRange(0, 0)
             self.progress_bar.setFormat("Rendering page in headless browser...")
             self.statusBar().showMessage("Rendering JS...")
-            self._start_js_render(self._current_url)
+            self._start_js_render(source_url)
             return
 
         self._reset_scrape_button()
@@ -849,20 +905,49 @@ class MainWindow(QMainWindow):
             self.log(f"WebEngine init failed: {exc}")
             self._on_js_render_failed(str(exc))
             return
-        self.js_scraper.log.connect(self.log)
-        self.js_scraper.finished.connect(self._on_js_render_done)
-        self.js_scraper.failed.connect(self._on_js_render_failed)
-        self.js_scraper.scrape(url)
+        scraper = self.js_scraper
+        generation = self._scrape_generation
+        scraper.log.connect(self._guard_scrape(generation, self.log))
+        scraper.finished.connect(self._guard_scrape(
+            generation, lambda videos, iframes, title: self._on_js_render_done(
+                videos, iframes, title, source_url=url,
+                referer_url=getattr(scraper, "page_url", url),
+                browser_cookies=getattr(scraper, "browser_cookies", []),
+            )
+        ))
+        scraper.failed.connect(self._guard_scrape(generation, self._on_js_render_failed))
+        scraper.finished.connect(lambda *_args: self._release_js_scraper(scraper))
+        scraper.failed.connect(lambda *_args: self._release_js_scraper(scraper))
+        try:
+            scraper.scrape(url)
+        except Exception as exc:  # noqa: BLE001
+            self._release_js_scraper(scraper)
+            if generation == self._scrape_generation and self._scrape_active:
+                self._on_js_render_failed(str(exc))
+
+    def _release_js_scraper(self, scraper) -> None:
+        scraper.dispose()
+        scraper.deleteLater()
+        if self.js_scraper is scraper:
+            self.js_scraper = None
 
     def _on_js_render_done(
         self,
         videos: list,
         iframes: list,
         page_title: str,
+        *,
+        source_url: Optional[str] = None,
+        referer_url: Optional[str] = None,
+        browser_cookies: Optional[list] = None,
     ) -> None:
         items = build_items_from_urls(
-            list(videos), list(iframes), self._current_url, page_title
+            list(videos), list(iframes), source_url or self._current_url, page_title
         )
+        for item in items:
+            if referer_url:
+                item.referer = referer_url
+            item.browser_cookies = [dict(cookie) for cookie in (browser_cookies or [])]
         self.video_list.set_videos(items)
         self._update_video_count_badge(len(items))
         self._reset_scrape_button()
@@ -924,6 +1009,11 @@ class MainWindow(QMainWindow):
         return True
 
     def _start_interactive_from_toolbar(self) -> None:
+        if self._closing or self._scrape_active:
+            if self.interactive_dialog is not None:
+                self.interactive_dialog.raise_()
+                self.interactive_dialog.activateWindow()
+            return
         url = self.url_input.text().strip()
         if not is_valid_url(url):
             QMessageBox.warning(
@@ -932,7 +1022,6 @@ class MainWindow(QMainWindow):
                 "Please enter a valid http(s) URL first.",
             )
             return
-        self._current_url = url
         self._open_interactive_scraper(url)
 
     def _open_interactive_scraper(self, url: str) -> None:
@@ -957,30 +1046,43 @@ class MainWindow(QMainWindow):
             )
             return
         self.interactive_dialog = dialog
-        dialog.log.connect(self.log)
-        dialog.finished_with_results.connect(self._on_js_render_done)
-        dialog.failed.connect(self._on_js_render_failed)
-        dialog.finished.connect(self._on_interactive_closed)
+        generation = self._begin_scrape(url)
+        dialog.log.connect(self._guard_scrape(generation, self.log))
+        dialog.finished_with_results.connect(self._guard_scrape(
+            generation, lambda videos, iframes, title: self._on_js_render_done(
+                videos, iframes, title, source_url=url,
+                referer_url=dialog.page_url, browser_cookies=dialog.browser_cookies,
+            )
+        ))
+        dialog.failed.connect(self._guard_scrape(generation, self._on_js_render_failed))
+        dialog.finished.connect(lambda result: self._on_interactive_closed(result, dialog, generation))
         self.statusBar().showMessage("Solve verification in the browser window…")
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setFormat("Waiting for interactive browser…")
         dialog.show()
 
-    def _on_interactive_closed(self, _result: int) -> None:
+    def _on_interactive_closed(self, _result: int, dialog=None, generation=None) -> None:
+        if dialog is not None:
+            dialog.deleteLater()
+        if dialog is not None and self.interactive_dialog is not dialog:
+            return
         self.interactive_dialog = None
+        if generation is not None and generation != self._scrape_generation:
+            return
         if self.progress_bar.maximum() == 0:
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(0)
             self.progress_bar.setFormat("Idle")
         self._reset_scrape_button()
 
-    def _on_scrape_failed(self, message: str) -> None:
+    def _on_scrape_failed(self, message: str, source_url: Optional[str] = None,
+                          x_auth_browser: Optional[str] = None) -> None:
         self._reset_scrape_button()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Scrape failed")
         self.statusBar().showMessage("Scrape failed")
-        if is_x_post_url(self._current_url):
+        if is_x_post_url(source_url or self._current_url):
             self.log(f"X extraction failed: {message}")
             QMessageBox.warning(
                 self,
@@ -988,7 +1090,7 @@ class MainWindow(QMainWindow):
                 message + (
                     "\n\nIf this post plays in a browser where you are signed "
                     "in, select that browser in X session and try again."
-                    if self._current_x_auth_browser is None
+                    if x_auth_browser is None
                     else ""
                 ),
             )
@@ -1011,6 +1113,8 @@ class MainWindow(QMainWindow):
             self, "Choose download folder", str(self.output_dir)
         )
         if directory:
+            if not self._ensure_output_dir(Path(directory)):
+                return
             self.output_dir = Path(directory)
             self.path_label.setText(str(self.output_dir))
             self.path_label.setToolTip(str(self.output_dir))
@@ -1025,7 +1129,8 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if not self._ensure_output_dir():
+            return
         quality = self.quality_combo.currentText()
         task_id = self._next_download_id
         self._next_download_id += 1
@@ -1040,6 +1145,19 @@ class MainWindow(QMainWindow):
         self._download_queue.append(task_id)
         self.log(f"[D{task_id}] Queued: {item.title}")
         self._pump_download_queue()
+
+    def _ensure_output_dir(self, directory: Optional[Path] = None) -> bool:
+        directory = directory if directory is not None else self.output_dir
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.log(f"Download folder unavailable: {directory}: {exc}")
+            QMessageBox.warning(self, "Download folder unavailable", (
+                f"Cannot use this download folder:\n{directory}\n\n{exc}\n\n"
+                "Click Choose… to select another folder and try again."
+            ))
+            return False
+        return True
 
     def stop_all_downloads(self) -> None:
         active = len(self.download_workers)
@@ -1138,6 +1256,7 @@ class MainWindow(QMainWindow):
         active = len(self.download_workers)
         queued = len(self._download_queue)
         has_downloads = active > 0 or queued > 0
+        self._refresh_queued_downloads()
         if self.stop_downloads_action is not None:
             self.stop_downloads_action.setEnabled(has_downloads)
         self._recalculate_download_lanes()
@@ -1148,6 +1267,28 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Ready")
         self._update_download_summary()
+
+    def _refresh_queued_downloads(self) -> None:
+        self.queued_downloads_menu.clear()
+        self.queued_downloads_button.setText(f"Queued downloads ({len(self._download_queue)}) · Manage")
+        self.queued_downloads_button.setVisible(bool(self._download_queue))
+        for task_id in self._download_queue:
+            task = self._download_tasks.get(task_id)
+            if task is None:
+                continue
+            action = self.queued_downloads_menu.addAction(
+                f"Remove D{task_id} — {self._truncate_text(task['item'].title, 75)}"
+            )
+            action.setToolTip(task["item"].title)
+            action.triggered.connect(lambda _checked=False, tid=task_id: self._remove_queued_download(tid))
+
+    def _remove_queued_download(self, task_id: int) -> None:
+        if task_id not in self._download_queue or task_id in self.download_workers:
+            return
+        self._download_queue.remove(task_id)
+        self._download_tasks.pop(task_id, None)
+        self.log(f"[D{task_id}] Removed from download queue")
+        self._refresh_download_activity()
 
     def _download_activity_text(self) -> str:
         paused = sum(
@@ -1232,7 +1373,7 @@ class MainWindow(QMainWindow):
             return
         if current == "resuming" and state in {"starting", "pausing"}:
             return
-        if current == "finalizing" and state in {"starting", "downloading", "pausing", "paused", "resuming"}:
+        if current == "finalizing" and state in {"starting", "pausing", "paused", "resuming"}:
             return
         if state not in {"starting", "downloading", "pausing", "paused", "resuming",
                          "finalizing", "cancelling", "cancelled", "completed", "failed"}:
@@ -1525,16 +1666,19 @@ class MainWindow(QMainWindow):
         from PyQt6.QtGui import QDesktopServices
         from PyQt6.QtCore import QUrl
 
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if not self._ensure_output_dir():
+            return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.output_dir)))
 
     def _show_about(self) -> None:
         dialog = AboutDialog(self)
         dialog.exec()
+        dialog.deleteLater()
 
     def _open_preferences(self) -> None:
         dialog = SettingsDialog(self.settings_store, self)
         dialog.exec()
+        dialog.deleteLater()
 
     # ------------------------------------------------------------- theming
 
@@ -1551,7 +1695,9 @@ class MainWindow(QMainWindow):
         if persist:
             settings = self.settings_store.get()
             settings.theme = name
-            self.settings_store.update(settings)
+            if not self.settings_store.update(settings):
+                self.log(self.settings_store.last_save_error)
+                self.statusBar().showMessage("Theme changed for this session; settings could not be saved. See Logs.")
 
     def _toggle_theme(self) -> None:
         self._apply_theme(
@@ -1574,6 +1720,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
         if not self._closing:
             self._closing = True
+            self._scrape_active = False
+            self._scrape_generation += 1
+            if self.js_scraper is not None:
+                self._release_js_scraper(self.js_scraper)
+            if self.interactive_dialog is not None:
+                self.interactive_dialog.reject()
             self._close_downloads_deadline = time.monotonic() + 5.0
             self.preview_panel.shutdown()
             self.video_list.shutdown()

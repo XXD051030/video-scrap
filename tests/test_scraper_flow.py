@@ -37,8 +37,7 @@ def test_js_decoder_permutation_decode_and_cleanup() -> None:
 
 
 def test_js_decoder_long_permutation() -> None:
-    # A long permutation protects the indexing optimization without depending
-    # on output order, which is deliberately unspecified by the decoder.
+    # A long permutation protects the indexing optimization.
     expected = "https://media.example/video.mp4?token=" + "x" * 360
     parts = list(expected)
     order = list(reversed(range(len(parts))))
@@ -117,9 +116,7 @@ def test_redirected_response_with_absolute_media_preserves_page_metadata() -> No
     assert len(items) == 1
     assert items[0].url == media
     assert items[0].source_url == requested
-    assert items[0].referer == requested
-    # Relative media URLs after redirects have a known resolution issue; this
-    # test deliberately does not bless that behavior as correct.
+    assert items[0].referer == final
 
 
 if __name__ == "__main__":

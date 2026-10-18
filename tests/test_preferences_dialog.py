@@ -156,6 +156,20 @@ class PreferencesDialogTests(unittest.TestCase):
         self.assertEqual(self.store.get().playback_buffer_seconds, 60)
         self.assertEqual(self.notifications, [])
 
+    def test_failed_save_stays_open_explains_error_and_can_retry(self) -> None:
+        dialog = self._open()
+        self._edit(dialog, 95)
+        with mock.patch.object(settings.os, "replace", side_effect=OSError("disk full")):
+            QTest.mouseClick(self._button(dialog, QDialogButtonBox.StandardButton.Ok),
+                             Qt.MouseButton.LeftButton)
+            _flush()
+        self.assertTrue(dialog.isVisible())
+        self.assertTrue(dialog.save_error_label.isVisible())
+        self.assertIn("disk full", dialog.save_error_label.text())
+        self.assertEqual(self.path.read_bytes(), self.before)
+        self._save(dialog)
+        self.assertEqual(settings.AppSettings.load().playback_buffer_seconds, 95)
+
     def test_escape_dismisses_without_persisting_edits(self) -> None:
         dialog = self._open()
         self._edit(dialog, 200)

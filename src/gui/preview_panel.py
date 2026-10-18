@@ -40,6 +40,10 @@ class ClickableSlider(QSlider):
     without releasing the mouse.
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._track_dragging = False
+
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt API)
         if event.button() == Qt.MouseButton.LeftButton:
             opt = QStyleOptionSlider()
@@ -53,13 +57,36 @@ class ClickableSlider(QSlider):
             # If the click already landed on the handle let Qt's default
             # drag behaviour take over - that gives the most natural feel.
             if not handle_rect.contains(event.pos()):
-                new_value = self._pixel_pos_to_value(event.pos().x())
-                self.setValue(new_value)
-                self.sliderMoved.emit(new_value)
+                self._track_dragging = True
                 self.setSliderDown(True)
+                self.setSliderPosition(self._pixel_pos_to_value(event.pos().x()))
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._track_dragging:
+            self.setSliderPosition(self._pixel_pos_to_value(event.pos().x()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._track_dragging and event.button() == Qt.MouseButton.LeftButton:
+            self.setSliderPosition(self._pixel_pos_to_value(event.pos().x()))
+            self._track_dragging = False
+            self.setSliderDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def event(self, event) -> bool:
+        if (getattr(self, "_track_dragging", False)
+                and event.type() in (QEvent.Type.UngrabMouse, QEvent.Type.Hide,
+                                     QEvent.Type.WindowDeactivate)):
+            self._track_dragging = False
+            self.setSliderDown(False)
+        return super().event(event)
 
     def _pixel_pos_to_value(self, x: int) -> int:
         opt = QStyleOptionSlider()
@@ -346,7 +373,9 @@ class PreviewPanel(QWidget):
             meta_parts.append(video.ext.upper())
         if video.uploader:
             meta_parts.append(video.uploader)
-        if video.is_hls:
+        if video.is_dash:
+            meta_parts.append("DASH stream")
+        elif video.is_hls:
             meta_parts.append("HLS stream")
         elif video.is_direct:
             meta_parts.append("Direct link")
@@ -378,6 +407,10 @@ class PreviewPanel(QWidget):
         if self._is_x_video(video):
             selected = self._best_x_preview_format(video)
             playable_url = selected.get("url") if selected else None
+        elif video.is_direct and video.is_dash:
+            playable_url = None
+            self.thumbnail_label.setText("DASH preview is not supported. You can still download this video.")
+            self.player_message.emit("Direct DASH/MPD preview is not supported; downloading is available.")
         elif video.is_direct:
             playable_url = video.url
             self._pending_is_hls = video.is_hls
@@ -577,12 +610,13 @@ class PreviewPanel(QWidget):
             if is_x_video:
                 self.player_message.emit("X preview unavailable: media proxy is not running.")
                 return None
-            if video.hls_png_wrapped:
+            if video.hls_png_wrapped or video.browser_cookies:
                 self.player_message.emit("Preview unavailable: media proxy is not running.")
                 return None
             return playable_url
         if not is_x_video and not (
             video.referer or self._pending_playable_headers or self._pending_is_hls
+            or video.browser_cookies
         ):
             return playable_url
         try:
@@ -605,13 +639,15 @@ class PreviewPanel(QWidget):
                     referer=video.referer,
                     extra_headers=self._pending_playable_headers,
                     is_hls=self._pending_is_hls or video.is_hls,
+                    browser_cookies=video.browser_cookies,
+                    is_dash=video.is_dash,
                     **variant_options,
                 )
         except Exception as exc:  # noqa: BLE001
             if is_x_video:
                 self.player_message.emit(f"X preview setup failed: {exc}")
                 return None
-            if video.hls_png_wrapped:
+            if video.hls_png_wrapped or video.browser_cookies:
                 self.player_message.emit(f"Preview setup failed: {exc}")
                 return None
             return playable_url
@@ -629,7 +665,7 @@ class PreviewPanel(QWidget):
     def _best_playable_url(self, video: VideoItem) -> Optional[str]:
         """Return the chosen preview URL, retaining direct-link behavior."""
         if video.is_direct:
-            return video.url
+            return None if video.is_dash else video.url
         selected = self._best_preview_format(video)
         return selected.get("url") if selected else None
 

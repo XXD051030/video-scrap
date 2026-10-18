@@ -29,7 +29,7 @@ try:
 except Exception:  # noqa: BLE001
     _CryptoAES = None
 
-from .net import build_session
+from .browser_cookies import browser_cookiejar, build_scoped_session as build_session
 from .ffmpeg import resolve_ffmpeg
 from .parallel_downloader import ParallelDownloader, _publish_unique
 from .scraper import VideoItem, is_x_post_url
@@ -343,6 +343,8 @@ class VideoDownloader:
     ) -> Path:
         """Normalize explicitly wrapped HLS before using the existing backends."""
         self._raise_if_cancelled()
+        # A downloader owns one task; never flatten a browser jar into headers.
+        self._session.cookies = browser_cookiejar(getattr(item, "browser_cookies", None))
         with self._download_source(item) as source:
             return self._download_with_stage(
                 source, quality, on_progress, audio_format
@@ -351,7 +353,9 @@ class VideoDownloader:
     @contextmanager
     def _download_source(self, item: VideoItem) -> Iterator[VideoItem]:
         """Keep a wrapped-HLS proxy alive through transfer, audio and publishing."""
-        if not item.hls_png_wrapped:
+        browser_records = getattr(item, "browser_cookies", None)
+        authenticated_hls = bool(browser_records and item.is_direct and item.is_hls)
+        if not item.hls_png_wrapped and not authenticated_hls:
             yield item
             return
         if not item.is_direct or not item.is_hls:
@@ -369,10 +373,16 @@ class VideoDownloader:
                 item.url,
                 referer=item.referer,
                 is_hls=True,
-                hls_png_wrapped=True,
+                hls_png_wrapped=item.hls_png_wrapped,
+                cookiejar=browser_cookiejar(browser_records),
             )
             self._raise_if_cancelled()
-            yield replace(item, url=local_url, hls_png_wrapped=False)
+            updates = {"url": local_url, "hls_png_wrapped": False}
+            if browser_records:
+                # FFmpeg only sees loopback URLs. Cookie scope is enforced at
+                # every upstream hop by this task's private proxy instead.
+                updates["browser_cookies"] = []
+            yield replace(item, **updates)
         finally:
             proxy.stop()
 
@@ -541,7 +551,9 @@ class VideoDownloader:
             try:
                 if quality == "audio only":
                     return self._download_hls_parallel(item, on_progress, audio_only=True)
-                return self._download_hls_parallel(item, on_progress)
+                return self._download_hls_parallel(item, on_progress, **(
+                    {"quality": quality} if quality != "best" else {}
+                ))
             except (_HlsByteRangeError, _HlsIntegrityError):
                 # yt-dlp's HTTP backend can accept a whole-file 200 or an
                 # incorrect 206 for a Range request. Do not publish those
@@ -568,7 +580,9 @@ class VideoDownloader:
                         )
                     )
                 try:
-                    result = self._download_hls_ytdlp(fallback_item, on_progress)
+                    result = self._download_hls_ytdlp(fallback_item, on_progress, **(
+                        {"quality": quality} if quality != "best" else {}
+                    ))
                     if exc.require_av:
                         ffmpeg = resolve_ffmpeg()
                         if not ffmpeg:
@@ -591,13 +605,15 @@ class VideoDownloader:
                                 message="Native HLS failed; retrying with ffmpeg...",
                             )
                         )
-                    result = self._download_hls_ffmpeg(fallback_item, ffmpeg, on_progress)
+                    result = self._download_hls_ffmpeg(fallback_item, ffmpeg, on_progress, **(
+                        {"quality": quality} if quality != "best" else {}
+                    ))
                     if exc.require_av:
                         self._verify_hls_output(
                             ffmpeg, result, exc.expected_duration, require_av=True
                         )
                     return result
-        if item.is_direct and not item.is_hls:
+        if item.is_direct and not item.is_hls and not getattr(item, "is_dash", False):
             return self._download_direct(item, on_progress)
 
         fmt = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"])
@@ -699,8 +715,11 @@ class VideoDownloader:
             if x_index is not None:
                 ydl_opts["playlist_items"] = str(x_index)
 
+        self._configure_browser_ydl(item, ydl_opts)
+
         self._raise_if_cancelled()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            self._install_browser_cookies(item, ydl)
             result = ydl.download([_x_download_url(item.url) if is_x_item else item.url])
 
         self._raise_if_cancelled()
@@ -724,12 +743,30 @@ class VideoDownloader:
             )
         return Path(last_path["path"]) if last_path["path"] else self.output_dir
 
+    @staticmethod
+    def _configure_browser_ydl(item: VideoItem, options: dict) -> None:
+        if getattr(item, "browser_cookies", None):
+            # yt-dlp's requests handler merges into a permissive new jar;
+            # urllib uses the supplied CookieJar's strict policy directly.
+            options["compat_opts"] = {"prefer-legacy-http-handler"}
+            options["external_downloader"] = "native"
+
+    @staticmethod
+    def _install_browser_cookies(item: VideoItem, ydl) -> None:
+        records = getattr(item, "browser_cookies", None)
+        if records:
+            jar = browser_cookiejar(records, base=ydl.cookiejar)
+            ydl.cookiejar.set_policy(jar._policy)
+            for cookie in jar:
+                ydl.cookiejar.set_cookie(cookie)
+
     def _download_hls_parallel(
         self,
         item: VideoItem,
         on_progress: Optional[ProgressHandler],
         *,
         audio_only: bool = False,
+        quality: str = "best",
     ) -> Path:
         """Download HLS segments concurrently, then remux to mp4."""
         title = safe_filename(item.title)
@@ -753,7 +790,7 @@ class VideoDownloader:
                 )
             else:
                 manifest_url, manifest_text, master_context = self._fetch_hls_manifest(
-                    item.url, headers
+                    item.url, headers, quality=quality
                 )
         except _HlsByteRangeError:
             raise
@@ -768,7 +805,7 @@ class VideoDownloader:
         audio_text = ""
         if master_context is not None:
             selected_variant = self._pick_hls_variant(
-                master_context.text, master_context.url
+                master_context.text, master_context.url, quality
             )
             audio_url = self._pick_hls_audio_rendition(
                 master_context.text, master_context.url, selected_variant
@@ -1047,6 +1084,7 @@ class VideoDownloader:
         *,
         media_only: bool = False,
         audio_only: bool = False,
+        quality: str = "best",
     ) -> tuple[str, str, Optional[_HlsMasterContext]]:
         self._raise_if_cancelled()
         with self._session.get(
@@ -1060,7 +1098,7 @@ class VideoDownloader:
         if media_only:
             self._validate_hls_media_manifest(text)
             return final_url, text, None
-        variant = self._pick_hls_variant(text, final_url)
+        variant = self._pick_hls_variant(text, final_url, quality)
         if variant is None:
             self._validate_hls_media_manifest(text)
             return final_url, text, None
@@ -1218,25 +1256,37 @@ class VideoDownloader:
         ):
             raise _HlsByteRangeError("The HLS response does not identify a media playlist")
 
-    def _pick_hls_variant(self, text: str, manifest_url: str) -> Optional[str]:
-        best_score = -1
-        best_url: Optional[str] = None
+    def _pick_hls_variant(
+        self, text: str, manifest_url: str, quality: str = "best"
+    ) -> Optional[str]:
+        candidates: list[tuple[int, int, str]] = []
         lines = text.splitlines()
         for idx, raw in enumerate(lines):
             line = raw.strip()
             if not line.startswith("#EXT-X-STREAM-INF"):
                 continue
             attrs = _parse_m3u8_attrs(line.split(":", 1)[1] if ":" in line else "")
-            bandwidth = int(attrs.get("BANDWIDTH") or 0)
+            try:
+                bandwidth = int(attrs.get("BANDWIDTH") or 0)
+            except ValueError:
+                bandwidth = 0
+            resolution = re.fullmatch(r"\d+[xX](\d+)", attrs.get("RESOLUTION", ""))
+            height = int(resolution.group(1)) if resolution else 0
             for next_line in lines[idx + 1:]:
                 next_line = next_line.strip()
                 if not next_line or next_line.startswith("#"):
                     continue
-                if bandwidth > best_score:
-                    best_score = bandwidth
-                    best_url = urljoin(manifest_url, next_line)
+                candidates.append((height, bandwidth, urljoin(manifest_url, next_line)))
                 break
-        return best_url
+        if not candidates:
+            return None
+        cap = re.fullmatch(r"(\d+)p", quality)
+        if cap:
+            limited = [entry for entry in candidates if 0 < entry[0] <= int(cap.group(1))]
+            if not limited:
+                raise RuntimeError(f"No HLS variant with a declared height at or below {quality}")
+            return max(limited, key=lambda entry: (entry[0], entry[1]))[2]
+        return max(candidates, key=lambda entry: entry[1])[2]
 
     def _parse_hls_segments(
         self,
@@ -1503,7 +1553,10 @@ class VideoDownloader:
     ) -> None:
         with open(target, "w", encoding="utf-8") as file:
             for index, source in enumerate(sources):
-                escaped = str(source).replace("\\", "\\\\").replace("'", "\\'")
+                # concat uses FFmpeg's token quoting: close the quoted token,
+                # escape the quote outside it, then reopen. Backslashes inside
+                # single quotes are literal (including Windows separators).
+                escaped = str(source).replace("'", "'\\''")
                 file.write(f"file '{escaped}'\n")
                 if durations is not None and durations[index] > 0:
                     # TS probing can underestimate AAC segment durations. Use
@@ -1585,6 +1638,7 @@ class VideoDownloader:
         self,
         item: VideoItem,
         on_progress: Optional[ProgressHandler],
+        *, quality: str = "best",
     ) -> Path:
         title = safe_filename(item.title)
         outtmpl = str(self.output_dir / f"{title}.%(ext)s")
@@ -1667,7 +1721,7 @@ class VideoDownloader:
 
         ydl_opts = {
             "outtmpl": outtmpl,
-            "format": "bestvideo*+bestaudio/best",
+            "format": QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"]),
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
@@ -1690,7 +1744,9 @@ class VideoDownloader:
             ydl_opts["ffmpeg_location"] = ffmpeg
 
         self._raise_if_cancelled()
+        self._configure_browser_ydl(item, ydl_opts)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            self._install_browser_cookies(item, ydl)
             result = ydl.download([item.url])
 
         self._raise_if_cancelled()
@@ -1732,6 +1788,9 @@ class VideoDownloader:
                 lane_limiter=self._lane_limiter,
             )
             self._parallel = parallel
+            records = getattr(item, "browser_cookies", None)
+            if records:
+                parallel._session.cookies = browser_cookiejar(records)
 
         def relay(downloaded: int, total: int, speed: float) -> None:
             if on_progress is None:
@@ -1785,6 +1844,7 @@ class VideoDownloader:
         item: VideoItem,
         ffmpeg: str,
         on_progress: Optional[ProgressHandler],
+        *, quality: str = "best",
     ) -> Path:
         """Download a direct HLS manifest with ffmpeg and parse live progress."""
         title = safe_filename(item.title)
@@ -1797,8 +1857,25 @@ class VideoDownloader:
                     message="Reading HLS manifest...",
                 )
             )
-        duration = item.duration or self._probe_hls_duration(item)
         headers = build_request_headers(item.referer)
+        audio_url = None
+        if quality != "best":
+            selected_url, selected_text, context = self._fetch_hls_manifest(
+                item.url, headers, quality=quality
+            )
+            if _hls_has_byte_ranges(selected_text):
+                raise _HlsByteRangeError("FFmpeg fallback cannot bypass HLS range validation")
+            if context is not None:
+                variant = self._pick_hls_variant(context.text, context.url, quality)
+                audio_url = self._pick_hls_audio_rendition(context.text, context.url, variant)
+                if audio_url:
+                    audio_url, audio_text, _ = self._fetch_hls_manifest(
+                        audio_url, headers, media_only=True
+                    )
+                    if _hls_has_byte_ranges(audio_text):
+                        raise _HlsByteRangeError("FFmpeg fallback cannot bypass audio range validation")
+            item = replace(item, url=selected_url)
+        duration = item.duration or self._probe_hls_duration(item)
         header_blob = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
 
         cmd = [
@@ -1811,10 +1888,12 @@ class VideoDownloader:
         ]
         if item.url.lower().startswith(("http://", "https://")):
             cmd.extend(["-headers", header_blob])
+        cmd.extend(["-i", item.url])
+        if audio_url:
+            cmd.extend(["-headers", header_blob, "-i", audio_url,
+                        "-map", "0:v:0", "-map", "1:a:0"])
         cmd.extend(
             [
-                "-i",
-                item.url,
                 "-c",
                 "copy",
                 "-bsf:a",

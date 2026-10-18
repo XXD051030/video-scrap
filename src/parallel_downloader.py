@@ -13,6 +13,7 @@ Range support.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import secrets
@@ -25,7 +26,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 
-from .net import build_session
+from .browser_cookies import build_scoped_session as build_session
 
 
 @dataclass
@@ -329,8 +330,16 @@ class ParallelDownloader:
 
         try:
             os.fsync(fd)
-        except OSError:
-            pass
+        except OSError as exc:
+            # Some filesystems do not implement fsync. Actual writeback errors
+            # (EIO/ENOSPC/EROFS, etc.) must prevent publication of this result.
+            unsupported = {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}
+            if exc.errno not in unsupported:
+                try:
+                    os.close(fd)
+                finally:
+                    part_path.unlink(missing_ok=True)
+                raise
         try:
             os.close(fd)
         except OSError:
