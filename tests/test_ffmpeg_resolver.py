@@ -18,6 +18,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import ffmpeg
+from scripts.smoke_app import _resolve_smoke_ffmpeg
 
 
 @contextmanager
@@ -199,6 +200,86 @@ class FFmpegResolverTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PATH": sentinel}):
             self.assertEqual(ffmpeg.resolve_ffmpeg(), str(self.source_mac.resolve()))
             self.assertEqual(os.environ["PATH"], sentinel)
+
+
+class SmokeFFmpegResolverTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="smoke-ffmpeg-discovery-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.project = self.root / "project"
+        self.bundle = self.root / "bundle"
+        self.empty_bin = self.root / "empty-bin"
+        self.empty_bin.mkdir()
+        self.fake_imageio = SimpleNamespace(get_ffmpeg_exe=mock.Mock(return_value=""))
+        for patcher in (
+            mock.patch.object(ffmpeg, "__file__", str(self.project / "src" / "ffmpeg.py")),
+            mock.patch.dict(os.environ, {"PATH": str(self.empty_bin)}),
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(sys, "frozen", False, create=True),
+            mock.patch.object(sys, "_MEIPASS", str(self.bundle), create=True),
+            mock.patch.dict(sys.modules, {"imageio_ffmpeg": self.fake_imageio}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def executable(self, path: Path) -> Path:
+        return FFmpegResolverTests.executable(path)
+
+    def test_source_smoke_uses_application_asset_without_path_ffmpeg(self):
+        source = self.executable(self.project / "build" / "app-assets" / "bin" / "ffmpeg")
+        self.assertIsNone(ffmpeg.shutil.which("ffmpeg"))
+        self.assertEqual(_resolve_smoke_ffmpeg(), str(source.resolve()))
+        self.assertEqual(os.environ["PATH"], str(self.empty_bin))
+
+    def test_source_smoke_uses_imageio_without_path_ffmpeg(self):
+        fallback = self.executable(self.root / "imageio" / "ffmpeg")
+        self.fake_imageio.get_ffmpeg_exe.return_value = str(fallback)
+        self.assertIsNone(ffmpeg.shutil.which("ffmpeg"))
+        self.assertEqual(_resolve_smoke_ffmpeg(), str(fallback.resolve()))
+
+    def test_missing_binary_fails_source_smoke(self):
+        with self.assertRaisesRegex(RuntimeError, "application resolver"):
+            _resolve_smoke_ffmpeg()
+
+    def test_frozen_smoke_accepts_the_bundle_without_path_ffmpeg(self):
+        bundled = self.executable(self.bundle / "bin" / "ffmpeg")
+        with mock.patch.object(sys, "frozen", True):
+            self.assertEqual(_resolve_smoke_ffmpeg(), str(bundled.resolve()))
+
+    def test_frozen_smoke_accepts_windows_bundle_name(self):
+        bundled = self.executable(self.bundle / "bin" / "ffmpeg.exe")
+        # POSIX shutil cannot call Windows' native executable-search API.
+        with mock.patch.object(sys, "frozen", True), mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.object(ffmpeg.shutil, "which", return_value=None):
+            self.assertEqual(_resolve_smoke_ffmpeg(), str(bundled.resolve()))
+
+    def test_frozen_smoke_rejects_source_fallback(self):
+        self.executable(self.project / "build" / "app-assets" / "bin" / "ffmpeg")
+        with mock.patch.object(sys, "frozen", True):
+            with self.assertRaisesRegex(RuntimeError, "application bundle"):
+                _resolve_smoke_ffmpeg()
+
+    def test_frozen_smoke_rejects_imageio_fallback(self):
+        fallback = self.executable(self.root / "imageio" / "ffmpeg")
+        self.fake_imageio.get_ffmpeg_exe.return_value = str(fallback)
+        with mock.patch.object(sys, "frozen", True):
+            with self.assertRaisesRegex(RuntimeError, "application bundle"):
+                _resolve_smoke_ffmpeg()
+
+    def test_frozen_smoke_rejects_system_tool_even_when_bundle_exists(self):
+        self.executable(self.bundle / "bin" / "ffmpeg")
+        system = self.executable(self.root / "system" / "ffmpeg")
+        with mock.patch.dict(os.environ, {"PATH": str(system.parent)}):
+            with mock.patch.object(sys, "frozen", True):
+                with self.assertRaisesRegex(RuntimeError, "application bundle"):
+                    _resolve_smoke_ffmpeg()
+
+    def test_frozen_smoke_rejects_missing_bundle_metadata(self):
+        self.executable(self.project / "build" / "app-assets" / "bin" / "ffmpeg")
+        with mock.patch.object(sys, "frozen", True), mock.patch.object(sys, "_MEIPASS", None):
+            with self.assertRaisesRegex(RuntimeError, "application bundle"):
+                _resolve_smoke_ffmpeg()
 
 
 if __name__ == "__main__":

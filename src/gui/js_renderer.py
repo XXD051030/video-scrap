@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Callable, List, Optional
 
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal
+from ..utils import redact_log_secrets
 
 try:
     from PyQt6.QtWebEngineCore import QWebEnginePage
@@ -82,12 +83,9 @@ class JSPageScraper(QObject):
         self.wait_after_load_ms = wait_after_load_ms
         self.load_timeout_ms = load_timeout_ms
         self._page: Optional[QWebEnginePage] = None
+        self._generation = 0
         self._timeout_timer = QTimer(self)
-        self._timeout_timer.setSingleShot(True)
-        self._timeout_timer.timeout.connect(self._on_timeout)
         self._wait_timer = QTimer(self)
-        self._wait_timer.setSingleShot(True)
-        self._wait_timer.timeout.connect(self._extract)
         self._done = False
         self._profile = None
         self.page_url = ""
@@ -95,10 +93,22 @@ class JSPageScraper(QObject):
 
     def scrape(self, url: str) -> None:
         self.dispose()
+        self._generation += 1
+        generation = self._generation
         self._done = False
         self.page_url = url
         self.browser_cookies = []
-        self.log.emit(f"WebEngine: loading {url}")
+        self.log.emit(redact_log_secrets(f"WebEngine: loading {url}"))
+        # A timer object belongs to one run. A queued timeout from a stopped
+        # previous timer must not act on a newly loaded page.
+        self._timeout_timer.deleteLater()
+        self._wait_timer.deleteLater()
+        self._timeout_timer = QTimer(self)
+        self._timeout_timer.setSingleShot(True)
+        self._timeout_timer.timeout.connect(lambda: self._on_timeout(generation))
+        self._wait_timer = QTimer(self)
+        self._wait_timer.setSingleShot(True)
+        self._wait_timer.timeout.connect(lambda: self._extract(generation))
         # Reuse the persistent profile so any cookies the user established
         # via the interactive dialog (after clearing a CAPTCHA / logging in)
         # are available to the headless renderer as well.
@@ -113,12 +123,12 @@ class JSPageScraper(QObject):
             else QWebEnginePage(self)
         )
         self._profile = profile
-        self._page.loadFinished.connect(self._on_loaded)
+        self._page.loadFinished.connect(lambda ok: self._on_loaded(ok, generation))
         self._timeout_timer.start(self.load_timeout_ms)
         self._page.load(QUrl(url))
 
-    def _on_loaded(self, ok: bool) -> None:
-        if self._done:
+    def _on_loaded(self, ok: bool, generation=None) -> None:
+        if self._done or (generation is not None and generation != self._generation):
             return
         if not ok:
             self._fail("WebEngine load reported failure")
@@ -128,22 +138,23 @@ class JSPageScraper(QObject):
         )
         self._wait_timer.start(self.wait_after_load_ms)
 
-    def _extract(self) -> None:
-        if self._done or self._page is None:
+    def _extract(self, generation=None) -> None:
+        if self._done or self._page is None or (generation is not None and generation != self._generation):
             return
-        self._page.runJavaScript(EXTRACT_SCRIPT, self._on_extract_result)
+        generation = self._generation
+        self._page.runJavaScript(EXTRACT_SCRIPT,
+                                lambda result: self._on_extract_result(result, generation))
 
-    def _on_extract_result(self, result) -> None:
-        if self._done:
+    def _on_extract_result(self, result, generation=None) -> None:
+        if self._done or (generation is not None and generation != self._generation):
             return
         self._timeout_timer.stop()
-        self._done = True
         if not isinstance(result, dict):
             self._fail("WebEngine returned no result")
             return
-        videos = list(result.get("videos") or [])
-        iframes = list(result.get("iframes") or [])
-        title = result.get("pageTitle") or ""
+        videos = [url for url in result.get("videos", []) if isinstance(url, str)] if isinstance(result.get("videos", []), list) else []
+        iframes = [url for url in result.get("iframes", []) if isinstance(url, str)] if isinstance(result.get("iframes", []), list) else []
+        title = result.get("pageTitle") if isinstance(result.get("pageTitle"), str) else ""
         if self._page is not None:
             self.page_url = self._page.url().toString() or self.page_url
         if self._profile is not None:
@@ -156,8 +167,8 @@ class JSPageScraper(QObject):
         self.dispose()
         self.finished.emit(videos, iframes, title)
 
-    def _on_timeout(self) -> None:
-        if self._done:
+    def _on_timeout(self, generation=None) -> None:
+        if self._done or (generation is not None and generation != self._generation):
             return
         self._fail("WebEngine load timed out")
 
@@ -166,6 +177,7 @@ class JSPageScraper(QObject):
         self.failed.emit(message)
 
     def dispose(self) -> None:
+        self._generation += 1
         self._done = True
         self._timeout_timer.stop()
         self._wait_timer.stop()

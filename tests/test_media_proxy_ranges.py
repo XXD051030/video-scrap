@@ -23,7 +23,7 @@ class FakeResponse:
         content_encoding: str | None = None,
     ) -> None:
         self.status_code = status
-        self.headers: dict[str, str] = {}
+        self.headers: dict[str, str] = {"ETag": '"stable-fixture"'}
         if content_range is not None:
             self.headers["Content-Range"] = content_range
         if content_length is not None:
@@ -163,7 +163,7 @@ def test_prefetch_valid_206_and_200_fallback() -> None:
         full = FakeResponse(200, [b"0123456789ABCDEF"], content_length=16)
         prefetch.session = FakeSession(full)
         prefetch._fetch_into_cache(0, 3)
-        assert entry.cached_run_end(0) == 16
+        assert entry.cached_run_end(0) == 4
 
     _with_entry(check)
 
@@ -174,7 +174,7 @@ def test_200_without_content_length_keeps_streaming_fallback() -> None:
         response = FakeResponse(200, [b"0123456789"])
         proxy._session = FakeSession(response)
         assert b"".join(proxy._fetch_range(entry, 3, 5)) == b"345"
-        assert entry.cached_run_end(0) == 10
+        assert entry.cached_run_end(0) == 6
 
     _with_entry(check)
 

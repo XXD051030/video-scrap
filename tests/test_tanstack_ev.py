@@ -15,6 +15,8 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from http_fixtures import html_response
+
 from src.scraper import (  # noqa: E402
     VideoItem,
     VideoScraper,
@@ -70,9 +72,9 @@ def _page_html(script: str, body: str = "") -> str:
 
 
 def _scrape(html: str, ytdlp_items: list[VideoItem] | None = None) -> tuple[list[VideoItem], list[str]]:
-    response = Mock(text=html, url=PAGE)
+    response = html_response(text=html, url=PAGE)
     logs: list[str] = []
-    with patch("src.scraper.requests.get", return_value=response) as get, patch.object(
+    with patch("src.scraper.ScopedCookieSession.get", return_value=response) as get, patch.object(
         VideoScraper, "_scrape_with_ytdlp", return_value=ytdlp_items or []
     ) as ytdlp:
         items = VideoScraper().scrape(PAGE, progress=logs.append)

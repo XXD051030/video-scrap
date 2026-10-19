@@ -43,6 +43,7 @@ class FakeResponse:
         self.payload = payload
         self.status_code = status
         self.headers = dict(headers or {})
+        self.headers.setdefault("ETag", '"stable-fixture"')
         self.url = url
 
     @property
@@ -136,9 +137,12 @@ class HlsByteRangeTests(unittest.TestCase):
 
     def test_explicit_range_can_follow_different_uri_or_whole_segment(self):
         text = """#EXTM3U
+#EXTINF:1,
 #EXT-X-BYTERANGE:3@2
 blob.ts
+#EXTINF:1,
 whole.ts
+#EXTINF:1,
 #EXT-X-BYTERANGE:2@5
 other.ts
 """
@@ -364,7 +368,7 @@ blob.ts
                 ffmpeg_fallback.assert_not_called()
                 self.assertEqual(list(self.output_dir.iterdir()), [])
 
-    def test_plain_hls_keeps_existing_fallback_without_ffmpeg(self):
+    def test_plain_hls_cannot_publish_an_unverified_fallback_without_ffmpeg(self):
         downloader = self.downloader("#EXTM3U\n#EXTINF:1,\nwhole.ts\n")
 
         def fallback(_item, _on_progress):
@@ -374,8 +378,9 @@ blob.ts
 
         with mock.patch("src.downloader.resolve_ffmpeg", return_value=None), \
                 mock.patch.object(downloader, "_download_hls_ytdlp", side_effect=fallback) as fallback_backend:
-            result = downloader.download(self.item())
-        self.assertEqual(result.read_bytes(), b"plain HLS fallback")
+            with self.assertRaisesRegex(RuntimeError, "FFmpeg is required to verify"):
+                downloader.download(self.item())
+        self.assertEqual(list(self.output_dir.iterdir()), [])
         fallback_backend.assert_called_once()
 
     def test_fallback_stays_on_the_inspected_variant_and_preserves_metadata(self):
@@ -408,7 +413,9 @@ ranged.m3u8
                     ytdlp = stack.enter_context(mock.patch.object(downloader, "_download_hls_ytdlp",
                         side_effect=finished if backend == "yt-dlp" else RuntimeError("yt-dlp failed")))
                     ffmpeg = stack.enter_context(mock.patch.object(downloader, "_download_hls_ffmpeg", side_effect=finished))
+                    verify = stack.enter_context(mock.patch.object(downloader, "_verify_hls_output"))
                     result = downloader.download(video)
+                    verify.assert_called_once()
                 self.assertEqual(result.read_bytes(), b"verified plain variant")
                 self.assertEqual(ytdlp.call_args.args[0].url, plain_url)
                 if backend == "ffmpeg":

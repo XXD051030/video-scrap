@@ -164,6 +164,7 @@ class AudioDownloadTests(unittest.TestCase):
                     self.send_response(200)
                 self.send_header("Content-Length", str(end - start + 1))
                 self.send_header("Accept-Ranges", "bytes")
+                self.send_header("ETag", '"stable-audio-fixture"')
                 self.send_header("Content-Type", "application/octet-stream")
                 self.end_headers()
                 if not head:
@@ -418,8 +419,8 @@ class AudioDownloadTests(unittest.TestCase):
                 downloader = self.downloader(connections=1)
                 download_segment = downloader._download_hls_segment
 
-                def cancel_after_initial_segment(segment, headers):
-                    payload = download_segment(segment, headers)
+                def cancel_after_initial_segment(segment, headers, **kwargs):
+                    payload = download_segment(segment, headers, **kwargs)
                     if segment.index == 0:
                         downloader.cancel(keep_partial=True)
                     return payload

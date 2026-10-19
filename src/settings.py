@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import threading
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -138,10 +139,18 @@ def _record_invalid_settings(reason: str, diagnostics: Optional[List[str]]) -> N
 
 
 class SettingsStore:
-    """Thread-safe wrapper that broadcasts changes to subscribers."""
+    """Serialize persistence and deliver snapshots in commit order.
+
+    Callbacks run outside the data/transaction locks on the thread draining
+    the notification queue. UI subscribers must marshal to their UI thread.
+    A callback may read, unsubscribe, or update settings without deadlocking.
+    """
 
     def __init__(self, settings: Optional[AppSettings] = None) -> None:
         self._lock = threading.Lock()
+        self._transaction = threading.RLock()
+        self._notifications = deque()
+        self._dispatching = False
         self.diagnostics: List[str] = []
         self.last_save_error = ""
         self._settings = (settings or AppSettings.load(self.diagnostics)).normalised()
@@ -153,29 +162,59 @@ class SettingsStore:
 
     def update(self, settings: AppSettings, persist: bool = True) -> bool:
         snapshot = settings.normalised()
-        with self._lock:
-            self._settings = AppSettings(**asdict(snapshot))
-            listeners = list(self._listeners)
-        errors: List[str] = []
-        saved = snapshot.save(errors) if persist else True
-        self.last_save_error = errors[0] if errors else ""
-        for cb in listeners:
-            try:
-                cb(AppSettings(**asdict(snapshot)))
-            except Exception:  # noqa: BLE001
-                # Listener bugs must not break the settings flow.
-                pass
+        with self._transaction:
+            errors: List[str] = []
+            saved = snapshot.save(errors) if persist else True
+            with self._lock:
+                self._settings = AppSettings(**asdict(snapshot))
+                self.last_save_error = errors[0] if errors else ""
+                self._notifications.append((list(self._listeners), snapshot))
+        self._drain_notifications()
         return saved
+
+    def _drain_notifications(self) -> None:
+        with self._lock:
+            if self._dispatching:
+                return
+            self._dispatching = True
+        try:
+            while True:
+                with self._lock:
+                    if not self._notifications:
+                        self._dispatching = False
+                        return
+                    listeners, snapshot = self._notifications.popleft()
+                for cb in listeners:
+                    with self._lock:
+                        subscribed = cb in self._listeners
+                    if not subscribed:
+                        continue
+                    try:
+                        cb(AppSettings(**asdict(snapshot)))
+                    except Exception:  # noqa: BLE001
+                        pass
+        except BaseException:
+            with self._lock:
+                self._dispatching = False
+            raise
 
     def subscribe(
         self,
         cb: Callable[[AppSettings], None],
         fire_initial: bool = True,
-    ) -> None:
-        with self._lock:
-            self._listeners.append(cb)
-        if fire_initial:
-            try:
-                cb(self.get())
-            except Exception:  # noqa: BLE001
-                pass
+    ) -> Callable[[], None]:
+        with self._transaction:
+            with self._lock:
+                if cb not in self._listeners:
+                    self._listeners.append(cb)
+                    if fire_initial:
+                        snapshot = AppSettings(**asdict(self._settings))
+                        self._notifications.append(([cb], snapshot))
+        self._drain_notifications()
+
+        def unsubscribe() -> None:
+            with self._lock:
+                if cb in self._listeners:
+                    self._listeners.remove(cb)
+
+        return unsubscribe

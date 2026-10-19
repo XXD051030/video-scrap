@@ -11,6 +11,8 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from http_fixtures import html_response
+
 from src.scraper import (
     VideoItem, VideoScraper, _extract_next_data_ev_hls, _is_embed_iframe,
     build_items_from_urls,
@@ -40,7 +42,7 @@ class ScraperValidationTests(unittest.TestCase):
             calls.append(url)
             return []
 
-        with patch("src.scraper.requests.get", return_value=Mock(text=html, url=final)), patch.object(
+        with patch("src.scraper.ScopedCookieSession.get", return_value=html_response(text=html, url=final)), patch.object(
             VideoScraper, "_scrape_with_ytdlp", side_effect=extract
         ):
             items = VideoScraper().scrape(REQUESTED)

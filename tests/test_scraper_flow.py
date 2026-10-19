@@ -14,6 +14,8 @@ from urllib.parse import quote
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.js_decoder import decode_obfuscated_urls
+from http_fixtures import html_response
+
 from src.scraper import VideoItem, VideoScraper
 
 
@@ -84,7 +86,7 @@ def test_scrape_combines_html_embed_and_hidden_media() -> None:
             ]
         return []
 
-    with patch("src.scraper.requests.get", return_value=Mock(text=html, url=page)), patch.object(
+    with patch("src.scraper.ScopedCookieSession.get", return_value=html_response(text=html, url=page)), patch.object(
         VideoScraper, "_scrape_with_ytdlp", side_effect=fake_ytdlp
     ):
         items = VideoScraper().scrape(page)
@@ -106,9 +108,9 @@ def test_redirected_response_with_absolute_media_preserves_page_metadata() -> No
     final = "https://final.example/videos/42"
     media = "https://media.example/clip.mp4"
     html = f'<html><video src="{media}"></video></html>'
-    response = Mock(text=html, url=final)
+    response = html_response(text=html, url=final)
 
-    with patch("src.scraper.requests.get", return_value=response), patch.object(
+    with patch("src.scraper.ScopedCookieSession.get", return_value=response), patch.object(
         VideoScraper, "_scrape_with_ytdlp", return_value=[]
     ):
         items = VideoScraper().scrape(requested)

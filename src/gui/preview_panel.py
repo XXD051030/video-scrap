@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from typing import Optional
+from html import escape
+import math
+import weakref
 
 from urllib.parse import urlparse
 
 from PyQt6.QtCore import QEvent, QSize, QUrl, Qt, pyqtSignal
-from PyQt6.QtGui import QKeySequence, QMouseEvent, QPixmap, QShortcut
+from PyQt6.QtGui import QDesktopServices, QKeySequence, QMouseEvent, QPixmap, QShortcut
+from PyQt6 import sip
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
@@ -29,7 +33,7 @@ from ..scraper import VideoItem
 from ..utils import format_duration
 from .icons import make_icon
 from .style import DARK, Theme
-from .workers import ThumbnailWorker
+from .workers import ThumbnailWorker, cancel_background_worker, track_background_worker
 
 
 class ClickableSlider(QSlider):
@@ -129,6 +133,8 @@ class _FullscreenWindow(QWidget):
 class PreviewPanel(QWidget):
     """Display details and an embedded media player for a selected video."""
 
+    _MAX_SLIDER_POSITION = (1 << 31) - 1
+
     player_message = pyqtSignal(str)
     playback_activity_changed = pyqtSignal(bool)
 
@@ -142,6 +148,8 @@ class PreviewPanel(QWidget):
         self.setObjectName("PreviewPanel")
         self._current: Optional[VideoItem] = None
         self._thumb_worker: Optional[ThumbnailWorker] = None
+        self._thumb_generation = 0
+        self._pending_thumbnail = None
         self._thumbnail_pixmap: Optional[QPixmap] = None
         self._proxy = proxy
         self._theme = theme or DARK
@@ -152,6 +160,7 @@ class PreviewPanel(QWidget):
         self._pending_is_hls = False
         self._pending_hls_variant_url: Optional[str] = None
         self._source_loaded = False
+        self._duration_ms = 0
         self._fullscreen_window: Optional[_FullscreenWindow] = None
 
         layout = QVBoxLayout(self)
@@ -215,7 +224,7 @@ class PreviewPanel(QWidget):
         self.position_slider.setObjectName("SeekSlider")
         self.position_slider.setAccessibleName("Playback position")
         self.position_slider.setRange(0, 0)
-        self.position_slider.sliderMoved.connect(self.player.setPosition)
+        self.position_slider.sliderMoved.connect(self._seek_to_slider_position)
         seek_controls.addWidget(self.position_slider, stretch=1)
 
         self.time_label = QLabel("00:00 / 00:00")
@@ -296,7 +305,8 @@ class PreviewPanel(QWidget):
 
         self.url_label = QLabel("")
         self.url_label.setObjectName("UrlLink")
-        self.url_label.setOpenExternalLinks(True)
+        self.url_label.setOpenExternalLinks(False)
+        self.url_label.linkActivated.connect(self._open_source_link)
         self.url_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
         )
@@ -390,30 +400,22 @@ class PreviewPanel(QWidget):
         self.thumbnail_label.setText("Loading thumbnail...")
 
         if video.thumbnail:
-            self._thumb_worker = ThumbnailWorker(
-                0,
-                video.thumbnail,
-                referer=video.referer,
-                cookies=getattr(video, "x_cookiejar", None),
-                parent=self,
-            )
-            self._thumb_worker.ready.connect(self._apply_thumbnail)
-            self._thumb_worker.failed.connect(self._on_thumb_failed)
-            self._thumb_worker.start()
+            self._pending_thumbnail = (video, self._thumb_generation)
+            self._start_pending_thumbnail()
         else:
             self.thumbnail_label.setText("(No thumbnail available)")
 
         selected = None
-        if self._is_x_video(video):
-            selected = self._best_x_preview_format(video)
-            playable_url = selected.get("url") if selected else None
-        elif video.is_direct and video.is_dash:
+        if video.is_direct and video.is_dash:
             playable_url = None
             self.thumbnail_label.setText("DASH preview is not supported. You can still download this video.")
             self.player_message.emit("Direct DASH/MPD preview is not supported; downloading is available.")
         elif video.is_direct:
             playable_url = video.url
             self._pending_is_hls = video.is_hls
+        elif self._is_x_video(video):
+            selected = self._best_x_preview_format(video)
+            playable_url = selected.get("url") if selected else None
         else:
             selected = self._best_preview_format(video)
             playable_url = selected.get("url") if selected else None
@@ -548,13 +550,38 @@ class PreviewPanel(QWidget):
             label.setMaximumHeight(label.fontMetrics().lineSpacing() * 2 + 2)
 
     def _render_url_label(self, video: VideoItem) -> None:
-        host = urlparse(video.url).netloc or video.url
+        try:
+            host = urlparse(video.url).hostname or video.url
+        except ValueError:
+            host = video.url
         self.url_label.setText(
-            f'<a href="{video.url}" style="color: {self._accent};'
+            f'<a href="{escape(video.url, quote=True)}" style="color: {self._accent};'
             ' text-decoration: none;">'
-            f"{host}  ↗</a>"
+            f"{escape(host)}  ↗</a>"
         )
         self.url_label.setToolTip(video.url)
+
+    @staticmethod
+    def _open_source_link(value: str) -> bool:
+        # QLabel never opens arbitrary protocols or embedded credentials.
+        try:
+            parsed = urlparse(value)
+            if (parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None
+                    or any(ord(char) < 33 for char in value) or "\\" in value):
+                return False
+            parsed.port  # Validate malformed/out-of-range ports before opening.
+        except (TypeError, ValueError):
+            return False
+        return QDesktopServices.openUrl(QUrl(value))
+
+    @staticmethod
+    def _format_height(fmt: dict) -> int:
+        try:
+            height = float(fmt.get("height") or 0)
+            return int(height) if math.isfinite(height) and 0 <= height <= 100000 else 0
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
     @staticmethod
     def _is_x_video(video: VideoItem) -> bool:
@@ -575,6 +602,8 @@ class PreviewPanel(QWidget):
         """Prefer a combined MP4; use HLS if X exposes no suitable MP4."""
         options = []
         for fmt in video.formats or []:
+            if not isinstance(fmt, dict):
+                continue
             url = fmt.get("url")
             if not isinstance(url, str) or not url.startswith(("https://", "http://")):
                 continue
@@ -596,10 +625,7 @@ class PreviewPanel(QWidget):
                 category = 2
             else:
                 category = 1
-            try:
-                height = int(fmt.get("height") or 0)
-            except (TypeError, ValueError):
-                height = 0
+            height = cls._format_height(fmt)
             options.append(((category, audio, height), fmt))
         return max(options, key=lambda option: option[0])[1] if options else None
 
@@ -626,6 +652,7 @@ class PreviewPanel(QWidget):
                     referer=video.referer,
                     extra_headers=self._pending_playable_headers,
                     cookiejar=getattr(video, "x_cookiejar", None),
+                    browser_cookies=video.browser_cookies,
                     is_hls=self._pending_is_hls,
                 )
             else:
@@ -726,10 +753,7 @@ class PreviewPanel(QWidget):
                     _preview_hls_variant_url=url,
                 )
                 acodec = str(selected.get("acodec") or "").lower()
-            try:
-                height = int(fmt.get("height") or 0)
-            except (TypeError, ValueError):
-                height = 0
+            height = cls._format_height(fmt)
             # AV1 may be offered as MP4 even when Qt has no usable decoder.
             # Prefer AVC without changing the user's download-format choice.
             codec = 2 if vcodec.startswith(("avc1", "h264")) else (
@@ -741,6 +765,39 @@ class PreviewPanel(QWidget):
             )
             candidates.append((score, selected))
         return max(candidates, key=lambda option: option[0])[1] if candidates else None
+
+    def _start_pending_thumbnail(self) -> None:
+        if self._thumb_worker is not None or self._pending_thumbnail is None:
+            return
+        video, generation = self._pending_thumbnail
+        self._pending_thumbnail = None
+        worker = ThumbnailWorker(
+            0,
+            video.thumbnail,
+            referer=video.referer,
+            cookies=getattr(video, "x_cookiejar", None),
+            browser_cookies=video.browser_cookies,
+        )
+        self._thumb_worker = worker
+        owner = weakref.ref(self)
+        def deliver(index, result, *, failed=False):
+            panel = owner()
+            if (panel is not None and not sip.isdeleted(panel)
+                    and generation == panel._thumb_generation):
+                if failed:
+                    panel._on_thumb_failed(index, result)
+                else:
+                    panel._apply_thumbnail(index, result)
+        worker.ready.connect(deliver)
+        worker.failed.connect(lambda index, message: deliver(index, message, failed=True))
+        def finished():
+            panel = owner()
+            if panel is not None and not sip.isdeleted(panel) and panel._thumb_worker is worker:
+                panel._thumb_worker = None
+                panel._start_pending_thumbnail()
+        worker.finished.connect(finished)
+        track_background_worker(worker)
+        worker.start()
 
     def _apply_thumbnail(self, _index: int, data: bytes) -> None:
         pixmap = QPixmap()
@@ -768,15 +825,12 @@ class PreviewPanel(QWidget):
         self.thumbnail_label.setText(f"(Thumbnail error: {message})")
 
     def _stop_thumb_worker(self) -> None:
+        self._thumb_generation += 1
         worker = self._thumb_worker
-        self._thumb_worker = None
-        if worker is None or not worker.isRunning():
+        self._pending_thumbnail = None
+        if worker is None:
             return
-        worker.requestInterruption()
-        worker.quit()
-        if not worker.wait(1000):
-            worker.terminate()
-            worker.wait(1000)
+        cancel_background_worker(worker)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.play_button.setEnabled(enabled)
@@ -816,14 +870,46 @@ class PreviewPanel(QWidget):
 
     def _on_position_changed(self, position: int) -> None:
         if not self.position_slider.isSliderDown():
-            self.position_slider.setValue(position)
-        duration = self.player.duration()
+            self.position_slider.setValue(self._position_to_slider(position))
         self.time_label.setText(
-            f"{format_duration(position / 1000)} / {format_duration(duration / 1000)}"
+            f"{format_duration(position / 1000)} / {format_duration(self._duration_ms / 1000)}"
         )
 
     def _on_duration_changed(self, duration: int) -> None:
-        self.position_slider.setRange(0, duration)
+        dragging = self.position_slider.isSliderDown()
+        position = (self._slider_to_position(self.position_slider.sliderPosition())
+                    if dragging else self.player.position())
+        self._duration_ms = max(0, duration)
+        # QMediaPlayer uses qint64 milliseconds, while QSlider accepts int32.
+        # Keep exact milliseconds for ordinary media, and map longer media
+        # proportionally using integer arithmetic so both endpoints remain exact.
+        blocked = self.position_slider.blockSignals(True)
+        try:
+            self.position_slider.setRange(
+                0, min(self._duration_ms, self._MAX_SLIDER_POSITION)
+            )
+            self.position_slider.setSliderPosition(self._position_to_slider(position))
+        finally:
+            self.position_slider.blockSignals(blocked)
+        self._on_position_changed(self.player.position())
+
+    def _position_to_slider(self, position: int) -> int:
+        position = max(0, position)
+        if self._duration_ms <= self._MAX_SLIDER_POSITION:
+            return min(position, self._MAX_SLIDER_POSITION)
+        position = min(position, self._duration_ms)
+        return ((position * self._MAX_SLIDER_POSITION + self._duration_ms // 2)
+                // self._duration_ms)
+
+    def _slider_to_position(self, value: int) -> int:
+        value = max(0, min(value, self._MAX_SLIDER_POSITION))
+        if self._duration_ms <= self._MAX_SLIDER_POSITION:
+            return value
+        return ((value * self._duration_ms + self._MAX_SLIDER_POSITION // 2)
+                // self._MAX_SLIDER_POSITION)
+
+    def _seek_to_slider_position(self, value: int) -> None:
+        self.player.setPosition(self._slider_to_position(value))
 
     def _on_playback_state_changed(self, state) -> None:
         if state == QMediaPlayer.PlaybackState.PlayingState:

@@ -33,18 +33,18 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..downloader import DownloadLaneLimiter, QUALITY_FORMATS, DownloadProgress
+from ..downloader import QUALITY_FORMATS, DownloadProgress
 from ..media_proxy import MediaProxyServer
 from ..scraper import VideoItem, build_items_from_urls, is_x_post_url
 from ..settings import SettingsStore
-from ..utils import format_bytes, is_valid_url
+from ..utils import format_bytes, is_valid_url, redact_log_secrets
 from .about_dialog import AboutDialog
 from .icons import IconComboBox, make_icon
 from .preview_panel import PreviewPanel
 from .settings_dialog import SettingsDialog
 from .style import build_palette, build_stylesheet, get_theme
 from .video_list import VideoListWidget
-from .workers import DownloadWorker, ScrapeWorker
+from .workers import DownloadWorker, ScrapeWorker, cancel_background_worker, track_background_worker
 
 try:
     from .js_renderer import JSPageScraper, WEBENGINE_AVAILABLE
@@ -53,9 +53,10 @@ except Exception:  # noqa: BLE001
     WEBENGINE_AVAILABLE = False
 
 try:
-    from .interactive_scraper import InteractiveScrapeDialog
+    from .interactive_scraper import InteractiveScrapeDialog, WEBENGINE_AVAILABLE as INTERACTIVE_AVAILABLE
 except Exception:  # noqa: BLE001
     InteractiveScrapeDialog = None  # type: ignore[assignment]
+    INTERACTIVE_AVAILABLE = False
 
 
 DEFAULT_DOWNLOAD_DIR = (
@@ -64,10 +65,6 @@ DEFAULT_DOWNLOAD_DIR = (
     else Path.cwd() / "downloads"
 )
 MAX_ACTIVE_DOWNLOADS = 2
-DOWNLOAD_LANE_IDLE_BASE = 8
-DOWNLOAD_LANE_IDLE_MAX = 32
-DOWNLOAD_LANE_STEP = 8
-DOWNLOAD_LANE_INCREASE_SEGMENTS = 80
 DOWNLOAD_TASK_CONNECTIONS = 16
 SIDEBAR_COLLAPSED_WIDTH = 52
 LOGS_DEFAULT_HEIGHT = 140
@@ -134,10 +131,6 @@ class MainWindow(QMainWindow):
         self._download_queue: List[int] = []
         self._download_tasks: dict[int, dict] = {}
         self._next_download_id: int = 1
-        self._lane_limiter = DownloadLaneLimiter(limit=DOWNLOAD_LANE_IDLE_BASE)
-        self._download_lane_limit: int = DOWNLOAD_LANE_IDLE_BASE
-        self._download_idle_lane_limit: int = DOWNLOAD_LANE_IDLE_BASE
-        self._download_segment_successes: int = 0
         self._download_task_slots: dict[int, int] = {}
         self._download_slot_tasks: List[Optional[int]] = [
             None for _ in range(MAX_ACTIVE_DOWNLOADS)
@@ -582,7 +575,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         self.browser_scrape_action = None
-        if InteractiveScrapeDialog is not None:
+        if InteractiveScrapeDialog is not None and INTERACTIVE_AVAILABLE:
             self.browser_scrape_action = QAction("Browser scrape", self)
             self.browser_scrape_action.setToolTip("Scrape with browser (solve CAPTCHA / login)")
             self.browser_scrape_action.triggered.connect(self._start_interactive_from_toolbar)
@@ -767,7 +760,7 @@ class MainWindow(QMainWindow):
         self.collapsed_count_badge.setToolTip(f"{count} discovered videos")
 
     def log(self, message: str) -> None:
-        self.log_view.appendPlainText(message)
+        self.log_view.appendPlainText(redact_log_secrets(message))
 
     # ------------------------------------------------------------- scraping
 
@@ -820,6 +813,8 @@ class MainWindow(QMainWindow):
             self._on_scrape_failed(str(exc), url, x_auth_browser)
             return
         worker = self.scrape_worker
+        if isinstance(worker, QThread):
+            track_background_worker(worker)
         worker.log.connect(self._guard_scrape(generation, self.log))
         worker.finished_with_results.connect(self._guard_scrape(
             generation, lambda videos: self._on_scrape_done(videos, url, x_auth_browser)
@@ -827,7 +822,8 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._guard_scrape(
             generation, lambda message: self._on_scrape_failed(message, url, x_auth_browser)
         ))
-        worker.finished.connect(worker.deleteLater)
+        if not isinstance(worker, QThread):
+            worker.finished.connect(worker.deleteLater)
         worker.finished.connect(lambda: self._release_scrape_worker(worker))
         try:
             worker.start()
@@ -988,7 +984,7 @@ class MainWindow(QMainWindow):
         Returns True if the dialog was opened (caller should skip any
         further "no videos" message boxes).
         """
-        if InteractiveScrapeDialog is None or not self._current_url:
+        if InteractiveScrapeDialog is None or not INTERACTIVE_AVAILABLE or not self._current_url:
             return False
         answer = QMessageBox.question(
             self,
@@ -1025,7 +1021,7 @@ class MainWindow(QMainWindow):
         self._open_interactive_scraper(url)
 
     def _open_interactive_scraper(self, url: str) -> None:
-        if InteractiveScrapeDialog is None:
+        if InteractiveScrapeDialog is None or not INTERACTIVE_AVAILABLE:
             QMessageBox.warning(
                 self,
                 "WebEngine unavailable",
@@ -1179,7 +1175,6 @@ class MainWindow(QMainWindow):
                 task["cancel_requested"] = True
                 self._on_dl_item_state(task_id, 0, "cancelling")
 
-        self._lane_limiter.wake()
         self.log(
             f"Cancelling {active} active download(s); cleared {queued} queued task(s)"
         )
@@ -1206,7 +1201,6 @@ class MainWindow(QMainWindow):
                 task["output_dir"],
                 quality=task["quality"],
                 parallel_connections=DOWNLOAD_TASK_CONNECTIONS,
-                lane_limiter=self._lane_limiter,
                 parent=self,
                 audio_format=task.get("audio_format", "original"),
             )
@@ -1729,6 +1723,8 @@ class MainWindow(QMainWindow):
             self._close_downloads_deadline = time.monotonic() + 5.0
             self.preview_panel.shutdown()
             self.video_list.shutdown()
+            if self.scrape_worker and self.scrape_worker.isRunning():
+                cancel_background_worker(self.scrape_worker)
             self._download_queue.clear()
             for worker in list(self.download_workers.values()):
                 if worker.isRunning():
@@ -1737,10 +1733,8 @@ class MainWindow(QMainWindow):
         pending = False
         for task_id, worker in list(self.download_workers.items()):
             if worker.isRunning():
-                remaining = max(0, int((self._close_downloads_deadline - time.monotonic()) * 1000))
-                if not worker.wait(remaining):
-                    pending = True
-                    continue
+                pending = True
+                continue
             self.download_workers.pop(task_id, None)
         if pending:
             # The engine owns process-tree cancellation and cleanup. Never
@@ -1751,11 +1745,6 @@ class MainWindow(QMainWindow):
                 self._close_retry_pending = True
                 QTimer.singleShot(100, self._retry_close_after_downloads)
             return
-        if self.scrape_worker and self.scrape_worker.isRunning():
-            self.scrape_worker.requestInterruption()
-            if not self.scrape_worker.wait(3000):
-                self.scrape_worker.terminate()
-                self.scrape_worker.wait(1000)
         try:
             self.media_proxy.stop()
         except Exception:  # noqa: BLE001

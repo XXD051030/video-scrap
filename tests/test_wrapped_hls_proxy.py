@@ -273,16 +273,18 @@ class WrappedHlsProxyTests(unittest.TestCase):
         self.assertTrue(origin.wait_for(lambda: len(origin.requests_for("/segments/shared.png")) == 1))
         entered = threading.Condition()
         calls = 0
-        original = proxy._ensure_wrapped_cache
+        original = proxy._handle_entry
 
-        def record_player_entry(entry):
+        def record_player_entry(*args, **kwargs):
             nonlocal calls
             with entered:
                 calls += 1
                 entered.notify_all()
-            return original(entry)
+            # Count arrived player requests before the bounded payload slot;
+            # only admitted requests may retain a full decoded segment.
+            return original(*args, **kwargs)
 
-        with patch.object(proxy, "_ensure_wrapped_cache", side_effect=record_player_entry), ThreadPoolExecutor(max_workers=4) as clients:
+        with patch.object(proxy, "_handle_entry", side_effect=record_player_entry), ThreadPoolExecutor(max_workers=4) as clients:
             futures = [clients.submit(self.fetch, segment_url, headers={"Range": "bytes=1-8"}) for _ in range(4)]
             with entered:
                 arrived = entered.wait_for(lambda: calls == 4, timeout=3)
@@ -411,7 +413,7 @@ segment.png
         self.assertEqual(entry.hls_segment_entries, [])
         self.assertEqual(proxy._entries, {})
         self.assertEqual(proxy._token_by_entry, {})
-        self.assertEqual(list(proxy.cache_dir.iterdir()), [])
+        self.assertEqual(list(proxy.cache_dir.glob("vs_*.bin")), [])
 
     def test_closed_parent_registration_cleans_unregistered_temp_file(self) -> None:
         proxy = self.proxy()
@@ -421,7 +423,7 @@ segment.png
         )
         parent = proxy._lookup(urlparse(local).path)
         proxy.unregister(local)
-        self.assertEqual(list(proxy.cache_dir.iterdir()), [])
+        self.assertEqual(list(proxy.cache_dir.glob("vs_*.bin")), [])
         with self.assertRaisesRegex(RuntimeError, "closed"):
             proxy.register(
                 "https://media.example.test/child.png", parent=parent,
@@ -430,7 +432,7 @@ segment.png
         self.assertEqual(parent.children, [])
         self.assertEqual(proxy._entries, {})
         self.assertEqual(proxy._token_by_entry, {})
-        self.assertEqual(list(proxy.cache_dir.iterdir()), [])
+        self.assertEqual(list(proxy.cache_dir.glob("vs_*.bin")), [])
 
     def test_zero_buffer_does_not_fetch_segments_before_the_player(self) -> None:
         origin = self.origin({

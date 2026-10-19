@@ -279,10 +279,8 @@ blob.m4s
         for duration in ("NaN", "-1", "3oops", "1.2.3", ""):
             with self.subTest(duration=duration):
                 text = f"#EXTM3U\n#EXTINF:{duration},\nsegment.ts\n"
-                rewritten, segments, durations = proxy._rewrite_m3u8(text, SELECTED_URL, entry)
-                self.assertEqual(segments, [])
-                self.assertEqual(durations, [])
-                self.assertEqual(len(playlist_urls(rewritten)), 1)
+                with self.assertRaisesRegex(ValueError, "Invalid HLS segment duration"):
+                    proxy._rewrite_m3u8(text, SELECTED_URL, entry)
 
     def test_upstream_manifest_errors_are_not_returned_as_success(self):
         proxy, entry = self.proxy_entry(selected=SELECTED_URL)

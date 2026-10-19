@@ -7,7 +7,7 @@ The interface uses PyQt6, with extraction handled by yt-dlp, HTML parsing, and Q
 
 ## Current Status
 
-Current version: **0.3.3**, targeting macOS Apple Silicon and Windows x64. Windows runtime testing for this version is pending.
+Current version: **0.3.4**, targeting macOS Apple Silicon and Windows x64. Windows runtime testing for this version is pending.
 
 See [GitHub Releases](https://github.com/XXD051030/video-scrap/releases) for published packages and release notes.
 
@@ -207,17 +207,17 @@ Get-Content $report
 Successful checks return exit code `0` and set `ok` to `true` in the report.
 After the offline checks pass, use your own webpage or X links to verify real usage scenarios.
 
-### Audio Source Regression Checks
+### Source Regression Checks
 
 With the project build environment and FFmpeg installed, run:
 
 ```bash
-python tests/test_audio_downloads.py
-python tests/test_audio_download_controls.py
-python tests/test_ffmpeg_resolver.py
+python scripts/run_tests.py
+# Optional: run only selected files
+python scripts/run_tests.py tests/test_audio_downloads.py tests/test_process_ownership.py
 ```
 
-These checks cover audio output, packet preservation, HLS ranges, cancellation, cleanup, filenames, queued formats, controls, and FFmpeg discovery. Running them on macOS does not establish Windows compatibility.
+The runner isolates Qt modules and reports actual executed tests and skips in `build/test-results/`. GitHub Actions provides macOS/Windows jobs; a manual run with **package** enabled also builds and checks native bundles. Windows results remain pending until that job runs. `requirements-release-macos-arm64.txt` records exact versions from the local Python 3.12 build environment.
 
 ## Logs and Build Records
 
@@ -249,4 +249,4 @@ Third-party license texts are bundled in the `third-party/` resource directory.
 - Some yt-dlp sources provide streams that cannot be previewed directly in Qt, although downloading may still work.
 - A long pause may outlive the source's network session or signed link. Resume can then fail and require a new download; progress is not restored after closing the app.
 - The current HLS implementation does not support some combinations of initialization segments and byte ranges, or special encrypted range formats. It reports an error rather than continuing when it cannot handle them safely.
-- Earlier Windows builds were tested for startup, playback, and downloads; automated Windows regression and smoke-test reports have not been collected for 0.3.3.
+- Earlier Windows builds were tested for startup, playback, and downloads; automated Windows regression and smoke-test reports have not been collected for 0.3.4.

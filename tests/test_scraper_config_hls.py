@@ -11,6 +11,8 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from http_fixtures import html_response
+
 from src.scraper import VideoScraper, _extract_config_hls, _is_preview_teaser
 
 
@@ -53,8 +55,8 @@ def test_is_preview_teaser() -> None:
 
 def test_scrape_html_drops_preview_and_surfaces_hls() -> None:
     # Exercise the public scrape path while keeping both network layers local.
-    response = Mock(text=SAMPLE_HTML, url=PAGE)
-    with patch("src.scraper.requests.get", return_value=response), patch.object(
+    response = html_response(text=SAMPLE_HTML, url=PAGE)
+    with patch("src.scraper.ScopedCookieSession.get", return_value=response), patch.object(
         VideoScraper, "_scrape_with_ytdlp", return_value=[]
     ):
         items = VideoScraper().scrape(PAGE)

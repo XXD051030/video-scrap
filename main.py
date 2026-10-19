@@ -38,6 +38,8 @@ def main() -> int:
     window = None
     try:
         window = MainWindow()
+        from src.temp_ownership import schedule_stale_cleanup
+        schedule_stale_cleanup(window.output_dir, ".video-scrap-job-")
         atexit.register(_safe_stop_proxy, window)
         instance.activation_requested.connect(lambda: _activate_window(window))
         window.show()
@@ -96,6 +98,8 @@ def _finish_download_shutdown(window: MainWindow, app) -> None:
         app.processEvents()
     app.processEvents()
     window.close()
+    from src.gui.workers import finish_background_workers
+    finish_background_workers(app)
 
 
 if __name__ == "__main__":

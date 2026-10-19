@@ -52,6 +52,10 @@ _COMMENT_OR_STRING_RE = re.compile(
     rf"{_STRING_LITERAL}|//[^\n]*|/\*.*?\*/", re.DOTALL
 )
 _MEDIA_EXT_RE = re.compile(r"\.(mp4|webm|m3u8|mov|m4v|mkv|mpd)(?:\?|$)", re.IGNORECASE)
+MAX_DECODER_CHARS = 2 * 1024 * 1024
+MAX_DECLARATIONS = 4096
+MAX_ARRAY_ELEMENTS = 8192
+MAX_CANDIDATE_CHARS = 64 * 1024
 
 
 def _try_parse_string_array(literal: str) -> List[str] | None:
@@ -85,47 +89,34 @@ class _ArrayPair:
 
 def _candidate_pairs(html: str) -> List[_ArrayPair]:
     """Find adjacent compatible arrays belonging to the same script block."""
-    string_arrays = []
-    for m in _STRING_ARRAY_RE.finditer(html):
-        parsed = _try_parse_string_array(m.group(2))
-        if parsed:
-            string_arrays.append((parsed, m.group(1), m.start(), m.end()))
-
-    int_arrays = []
-    for m in _INT_ARRAY_RE.finditer(html):
-        parsed = _try_parse_int_array(m.group(2))
-        if parsed:
-            int_arrays.append((parsed, m.group(1), m.start(), m.end()))
-
+    declarations = []
+    for kind, pattern, parse in (("strings", _STRING_ARRAY_RE, _try_parse_string_array),
+                                 ("ints", _INT_ARRAY_RE, _try_parse_int_array)):
+        for match in pattern.finditer(html):
+            if len(declarations) >= MAX_DECLARATIONS:
+                return []
+            value = parse(match.group(2))
+            if value and len(value) <= MAX_ARRAY_ELEMENTS:
+                declarations.append((match.start(), match.end(), kind, match.group(1), value))
+    declarations.sort(key=lambda entry: entry[0])
     pairs: List[_ArrayPair] = []
-    for strings, strings_name, s_pos, s_end in string_arrays:
-        # Independent scripts/blocks often reuse equally sized arrays. Pair
-        # adjacent declarations, preferring a following index array, rather
-        # than applying one block's transforms to another block's fragments.
-        script_start = html.rfind("<script", 0, s_pos)
-        script_end = html.find("</script", s_pos)
-        script_end = script_end if script_end >= 0 else len(html)
-        next_string = min(
-            (position for _, _, position, _ in string_arrays if position > s_pos),
-            default=script_end,
-        )
-        following = [position for _, _, position, _ in int_arrays if s_pos < position < min(next_string, script_end)]
-        for ints, indices_name, i_pos, i_end in int_arrays:
-            if len(strings) != len(ints):
-                continue
-            if abs(i_pos - s_pos) > 4000:
-                continue
-            if not script_start < i_pos < script_end:
-                continue
-            if following and i_pos != min(following):
+    for index, (s_pos, s_end, kind, strings_name, strings) in enumerate(declarations):
+        if kind != "strings":
+            continue
+        # Only adjacent declarations can form a pair. This replaces repeated
+        # whole-document scans with a sorted, bounded neighbor lookup.
+        neighbors = declarations[index + 1:index + 2] + declarations[max(0, index - 1):index]
+        for i_pos, i_end, i_kind, indices_name, ints in neighbors:
+            if i_kind != "ints" or len(strings) != len(ints) or abs(i_pos - s_pos) > 4000:
                 continue
             low, high = sorted((s_pos, i_pos))
-            if any(low < position < high for _, _, position, _ in string_arrays + int_arrays):
+            if re.search(r"</?script\b", html[low:high], re.IGNORECASE):
                 continue
             n = len(ints)
             if sorted(ints) != list(range(n)):
                 continue
             pairs.append(_ArrayPair(strings, ints, strings_name, indices_name, max(s_end, i_end)))
+            break
     return pairs
 
 
@@ -270,6 +261,8 @@ def _decode_pipeline(html: str, pair: _ArrayPair, joined: str) -> str | None:
 
 def decode_obfuscated_urls(html: str) -> List[str]:
     """Return any media URLs that can be recovered from JS-array obfuscation."""
+    if len(html) > MAX_DECODER_CHARS:
+        return []  # Browser fallback can handle scripts outside this budget.
     out: List[str] = []
     for pair in _candidate_pairs(html):
         strings, ints = pair.strings, pair.indices
@@ -282,6 +275,8 @@ def decode_obfuscated_urls(html: str) -> List[str]:
         try:
             joined = "".join(strings[positions[i]] for i in range(n))
         except KeyError:
+            continue
+        if len(joined) > MAX_CANDIDATE_CHARS:
             continue
         candidate = _decode_pipeline(html, pair, joined)
         if candidate and candidate.lower().startswith(("http://", "https://")) and _MEDIA_EXT_RE.search(candidate):

@@ -91,7 +91,9 @@ def test_x_scrape_uses_only_ytdlp_and_keeps_real_playlist_indices() -> None:
     assert [item.url for item in items] == [POST, POST]
     assert len({item.title for item in items}) == 2
     assert items[0].raw is first
-    assert items[0].formats is first["formats"]
+    # The model now normalizes untrusted dimensions in a private copy.
+    assert items[0].formats == first["formats"]
+    assert items[0].formats is not first["formats"]
     assert items[0].formats[0]["http_headers"] == {"Referer": "https://x.com/"}
     assert "cookiesfrombrowser" not in youtube_dl.call_args.args[0]
 

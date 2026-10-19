@@ -270,7 +270,11 @@ class DownloadNameReservationTests(unittest.TestCase):
         stack.enter_context(
             mock.patch.object(downloader, "_parse_hls_segments", return_value=segments)
         )
-        stack.enter_context(mock.patch.object(downloader, "_download_hls_segment", side_effect=fetch))
+        def stream_to_file(segment, headers, *, destination):
+            data = fetch(segment, headers)
+            destination.write_bytes(data)
+            return len(data)
+        stack.enter_context(mock.patch.object(downloader, "_download_hls_segment", side_effect=stream_to_file))
         stack.enter_context(mock.patch.object(downloader, "_remux_hls_segments", side_effect=remux))
 
     def test_hls_partial_and_complete_names_do_not_collide_with_derived_title(self) -> None:

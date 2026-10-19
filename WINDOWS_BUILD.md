@@ -97,5 +97,6 @@ Get-Content .\build\windows\build.log -Tail 80
 ```
 
 将日志末尾、离线检查报告或启动报错截图提供出来，可以据此排查。
-当前 Windows 脚本已完成语法和配置检查，但尚未在 Windows 上实际打包或运行验证。
+早期 Windows 版本已由用户验证启动、播放和下载；本轮源码修复尚未取得新的 Windows 原生验证报告。不要将早期结果视为当前版本通过。
+源码回归可运行 `python scripts/run_tests.py`。GitHub Actions 已配置 Windows/macOS 检查，手动触发并勾选 `package` 可额外构建和验证成品；任务运行前仍属于待验证。
 应用尚未配置 Windows 代码签名。

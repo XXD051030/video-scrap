@@ -14,9 +14,11 @@ Range support.
 from __future__ import annotations
 
 import errno
+import ctypes
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +29,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import requests
 
 from .browser_cookies import build_scoped_session as build_session
+from .http_limits import resource_identity_url
 
 
 @dataclass
@@ -39,6 +42,7 @@ class ParallelDownloadResult:
     path: Path
     size: int
     elapsed: float
+    content_type: str = ""
 
 
 ProgressFn = Callable[[int, int, float], None]
@@ -77,38 +81,47 @@ def _publish_unique(part_path: Path, output_path: Path) -> Path:
         except FileExistsError:
             index += 1
         except OSError:
-            # Some removable and network filesystems do not support hard
-            # links. Reserve the name exclusively, then atomically replace
-            # only our own placeholder with the completed temporary file.
+            # Never replace a placeholder: its pathname can be exchanged by
+            # another process before replace(). Use an OS no-replace rename.
             try:
-                fd = os.open(
-                    str(candidate), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-                )
+                _rename_without_replacement(part_path, candidate)
             except FileExistsError:
                 index += 1
                 continue
-            reserved = None
-            try:
-                reserved = os.fstat(fd)
-                os.close(fd)
-                os.replace(part_path, candidate)
-            except OSError:
-                if reserved is None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-                try:
-                    current = candidate.stat()
-                    if reserved is None or (current.st_dev, current.st_ino) == (
-                        reserved.st_dev,
-                        reserved.st_ino,
-                    ):
-                        candidate.unlink()
-                except OSError:
-                    pass
-                raise
             return candidate
+
+
+def _rename_without_replacement(source: Path, destination: Path) -> None:
+    """Atomic no-clobber publication, or fail safely on unsupported systems."""
+    if sys.platform == "win32":
+        # Python's Windows rename uses MoveFileEx without REPLACE_EXISTING.
+        os.rename(source, destination)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = getattr(libc, "renamex_np", None)
+        if rename is None:
+            raise OSError(errno.ENOTSUP, "Atomic no-replace rename is unavailable")
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        result = rename(os.fsencode(source), os.fsencode(destination), 0x00000004)
+    elif sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        if rename is None:
+            raise OSError(errno.ENOTSUP, "Atomic no-replace rename is unavailable")
+        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                           ctypes.c_char_p, ctypes.c_uint]
+        result = rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    else:
+        raise OSError(errno.ENOTSUP, "Atomic no-replace rename is unavailable")
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
+
+
+def _strong_etag(headers: Dict[str, str]) -> Optional[str]:
+    value = headers.get("ETag", "").strip()
+    # RFC entity tags are quoted and a weak validator cannot bind ranges.
+    return value if re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]*"', value) else None
 
 
 def _open_unique_part(directory: Path) -> Tuple[int, Path]:
@@ -143,6 +156,8 @@ class ParallelDownloader:
         self.lane_limiter = lane_limiter
         self._cancel = threading.Event()
         self._session = build_session(pool=max(self.connections, 8))
+        self._entity_tag: Optional[str] = None
+        self._entity_url: Optional[str] = None
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -183,6 +198,7 @@ class ParallelDownloader:
         start_ts = time.monotonic()
         last_report = [start_ts]
         report_lock = threading.Lock()
+        content_type = [""]
 
         def write_chunk(chunk: bytes, offset: int) -> None:
             if pwrite is not None:
@@ -217,10 +233,12 @@ class ParallelDownloader:
             progress(done, size, done / elapsed)
 
         def worker(idx: int, span: Tuple[int, int]) -> None:
+            nonlocal size
             start, end = span
             req_headers = dict(headers)
             if accept_ranges and size > 0:
                 req_headers["Range"] = f"bytes={start}-{end}"
+                req_headers["If-Match"] = self._entity_tag
             acquired = False
             try:
                 if self.lane_limiter is not None:
@@ -233,6 +251,7 @@ class ParallelDownloader:
                     timeout=self.timeout,
                 ) as resp:
                     resp.raise_for_status()
+                    content_type[0] = resp.headers.get("Content-Type", "")
                     response_length = resp.headers.get("Content-Length")
                     if response_length is not None:
                         try:
@@ -243,6 +262,10 @@ class ParallelDownloader:
                             raise RuntimeError("Invalid response length")
 
                     if accept_ranges and size > 0:
+                        if resource_identity_url(resp, url) != self._entity_url:
+                            raise RuntimeError("Range resource URL changed during download")
+                        if _strong_etag(resp.headers) != self._entity_tag:
+                            raise RuntimeError("Range resource version changed during download")
                         expected_length = end - start + 1
                         actual_range = _parse_content_range(
                             resp.headers.get("Content-Range", "")
@@ -265,6 +288,11 @@ class ParallelDownloader:
                                 f"Single-stream response was HTTP {resp.status_code}, not 200"
                             )
                         expected_length = size if size > 0 else response_length
+                        # The full response is authoritative even when a
+                        # missing validator disabled ranges and probe length.
+                        # Keep progress determinate for ordinary CDN downloads.
+                        if response_length is not None:
+                            size = response_length
 
                     if (
                         response_length is not None
@@ -367,7 +395,8 @@ class ParallelDownloader:
         if progress is not None:
             progress(final_size, final_size, final_size / max(elapsed, 1e-3))
         return ParallelDownloadResult(
-            path=published_path, size=final_size, elapsed=elapsed
+            path=published_path, size=final_size, elapsed=elapsed,
+            content_type=content_type[0],
         )
 
     def _probe(
@@ -376,15 +405,17 @@ class ParallelDownloader:
         # HEAD is only advisory: confirm Range support with an actual GET.
         size = 0
         accept_ranges = False
+        self._entity_tag = None
+        self._entity_url = None
         try:
-            resp = self._session.head(
+            with self._session.head(
                 url, headers=headers, allow_redirects=True, timeout=self.timeout
-            )
-            if resp.ok:
-                size = int(resp.headers.get("Content-Length") or 0)
-                accept_ranges = (
-                    resp.headers.get("Accept-Ranges", "").lower() == "bytes"
-                )
+            ) as resp:
+                if resp.ok:
+                    size = int(resp.headers.get("Content-Length") or 0)
+                    accept_ranges = (
+                        resp.headers.get("Accept-Ranges", "").lower() == "bytes"
+                    )
         except Exception:  # noqa: BLE001
             pass
 
@@ -417,6 +448,11 @@ class ParallelDownloader:
                     )
                     if accept_ranges and reported_range is not None:
                         size = reported_range[2]
+                        self._entity_tag = _strong_etag(resp.headers)
+                        self._entity_url = resource_identity_url(resp, url)
+                        # A response length/Last-Modified date alone cannot
+                        # prove multiple requests belong to the same entity.
+                        accept_ranges = self._entity_tag is not None
                 else:
                     accept_ranges = False
         except Exception:  # noqa: BLE001

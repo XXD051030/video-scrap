@@ -1,0 +1,61 @@
+name: Native regression checks
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Build and smoke-test native application bundles
+        type: boolean
+        default: false
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-build.txt
+      - name: Run isolated offline regressions
+        run: python scripts/run_tests.py --output build/ci-tests --timeout 180
+      - name: Check source application
+        run: python main.py --smoke-test build/ci-source-smoke.json
+      - name: Save actual environment
+        if: always()
+        run: python -m pip freeze > build/ci-requirements.txt
+      - name: Build macOS application
+        if: github.event_name == 'workflow_dispatch' && inputs.package && runner.os == 'macOS'
+        run: python scripts/build_macos.py
+      - name: Check packaged macOS application
+        if: github.event_name == 'workflow_dispatch' && inputs.package && runner.os == 'macOS'
+        run: '"dist/Video Scraper.app/Contents/MacOS/Video Scraper" --smoke-test build/ci-package-smoke.json'
+      - name: Build Windows application
+        if: github.event_name == 'workflow_dispatch' && inputs.package && runner.os == 'Windows'
+        run: python scripts/build_windows.py
+      - name: Check packaged Windows application
+        if: github.event_name == 'workflow_dispatch' && inputs.package && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $task = Start-Process -FilePath 'dist/Video Scraper/Video Scraper.exe' -ArgumentList '--smoke-test', 'build/ci-package-smoke.json' -Wait -PassThru
+          if ($task.ExitCode -ne 0) { exit $task.ExitCode }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checks-${{ matrix.os }}
+          path: |
+            build/ci-tests
+            build/ci-source-smoke.json
+            build/ci-package-smoke.json
+            dist/build-info*.json
+            build/ci-requirements.txt

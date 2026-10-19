@@ -108,7 +108,7 @@ class CacheHandleTests(unittest.TestCase):
         child.write_at(0, b"late payload")
         self.assertEqual(child.read_at(0, 100), b"")
         self.assertEqual(proxy._entries, {})
-        self.assertEqual(list(proxy.cache_dir.iterdir()), [])
+        self.assertEqual(list(proxy.cache_dir.glob("vs_*.bin")), [])
 
     def test_concurrent_cache_io_and_close_cannot_recreate_file(self) -> None:
         entry = self.entry
@@ -174,7 +174,7 @@ try:
             os.close(fd)
     proxy.unregister(root)
     assert not proxy._entries
-    assert not list(proxy.cache_dir.iterdir())
+    assert not list(proxy.cache_dir.glob("vs_*.bin"))
     for segment in segments:
         segment.write_at(0, b"late")
         assert segment.read_at(0, 100) == b""

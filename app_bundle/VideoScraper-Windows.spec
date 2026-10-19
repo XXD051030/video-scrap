@@ -9,6 +9,8 @@ from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 if sys.platform != "win32":
     raise SystemExit("Build the Windows application on Windows.")
 project = Path(SPECPATH).parent
+sys.path.insert(0, str(project))
+from scripts.windows_version import write_version_resource
 assets = project / "build" / "windows-app-assets"
 ffmpeg = assets / "bin" / "ffmpeg.exe"
 icon = assets / "VideoScraper.ico"
@@ -44,6 +46,7 @@ exe = EXE(
     exclude_binaries=True,
     name="Video Scraper",
     icon=str(icon),
+    version=str(write_version_resource(project, assets / "version-info.txt")),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

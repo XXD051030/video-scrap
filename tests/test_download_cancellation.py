@@ -257,7 +257,10 @@ class DownloadCancellationTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(
             downloader, "_parse_hls_segments", return_value=[
                 _HlsSegment(0, "https://example.test/0.ts", 1, None, None)]))
-        stack.enter_context(mock.patch.object(downloader, "_download_hls_segment", return_value=PAYLOAD))
+        def fetch(_segment, _headers, *, destination):
+            destination.write_bytes(PAYLOAD)
+            return len(PAYLOAD)
+        stack.enter_context(mock.patch.object(downloader, "_download_hls_segment", side_effect=fetch))
         return stack.enter_context(mock.patch.object(downloader, "_remux_hls_segments", side_effect=remux))
 
     def test_hls_cancel_before_merge_never_creates_process_or_falls_back(self):

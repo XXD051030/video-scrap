@@ -23,6 +23,7 @@ from pathlib import Path
 import time
 from typing import Callable, List, Optional, Set
 from urllib.parse import urlparse
+from ..utils import redact_log_secrets
 
 from PyQt6.QtCore import QCoreApplication, QObject, QUrl, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -297,7 +298,7 @@ class InteractiveScrapeDialog(QDialog):
         if url in self._captured_media:
             return
         self._captured_media.add(url)
-        self.log.emit(f"[interactive] media request: {url}")
+        self.log.emit(redact_log_secrets(f"[interactive] media request: {url}"))
         self._refresh_status()
 
     def _on_url_changed(self, qurl: QUrl) -> None:

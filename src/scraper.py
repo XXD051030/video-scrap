@@ -19,7 +19,9 @@ import base64
 import copy
 import html as html_module
 import json
+import math
 import re
+import threading
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
 from typing import Callable, Dict, List, Optional, Tuple
@@ -30,6 +32,21 @@ import yt_dlp
 from bs4 import BeautifulSoup
 
 from .js_decoder import decode_obfuscated_urls
+from .http_limits import read_limited_response
+from .browser_cookies import ScopedCookieSession, build_scoped_session
+
+HTML_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _finite_number(value, *, integer=False):
+    """Extractor metadata is untrusted; unknown sizes must remain unknown."""
+    try:
+        number = float(value)
+        if not math.isfinite(number) or number <= 0:
+            return None
+        return int(number) if integer else number
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 HLS_EXTS = {"m3u8"}
@@ -286,7 +303,14 @@ def _extract_next_data_ev_hls(html: str) -> Optional[Tuple[str, Optional[str]]]:
         data = json.loads(m.group(1))
     except Exception:  # noqa: BLE001
         return None
-    page_props = (data.get("props") or {}).get("pageProps") or {}
+    if not isinstance(data, dict):
+        return None
+    props = data.get("props")
+    if not isinstance(props, dict):
+        return None
+    page_props = props.get("pageProps")
+    if not isinstance(page_props, dict):
+        return None
     ev = page_props.get("ev")
     if not isinstance(ev, dict):
         return None
@@ -301,7 +325,8 @@ def _extract_next_data_ev_hls(html: str) -> Optional[Tuple[str, Optional[str]]]:
     )
     if not video_url:
         return None
-    video = page_props.get("video") or {}
+    video = page_props.get("video")
+    video = video if isinstance(video, dict) else {}
     title = video.get("nameZh") or video.get("name")
     return video_url, (title if isinstance(title, str) else None)
 
@@ -426,6 +451,21 @@ class VideoItem:
     # Never turn this into a global Cookie header shared across media hosts.
     browser_cookies: List[Dict] = field(default_factory=list, repr=False)
 
+    def __post_init__(self) -> None:
+        self.width = _finite_number(self.width, integer=True)
+        self.height = _finite_number(self.height, integer=True)
+        self.duration = _finite_number(self.duration)
+        formats = []
+        for entry in self.formats if isinstance(self.formats, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            entry = dict(entry)
+            for name in ("width", "height", "fps", "tbr", "abr", "vbr", "filesize", "filesize_approx"):
+                if name in entry:
+                    entry[name] = _finite_number(entry[name], integer=name in {"width", "height", "filesize", "filesize_approx"})
+            formats.append(entry)
+        self.formats = formats
+
     @property
     def resolution(self) -> str:
         if self.width and self.height:
@@ -456,15 +496,33 @@ class VideoScraper:
 
     def __init__(self, timeout: int = 20) -> None:
         self.timeout = timeout
+        self._cancel_event = None
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise InterruptedError("Scraping cancelled")
 
     def scrape(
         self,
         url: str,
         progress: Optional[ProgressCallback] = None,
         x_auth_browser: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> List[VideoItem]:
         url = url.strip()
-        log = progress or (lambda _msg: None)
+        self._cancel_event = cancel_event
+        def log(message):
+            self._check_cancelled()
+            if progress is not None:
+                progress(message)
+        self._check_cancelled()
+
+        # A pasted media URL is already discovered. Never read its body as a
+        # web page, or ask a generic extractor to scan the complete video.
+        if _ext_of(url) in {"mp4", "webm", "mov", "m4v", "mkv", "m3u8", "mpd"}:
+            direct = build_items_from_urls([url], [], url, urlparse(url).path.rsplit("/", 1)[-1])
+            log(f"Found {len(direct)} direct media URL(s).")
+            return direct
 
         if is_x_post_url(url):
             return self._scrape_x_with_ytdlp(url, log, x_auth_browser)
@@ -612,13 +670,17 @@ class VideoScraper:
             streamed_player = False
             try:
                 ev_hls = _extract_next_data_ev_hls(html_text)
-                if not ev_hls:
+            except Exception as exc:  # noqa: BLE001
+                log(f"Next.js extractor failed: {exc}")
+                ev_hls = None
+            if not ev_hls:
+                try:
                     streamed_url = _extract_tanstack_ev_hls(html_text, base_url)
                     ev_hls = (streamed_url, None) if streamed_url else None
                     streamed_player = bool(streamed_url)
-            except Exception as exc:  # noqa: BLE001
-                log(f"Encrypted-config extractor failed: {exc}")
-                ev_hls = None
+                except Exception as exc:  # noqa: BLE001
+                    log(f"TanStack extractor failed: {exc}")
+                    ev_hls = None
             if ev_hls:
                 ev_url, ev_title = ev_hls
                 seen_urls.add(ev_url)
@@ -657,11 +719,12 @@ class VideoScraper:
         x_auth_browser: Optional[str],
     ) -> List[VideoItem]:
         """Extract each X post video once, keeping its playlist identity."""
+        check_cancelled = self._check_cancelled
         class _SilentLogger:
-            def debug(self, _msg: str) -> None: ...
-            def info(self, _msg: str) -> None: ...
-            def warning(self, _msg: str) -> None: ...
-            def error(self, _msg: str) -> None: ...
+            def debug(self, _msg: str) -> None: check_cancelled()
+            def info(self, _msg: str) -> None: check_cancelled()
+            def warning(self, _msg: str) -> None: check_cancelled()
+            def error(self, _msg: str) -> None: check_cancelled()
 
         ydl_opts = {
             "quiet": True,
@@ -671,6 +734,7 @@ class VideoScraper:
             "noplaylist": False,
             "ignoreerrors": False,
             "logger": _SilentLogger(),
+            "socket_timeout": self.timeout,
         }
         if x_auth_browser:
             ydl_opts["cookiesfrombrowser"] = (x_auth_browser,)
@@ -778,11 +842,12 @@ class VideoScraper:
         url: str,
         log: ProgressCallback,
     ) -> List[VideoItem]:
+        check_cancelled = self._check_cancelled
         class _SilentLogger:
-            def debug(self, _msg: str) -> None: ...
-            def info(self, _msg: str) -> None: ...
-            def warning(self, _msg: str) -> None: ...
-            def error(self, _msg: str) -> None: ...
+            def debug(self, _msg: str) -> None: check_cancelled()
+            def info(self, _msg: str) -> None: check_cancelled()
+            def warning(self, _msg: str) -> None: check_cancelled()
+            def error(self, _msg: str) -> None: check_cancelled()
 
         ydl_opts = {
             "quiet": True,
@@ -792,6 +857,7 @@ class VideoScraper:
             "noplaylist": False,
             "ignoreerrors": True,
             "logger": _SilentLogger(),
+            "socket_timeout": self.timeout,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -807,10 +873,13 @@ class VideoScraper:
 
         items: List[VideoItem] = []
         for entry in entries:
+            self._check_cancelled()
+            if not isinstance(entry, dict):
+                continue
             format_urls = [
                 fmt.get("url")
                 for fmt in (entry.get("formats") or [])
-                if fmt.get("url")
+                if isinstance(fmt, dict) and fmt.get("url")
             ]
             if format_urls and all(
                 _is_known_player_placeholder(link) for link in format_urls
@@ -847,9 +916,43 @@ class VideoScraper:
         url: str,
         log: ProgressCallback,
     ) -> _HtmlScanResult:
-        resp = requests.get(url, headers=HTTP_HEADERS, timeout=self.timeout)
-        resp.raise_for_status()
-        html = resp.text
+        self._check_cancelled()
+        session = build_scoped_session(pool=4)
+        stopped = threading.Event()
+        response_holder = []
+        def cancel_request():
+            while not stopped.wait(.05):
+                if self._cancel_event is not None and self._cancel_event.is_set():
+                    from .http_limits import abort_response
+                    for response in response_holder:
+                        abort_response(response)
+                    session.close()
+                    return
+        watcher = threading.Thread(target=cancel_request, name="ScrapeCancellation", daemon=True)
+        watcher.start()
+        resp = None
+        try:
+            resp = session.get(url, headers=HTTP_HEADERS, timeout=(min(10, self.timeout), min(5, self.timeout)), stream=True)
+            response_holder.append(resp)
+            resp.raise_for_status()
+            document_url = resp.url if isinstance(resp.url, str) else url
+            content_type = str((getattr(resp, "headers", {}) or {}).get("Content-Type", "")).split(";", 1)[0].lower()
+            if content_type.startswith(("video/", "audio/")) or content_type in {"application/vnd.apple.mpegurl", "application/x-mpegurl", "application/dash+xml"}:
+                items = build_items_from_urls([document_url], [], url, urlparse(document_url).path.rsplit("/", 1)[-1])
+                if items and content_type in {"application/vnd.apple.mpegurl", "application/x-mpegurl"}:
+                    items[0].is_hls, items[0].ext = True, "m3u8"
+                if items and content_type == "application/dash+xml":
+                    items[0].is_dash, items[0].ext = True, "mpd"
+                return _HtmlScanResult(items, [], "", url, None, document_url, document_url)
+            body = read_limited_response(resp, HTML_MAX_BYTES, self.timeout, lambda: self._cancel_event is not None and self._cancel_event.is_set())
+            if b"\x00" in body[:1024] or (content_type and content_type not in {"text/html", "application/xhtml+xml", "text/plain", "application/octet-stream"}):
+                raise ValueError("The response is not an HTML page")
+            html = body.decode(getattr(resp, "encoding", None) or "utf-8", errors="replace")
+        finally:
+            stopped.set()
+            if resp is not None:
+                resp.close()
+            session.close()
         # requests follows redirects. Relative resources belong to the final
         # document; <base> affects URL resolution, never the HTTP Referer.
         document_url = resp.url if isinstance(resp.url, str) else url

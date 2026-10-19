@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import mimetypes
 import re
-import shutil
 import struct
 import subprocess
 import sys
@@ -17,6 +16,21 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+
+
+def _resolve_smoke_ffmpeg() -> str:
+    """Share source discovery, but require bundle provenance when frozen."""
+    from src.ffmpeg import resolve_ffmpeg
+
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg was not found by the application resolver")
+    if getattr(sys, "frozen", False):
+        bundle = getattr(sys, "_MEIPASS", None)
+        name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+        if not bundle or Path(ffmpeg).resolve() != (Path(bundle) / "bin" / name).resolve():
+            raise RuntimeError("Frozen smoke test requires FFmpeg from the application bundle")
+    return ffmpeg
 
 
 def run_smoke_test(report_path: str) -> int:
@@ -82,6 +96,12 @@ def _run_smoke_test(report_path: str) -> int:
             report["checks"][name] = {
                 "ok": False, "traceback": traceback.format_exc()
             }
+            if window is not None:
+                from src.utils import redact_log_secrets
+                report["checks"][name]["recent_app_log"] = redact_log_secrets(
+                    "\n".join(window.log_view.toPlainText().splitlines()[-40:])
+                )
+            report["checks"][name]["recent_local_requests"] = requests_seen[-40:]
             raise
 
     def wait_until(predicate, message: str, timeout: int = 15000):
@@ -170,10 +190,7 @@ def _run_smoke_test(report_path: str) -> int:
 
     try:
         def dependencies():
-            ffmpeg = shutil.which("ffmpeg")
-            if not ffmpeg:
-                raise RuntimeError("Bundled ffmpeg is missing from PATH")
-            report["ffmpeg"] = ffmpeg
+            report["ffmpeg"] = _resolve_smoke_ffmpeg()
             extractor = yt_dlp.extractor.get_info_extractor("Twitter")
             assert extractor is not None
             assert extractor().ie_key() == "Twitter"

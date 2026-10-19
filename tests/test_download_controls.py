@@ -385,19 +385,17 @@ def test_cancelled_or_silent_exit_never_becomes_complete_at_one_hundred():
         assert window.progress_bar.format() == "Idle"
 
 
-def test_close_requests_plain_cancel_with_total_wait_budget_and_no_terminate():
+def test_close_requests_cancel_without_waiting_or_terminating_gui_threads():
     with _window() as window:
         a, b = _enqueue(window)
         a.running = b.running = True
         a.wait_result = b.wait_result = False
         event = QCloseEvent()
-        # Exhaust the shared deadline while the fake first worker is waiting.
-        with mock.patch.object(main_window.time, "monotonic", side_effect=[10.0, 10.1, 15.1]):
-            window.closeEvent(event)
+        window.closeEvent(event)
         assert not event.isAccepted()
         assert a.calls[:2] == [("cancel", False), "interrupt"]
         assert b.calls[:2] == [("cancel", False), "interrupt"]
-        assert 0 <= a.calls[2][1] <= 5000 and b.calls[2] == ("wait", 0)
+        assert a.calls == b.calls == [("cancel", False), "interrupt"]
         assert window._closing and window._close_retry_pending
         a.running = b.running = False
         window._retry_close_after_downloads()

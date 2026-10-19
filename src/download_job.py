@@ -8,6 +8,7 @@ Only the supervising parent publishes a successful result to the output folder.
 from __future__ import annotations
 
 from dataclasses import asdict
+from collections import deque
 import json
 import multiprocessing
 from multiprocessing.connection import Connection
@@ -27,6 +28,8 @@ import psutil
 from .downloader import DownloadLaneLimiter, DownloadProgress, VideoDownloader
 from .parallel_downloader import _publish_unique
 from .scraper import VideoItem
+from .process_owner import ProcessOwner
+from .temp_ownership import create_owned_tempdir, add_temp_owner
 
 
 class DownloadCancelled(RuntimeError):
@@ -69,8 +72,20 @@ def _download_child(
     quality: str,
     audio_format: str,
     parallel_connections: int,
+    owner_ready=None,
+    owner_release=None,
+    owner_pgid=None,
 ) -> None:
     """Spawn target; imported normally by Python and the frozen executable."""
+    if owner_ready is not None:
+        if sys.platform != "win32":
+            if owner_pgid is None:
+                raise RuntimeError("Download worker is missing its private group owner")
+            os.setpgid(0, owner_pgid)
+        owner_ready.set()
+        if not owner_release.wait(30):
+            connection.close()
+            return
     root = Path(work_dir)
     temporary = root / "temporary"
     temporary.mkdir(exist_ok=True)
@@ -137,6 +152,7 @@ class _ProcessTree:
         self.root = psutil.Process(pid)
         self.known: dict[int, psutil.Process] = {pid: self.root}
         self.suspended: dict[int, psutil.Process] = {}
+        self.owner = None
 
     @staticmethod
     def alive(process: psutil.Process) -> bool:
@@ -231,6 +247,10 @@ class _ProcessTree:
 
     def terminate(self) -> None:
         """Kill paused workers too, and wait only in the supervising thread."""
+        owner = getattr(self, "owner", None)
+        if owner is not None:
+            # Includes descendants whose parent exited before discover().
+            owner.terminate()
         try:
             self.suspend()
         except (psutil.Error, RuntimeError):
@@ -303,6 +323,8 @@ class DownloadJob:
         self._want_paused = False
         self._running = False
         self._state = "starting"
+        self._state_events = deque()
+        self._dispatching_state = False
         self._process: Optional[multiprocessing.Process] = None
         self._pid: Optional[int] = None
 
@@ -321,8 +343,29 @@ class DownloadJob:
             return self._pid
 
     def _emit_state(self, state: str) -> None:
-        if self.on_state is not None:
-            self.on_state(state)
+        # Events are enqueued while the state lock is held. A single caller
+        # drains them outside the lock, including reentrant control requests.
+        with self._lock:
+            if self._dispatching_state:
+                return
+            self._dispatching_state = True
+        try:
+            while True:
+                with self._lock:
+                    if not self._state_events:
+                        self._dispatching_state = False
+                        return
+                    event = self._state_events.popleft()
+                if self.on_state is not None:
+                    self.on_state(event)
+        except BaseException:
+            with self._lock:
+                self._dispatching_state = False
+            raise
+
+    def _set_state_locked(self, state: str) -> None:
+        self._state = state
+        self._state_events.append(state)
 
     def _state_to(self, state: str) -> bool:
         with self._lock:
@@ -336,7 +379,7 @@ class DownloadJob:
                 return False
             if self._state == state:
                 return False
-            self._state = state
+            self._set_state_locked(state)
         self._emit_state(state)
         return True
 
@@ -347,7 +390,7 @@ class DownloadJob:
             if self._want_paused:
                 return True
             self._want_paused = True
-            self._state = "pausing"
+            self._set_state_locked("pausing")
         self._wake.set()
         self._emit_state("pausing")
         return True
@@ -359,7 +402,7 @@ class DownloadJob:
             if not self._want_paused:
                 return False
             self._want_paused = False
-            self._state = "resuming"
+            self._set_state_locked("resuming")
         self._wake.set()
         self._emit_state("resuming")
         return True
@@ -371,7 +414,7 @@ class DownloadJob:
             if self._cancelled:
                 return True
             self._cancelled = True
-            self._state = "cancelling"
+            self._set_state_locked("cancelling")
         self._wake.set()
         self._emit_state("cancelling")
         return True
@@ -407,6 +450,7 @@ class DownloadJob:
 
     def _cleanup(
         self, *, process, tree, receiver, reader, work_dir, published, completed,
+        owner=None,
     ) -> None:
         """Attempt every cleanup step; never remove a live worker's files.
 
@@ -423,6 +467,7 @@ class DownloadJob:
                 errors.append(f"{description}: {type(exc).__name__}: {exc}")
                 return None
 
+        container = getattr(tree, "owner", None) if tree is not None else owner
         if tree is not None:
             attempt("terminate process tree", tree.terminate)
             # The handles were discovered under precisely this worker. Do not
@@ -434,6 +479,8 @@ class DownloadJob:
                 alive = attempt("inspect owned subprocess", lambda owner=owner: tree.alive(owner))
                 if alive is not False:
                     attempt("kill owned subprocess", owner.kill)
+        elif container is not None:
+            attempt("terminate process ownership", container.terminate)
 
         if process is not None:
             started = attempt("inspect worker PID", lambda: process.pid)
@@ -454,6 +501,11 @@ class DownloadJob:
                 errors.append("IPC reader did not finish after the receiver was closed")
 
         all_exited = True
+        if container is not None:
+            before = len(errors)
+            attempt("verify process ownership empty", container.wait_empty)
+            all_exited = len(errors) == before
+            attempt("close process ownership", container.close)
         if process is not None:
             if attempt("verify worker exit", process.is_alive) is not False:
                 all_exited = False
@@ -482,7 +534,7 @@ class DownloadJob:
             # Cleanup is part of successful completion/cancellation. Explicitly
             # override an earlier terminal callback if its cleanup later fails.
             with self._lock:
-                self._state = "failed"
+                self._set_state_locked("failed")
             attempt("report cleanup failure", lambda: self._emit_state("failed"))
             detail = "; ".join(errors)
             if retained_dir is not None:
@@ -501,19 +553,25 @@ class DownloadJob:
         reader = None
         published = None
         completed = False
+        owner = None
         try:
             if self._requests()[0]:
                 raise DownloadCancelled("Download cancelled")
             self._state_to("starting")
             destination = self.output_dir.resolve()
             destination.mkdir(parents=True, exist_ok=True)
-            work_dir = Path(tempfile.mkdtemp(prefix=".video-scrap-job-", dir=destination))
+            work_dir = create_owned_tempdir(".video-scrap-job-", destination)
             context = multiprocessing.get_context("spawn")
+            owner = ProcessOwner(cancelled=lambda: self._requests()[0])
+            if owner.anchor_pid is not None:
+                add_temp_owner(work_dir, owner.anchor_pid, group=owner.pgid)
+            owner_ready, owner_release = context.Event(), context.Event()
             receiver, sender = context.Pipe(duplex=False)
             process = context.Process(
                 target=_download_child,
                 args=(sender, _item_payload(self.item), str(work_dir), self.quality,
-                      self.audio_format, self.parallel_connections),
+                      self.audio_format, self.parallel_connections, owner_ready, owner_release,
+                      owner.pgid),
                 name="VideoScraperDownload",
             )
             with self._lock:
@@ -527,7 +585,17 @@ class DownloadJob:
                 sender.close()
             with self._lock:
                 self._pid = process.pid
+            deadline = time.monotonic() + 20
+            while not owner_ready.wait(0.05):
+                if self._requests()[0]:
+                    raise DownloadCancelled("Download cancelled")
+                if not process.is_alive() or time.monotonic() >= deadline:
+                    raise RuntimeError("Download worker ownership handshake failed")
+            owner.attach(process.pid)
+            add_temp_owner(work_dir, process.pid)
             tree = _ProcessTree(process.pid)
+            tree.owner = owner
+            owner_release.set()
             incoming: queue.Queue = queue.Queue()
 
             def read_messages() -> None:
@@ -609,7 +677,7 @@ class DownloadJob:
             with self._lock:
                 if self._cancelled:
                     raise DownloadCancelled("Download cancelled")
-                self._state = "completed"
+                self._set_state_locked("completed")
                 completed = True
             self._emit_state("completed")
             if self.on_progress is not None:
@@ -629,7 +697,15 @@ class DownloadJob:
             self._state_to("failed")
             raise
         finally:
-            self._cleanup(
-                process=process, tree=tree, receiver=receiver, reader=reader,
-                work_dir=work_dir, published=published, completed=completed,
-            )
+            try:
+                self._cleanup(
+                    process=process, tree=tree, receiver=receiver, reader=reader,
+                    work_dir=work_dir, published=published, completed=completed,
+                    owner=owner,
+                )
+            finally:
+                if owner is not None:
+                    try:
+                        owner.terminate()
+                    finally:
+                        owner.close()

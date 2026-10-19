@@ -46,6 +46,18 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def git_state() -> dict:
+    """Build source archives even when Git metadata is unavailable."""
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=PROJECT,
+                                         text=True, stderr=subprocess.DEVNULL).strip()
+        dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=PROJECT,
+                                            text=True, stderr=subprocess.DEVNULL))
+        return {"git_commit": commit, "working_tree_dirty": dirty}
+    except (OSError, subprocess.CalledProcessError):
+        return {"git_commit": None, "working_tree_dirty": None}
+
+
 def prepare_assets() -> dict:
     import imageio_ffmpeg
     from PIL import Image, ImageOps
@@ -147,8 +159,7 @@ def main() -> int:
         "architecture": platform.machine(), "macos_build_host": platform.mac_ver()[0],
         "minimum_macos": actual_minimum_os, "python": platform.python_version(),
         "pyinstaller": metadata.version("pyinstaller"), "dependencies": versions,
-        "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=PROJECT, text=True).strip(),
-        "working_tree_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=PROJECT, text=True)),
+        **git_state(),
         "source_sha256": {str(path.relative_to(PROJECT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths},
         "archive_sha256": archive_sha256,
         "signing": "ad-hoc; not notarized",

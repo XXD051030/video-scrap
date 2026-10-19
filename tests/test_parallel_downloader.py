@@ -70,6 +70,7 @@ class FakeSession:
         single_stream_short: bool = False,
         head_claims_ranges: Optional[bool] = None,
         head_size_override: Optional[int] = None,
+        etag: Optional[str] = '"stable-fixture"',
         probe_missing_length: bool = False,
         stream_barrier: Optional[threading.Barrier] = None,
     ) -> None:
@@ -79,6 +80,7 @@ class FakeSession:
         self.single_stream_short = single_stream_short
         self.head_claims_ranges = head_claims_ranges
         self.head_size_override = head_size_override
+        self.etag = etag
         self.probe_missing_length = probe_missing_length
         self.stream_barrier = stream_barrier
         self.requested_ranges: list[Optional[str]] = []
@@ -123,6 +125,7 @@ class FakeSession:
                     {
                         "Content-Length": str(len(body)),
                         "Content-Range": f"bytes 0-{actual_end}/{len(self.data)}",
+                        **({"ETag": self.etag} if self.etag else {}),
                     },
                     body,
                 )
@@ -145,6 +148,7 @@ class FakeSession:
             response_headers = {
                 "Content-Length": str(end - start + 1),
                 "Content-Range": f"bytes {reported_start}-{end}/{reported_total}",
+                **({"ETag": self.etag} if self.etag else {}),
             }
             if self.range_fault == "encoded":
                 response_headers["Content-Encoding"] = "gzip"
@@ -509,7 +513,7 @@ class ParallelDownloaderTests(unittest.TestCase):
             self.assertEqual(result.path.read_bytes(), PAYLOAD)
             self.assert_no_part_files(output.parent)
 
-    def test_failed_fallback_publish_removes_only_its_placeholder(self) -> None:
+    def test_failed_atomic_fallback_does_not_create_a_placeholder(self) -> None:
         session = FakeSession(PAYLOAD, supports_ranges=False)
         downloader = self.make_downloader(session)
         with tempfile.TemporaryDirectory() as directory:
@@ -521,11 +525,11 @@ class ParallelDownloaderTests(unittest.TestCase):
                     "link",
                     side_effect=OSError(errno.EPERM, "hard links unavailable"),
                 ), mock.patch.object(
-                    parallel_downloader.os,
-                    "replace",
-                    side_effect=OSError("replace failed"),
+                    parallel_downloader,
+                    "_rename_without_replacement",
+                    side_effect=OSError("no-replace rename failed"),
                 ):
-                    with self.assertRaisesRegex(OSError, "replace failed"):
+                    with self.assertRaisesRegex(OSError, "no-replace rename failed"):
                         downloader.download("http://example.test/media", output)
             finally:
                 downloader.close()
@@ -534,23 +538,13 @@ class ParallelDownloaderTests(unittest.TestCase):
             self.assertFalse((output.parent / "existing (1).bin").exists())
             self.assert_no_part_files(output.parent)
 
-    def test_fallback_reservation_setup_failure_removes_placeholder(self) -> None:
-        original_close = parallel_downloader.os.close
-
-        def close_then_fail(fd: int) -> None:
-            original_close(fd)
-            raise OSError(errno.EIO, "close failed")
-
-        for failed_step, patch_target in (
-            ("stat failed", mock.patch.object(
-                parallel_downloader.os,
-                "fstat",
-                side_effect=OSError(errno.EIO, "stat failed"),
-            )),
-            ("close failed", mock.patch.object(
-                parallel_downloader.os, "close", side_effect=close_then_fail
-            )),
-        ):
+    def test_unsupported_atomic_publication_preserves_source_and_destination(self) -> None:
+        for error in (errno.ENOTSUP, errno.EIO):
+            failed_step = "atomic rename unavailable"
+            patch_target = mock.patch.object(
+                parallel_downloader, "_rename_without_replacement",
+                side_effect=OSError(error, failed_step),
+            )
             with self.subTest(failed_step=failed_step):
                 with tempfile.TemporaryDirectory() as directory:
                     part = Path(directory) / "private.part"

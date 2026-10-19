@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import List, Optional
+import weakref
 
 from PyQt6.QtCore import QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QIcon, QPainter, QPainterPath, QPixmap
@@ -11,10 +12,11 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
 )
+from PyQt6 import sip
 
 from ..scraper import VideoItem
 from ..utils import format_duration
-from .workers import ThumbnailWorker
+from .workers import ThumbnailWorker, cancel_background_worker, track_background_worker
 
 
 class VideoListWidget(QListWidget):
@@ -64,7 +66,8 @@ class VideoListWidget(QListWidget):
 
             if video.thumbnail:
                 self._thumb_queue.append(
-                    (index, video.thumbnail, video.referer, video.x_cookiejar)
+                    (index, video.thumbnail, video.referer, video.x_cookiejar,
+                     video.browser_cookies)
                 )
 
         self._pump_thumbs()
@@ -102,23 +105,32 @@ class VideoListWidget(QListWidget):
             self._thumb_queue
             and self._thumb_running < self.THUMB_CONCURRENCY
         ):
-            index, url, referer, cookies = self._thumb_queue.pop(0)
+            index, url, referer, cookies, browser_cookies = self._thumb_queue.pop(0)
             worker = ThumbnailWorker(
-                index, url, referer=referer, parent=self, cookies=cookies
+                index, url, referer=referer, cookies=cookies,
+                browser_cookies=browser_cookies,
             )
-            worker.ready.connect(
-                lambda i, d, g=gen: self._apply_thumbnail(i, d, g)
-            )
-            worker.finished.connect(lambda g=gen: self._on_thumb_done(g))
+            owner = weakref.ref(self)
+            def ready(index, data, g=gen, owner=owner):
+                widget = owner()
+                if widget is not None and not sip.isdeleted(widget):
+                    widget._apply_thumbnail(index, data, g)
+            worker.ready.connect(ready)
+            def finished(w=worker, g=gen, owner=owner):
+                widget = owner()
+                if widget is not None and not sip.isdeleted(widget):
+                    widget._on_thumb_done(g, w)
+            worker.finished.connect(finished)
             self._thumb_workers.append(worker)
             self._thumb_running += 1
+            track_background_worker(worker)
             worker.start()
 
-    def _on_thumb_done(self, gen: int) -> None:
+    def _on_thumb_done(self, gen: int, worker=None) -> None:
+        if worker in self._thumb_workers:
+            self._thumb_workers.remove(worker)
         # Ignore stragglers from a previous list (gen mismatch); otherwise a
         # finished worker frees one slot and lets the next queued one start.
-        if gen != self._thumb_gen:
-            return
         self._thumb_running = max(0, self._thumb_running - 1)
         self._pump_thumbs()
 
@@ -167,12 +179,12 @@ class VideoListWidget(QListWidget):
         # late ready/finished signals are ignored (generation guard).
         self._thumb_gen += 1
         self._thumb_queue = []
-        self._thumb_running = 0
         for worker in self._thumb_workers:
-            if worker.isRunning():
-                worker.requestInterruption()
-                worker.quit()
-                if not worker.wait(1000):
-                    worker.terminate()
-                    worker.wait(1000)
-        self._thumb_workers.clear()
+            try:
+                worker.ready.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            cancel_background_worker(worker)
+        # Cancelled requests still occupy their slots until finished. Rapid
+        # list replacement cannot create a new batch of network threads each
+        # time the previous requests are waiting for their socket timeout.

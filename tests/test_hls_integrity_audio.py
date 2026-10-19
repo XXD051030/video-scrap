@@ -82,6 +82,7 @@ class HlsIntegrityAudioTests(unittest.TestCase):
         self.empty_once = False
         self.fail_after_empty = False
         self.ignore_ranges = False
+        self.emit_etag = True
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -123,6 +124,8 @@ class HlsIntegrityAudioTests(unittest.TestCase):
                     body, status = body[start:end + 1], 206
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(body)))
+                if owner.emit_etag:
+                    self.send_header("ETag", '"stable-fixture"')
                 if content_range:
                     self.send_header("Content-Range", content_range)
                 self.end_headers()
@@ -224,6 +227,21 @@ class HlsIntegrityAudioTests(unittest.TestCase):
                          if update.status == "finalizing")
         self.assertFalse(any(update.status == "downloading" for update in updates[finishing:]))
         fallback.assert_not_called()
+
+    def test_unvalidated_ranged_tracks_spool_each_object_once_and_cleanup_at_completion(self):
+        self.emit_etag = False
+        self.ranged("video")
+        self.ranged("audio")
+        downloader = self.downloader()
+        result = downloader.download(self.item())
+        duration, details = self.inspect(result)
+        self.assertAlmostEqual(duration, 3.0, delta=0.15)
+        self.assertIn("Video:", details)
+        self.assertIn("Audio:", details)
+        for name in ("/video.bin", "/audio.bin"):
+            self.assertEqual(sum(path == name and span is None for path, span in self.requests), 1)
+        self.assertIsNone(downloader._hls_range_spool)
+        self.assertEqual(list(self.output.iterdir()), [result])
 
     def test_separate_audio_and_video_ranges_keep_strict_native_success(self):
         self.ranged("video")
