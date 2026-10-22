@@ -86,6 +86,20 @@ def _run_smoke_test(report_path: str) -> int:
     window_module.DEFAULT_DOWNLOAD_DIR = root / "downloads"
     window = profile = page = server = server_thread = downloader = None
     requests_seen: list[tuple[str, str | None]] = []
+    controlled_gates: dict[str, threading.Event] = {}
+    controlled_stop = threading.Event()
+    controlled_requests: list[dict] = []
+    controlled_requests_lock = threading.Lock()
+    controlled_failure: dict = {}
+
+    def controlled_trace(trace, **fields):
+        if trace is not None:
+            with controlled_requests_lock:
+                trace.update(fields)
+
+    def controlled_request_snapshot():
+        with controlled_requests_lock:
+            return [dict(request) for request in controlled_requests]
 
     def check(name, operation):
         try:
@@ -102,6 +116,8 @@ def _run_smoke_test(report_path: str) -> int:
                     "\n".join(window.log_view.toPlainText().splitlines()[-40:])
                 )
             report["checks"][name]["recent_local_requests"] = requests_seen[-40:]
+            if name == "download_task_controls":
+                report["checks"][name]["before_cleanup"] = controlled_failure
             raise
 
     def wait_until(predicate, message: str, timeout: int = 15000):
@@ -155,6 +171,15 @@ def _run_smoke_test(report_path: str) -> int:
             if not path.is_relative_to(root) or not path.is_file():
                 self.send_error(404)
                 return
+            trace = None
+            if path.name in controlled_gates:
+                trace = {
+                    "path": path.name, "method": self.command,
+                    "range": range_header, "started_monotonic": time.monotonic(),
+                    "bytes_sent": 0, "stage": "headers",
+                }
+                with controlled_requests_lock:
+                    controlled_requests.append(trace)
             data = path.read_bytes()
             start, end, status = 0, len(data) - 1, 200
             if range_header:
@@ -178,15 +203,53 @@ def _run_smoke_test(report_path: str) -> int:
             self.end_headers()
             if body:
                 try:
-                    if path.name.startswith("controlled-task-"):
-                        for offset in range(start, end + 1, 8192):
-                            self.wfile.write(data[offset:min(offset + 8192, end + 1)])
+                    if trace is not None and range_header is None:
+                        # One startup wait lets the real downloader's .25s
+                        # progress throttle report its first 256 KiB. Gates,
+                        # rather than transfer speed, keep Pause deterministic.
+                        controlled_trace(trace, stage="initial_progress_wait",
+                                         initial_wait_started=time.monotonic())
+                        if controlled_stop.wait(.30):
+                            controlled_trace(trace, stage="fixture_stopped")
+                            return
+                        controlled_trace(trace, initial_wait_finished=time.monotonic())
+                        prefix_end = min(start + 256 * 1024, end + 1)
+                        self.wfile.write(data[start:prefix_end])
+                        self.wfile.flush()
+                        controlled_trace(trace, bytes_sent=prefix_end - start,
+                                         last_write_monotonic=time.monotonic(),
+                                         stage="waiting_for_gate",
+                                         gate_wait_started=time.monotonic())
+                        if not controlled_gates[path.name].wait(30):
+                            controlled_trace(trace, stage="gate_timeout",
+                                             error="Controlled download gate was not released")
+                            self.close_connection = True
+                            return
+                        controlled_trace(trace, gate_released=time.monotonic())
+                        if controlled_stop.is_set():
+                            controlled_trace(trace, stage="fixture_stopped")
+                            return
+                        controlled_trace(trace, stage="sending_remainder")
+                        for offset in range(prefix_end, end + 1, 8192):
+                            chunk = data[offset:min(offset + 8192, end + 1)]
+                            self.wfile.write(chunk)
                             self.wfile.flush()
-                            time.sleep(0.025)
+                            controlled_trace(trace, bytes_sent=offset + len(chunk) - start,
+                                             last_write_monotonic=time.monotonic())
                     else:
                         self.wfile.write(data[start:end + 1])
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+                        controlled_trace(trace, bytes_sent=end - start + 1,
+                                         last_write_monotonic=time.monotonic())
+                    controlled_trace(trace, stage="complete")
+                except OSError as error:
+                    controlled_trace(trace, stage="write_failed",
+                                     error=f"{type(error).__name__}: {error}")
+                    if not isinstance(error, (BrokenPipeError, ConnectionResetError)):
+                        raise
+                finally:
+                    controlled_trace(trace, ended_monotonic=time.monotonic())
+            else:
+                controlled_trace(trace, stage="complete", ended_monotonic=time.monotonic())
 
     try:
         def dependencies():
@@ -709,6 +772,7 @@ def _run_smoke_test(report_path: str) -> int:
             items = []
             for suffix in ("a", "b", "c"):
                 name = f"controlled-task-{suffix}.bin"
+                controlled_gates[name] = threading.Event()
                 (root / name).write_bytes(payload)
                 items.append(VideoItem(
                     f"Controlled task {suffix}", base + "/" + name, base,
@@ -738,6 +802,42 @@ def _run_smoke_test(report_path: str) -> int:
             def controls(task_id):
                 return window._download_rows[window._download_task_slots[task_id]]
 
+            def diagnostics():
+                tasks = []
+                for task_id, task in list(window._download_tasks.items()):
+                    worker = window.download_workers.get(task_id)
+                    job = getattr(worker, "_job", None)
+                    pid = getattr(job, "_pid", None)
+                    entry = {
+                        "id": task_id, "state": task.get("state"),
+                        "progress_pct": task.get("progress_pct"),
+                        "worker_running": bool(worker and worker.isRunning()),
+                        "worker_phase": getattr(worker, "_phase", None),
+                        "job_state": getattr(job, "_state", None), "pid": pid,
+                    }
+                    if pid is not None:
+                        try:
+                            entry["process_status"] = psutil.Process(pid).status()
+                        except psutil.Error as error:
+                            entry["process_status"] = f"{type(error).__name__}: {error}"
+                    tasks.append(entry)
+                files = []
+                for path in output.rglob("*"):
+                    try:
+                        if path.is_file():
+                            stat = path.stat()
+                            files.append({"path": str(path.relative_to(output)),
+                                          "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+                    except OSError as error:
+                        files.append({"path": str(path.relative_to(output)),
+                                      "error": f"{type(error).__name__}: {error}"})
+                return {
+                    "captured_monotonic": time.monotonic(), "tasks": tasks,
+                    "output_dir": str(output), "output_and_staging_files": files,
+                    "expected_outputs": [f"Controlled task {suffix}.bin" for suffix in ("a", "b", "c")],
+                    "http_requests": controlled_request_snapshot(),
+                }
+
             try:
                 assert window.stop_downloads_action is None
                 first = start(0)
@@ -746,8 +846,10 @@ def _run_smoke_test(report_path: str) -> int:
                     lambda: window._download_tasks[first].get("state") == "paused",
                     "The actual packaged task did not confirm Pause",
                 )
+                controlled_gates["controlled-task-a.bin"].set()
                 frozen_progress = window._download_tasks[first]["progress_pct"]
                 second = start(1)
+                controlled_gates["controlled-task-b.bin"].set()
                 second_file = output / "Controlled task b.bin"
                 wait_until(
                     lambda: second_file.exists() and second not in window.download_workers,
@@ -769,6 +871,7 @@ def _run_smoke_test(report_path: str) -> int:
                     lambda: window._download_tasks[third].get("state") == "paused",
                     "The cancellation fixture did not pause",
                 )
+                controlled_gates["controlled-task-c.bin"].set()
                 controls(third)["cancel"].click()
                 wait_until(
                     lambda: third not in window.download_workers,
@@ -785,8 +888,18 @@ def _run_smoke_test(report_path: str) -> int:
                     "paused_cancelled_without_output": True,
                     "staging_clean": True,
                     "spawned_from_actual_executable": True,
+                    "http_requests": controlled_request_snapshot(),
                 }
+            except Exception:
+                try:
+                    controlled_failure.update(diagnostics())
+                except Exception as error:
+                    controlled_failure["diagnostic_error"] = f"{type(error).__name__}: {error}"
+                raise
             finally:
+                controlled_stop.set()
+                for gate in controlled_gates.values():
+                    gate.set()
                 for worker in list(window.download_workers.values()):
                     worker.cancel()
                 wait_until(
