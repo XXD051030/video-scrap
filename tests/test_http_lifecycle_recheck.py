@@ -138,11 +138,16 @@ class ContinuousBodyTests(unittest.TestCase):
 class NativeContinuousBodyTests(unittest.TestCase):
     def setUp(self):
         self.release = threading.Event()
+        self.drip_received = [threading.Event() for _ in b"abcdefgh"]
+        self.drip_trace = []
         owner = self
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
             def log_message(self, *_): pass
             def do_GET(self):
+                # The fixture controls one-byte delivery; TCP batching is not
+                # the behavior this read1 regression is meant to measure.
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.send_response(200)
                 self.send_header("Content-Length", "8")
                 self.end_headers()
@@ -150,20 +155,60 @@ class NativeContinuousBodyTests(unittest.TestCase):
                     if self.path == "/stall":
                         owner.release.wait(5)
                     else:
-                        for byte in b"abcdefgh":
-                            self.wfile.write(bytes([byte])); self.wfile.flush(); time.sleep(.03)
+                        for index, byte in enumerate(b"abcdefgh"):
+                            if owner.release.is_set():
+                                return
+                            self.wfile.write(bytes([byte]))
+                            self.wfile.flush()
+                            owner.drip_trace.append(("sent", index, time.monotonic()))
+                            # Do not send the next byte until read1 has yielded
+                            # this one. A reader which waits to fill its buffer
+                            # cannot pass even on a very fast machine.
+                            if not owner.drip_received[index].wait(5):
+                                owner.drip_trace.append(("ack_timeout", index, time.monotonic()))
+                                self.close_connection = True
+                                return
                 except (BrokenPipeError, ConnectionResetError): pass
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
         self.session = build_scoped_session()
     def tearDown(self):
-        self.release.set(); self.session.close()
+        self.release.set()
+        for received in self.drip_received:
+            received.set()
+        self.session.close()
         self.server.shutdown(); self.server.server_close(); self.thread.join(2)
     def test_read1_counts_small_incoming_packets_as_progress(self):
         url = f"http://127.0.0.1:{self.server.server_port}/drip"
-        with self.session.get(url, stream=True, timeout=2) as response:
-            self.assertEqual(b"".join(iter_continuous_response(response, 8, .1)), b"abcdefgh")
+        with self.session.get(url, stream=True, timeout=3) as response:
+            clock = [0.0]
+            original_read1 = response.raw.read1
+
+            def read1(*args, **kwargs):
+                chunk = original_read1(*args, **kwargs)
+                self.drip_trace.append(("read", chunk.hex(), time.monotonic()))
+                clock[0] += .03
+                return chunk
+
+            # Real HTTP reads prove small packets are returned immediately.
+            # Controlled transfer time tests progress over a total > .1s
+            # without treating CI scheduling delays as an upstream stall.
+            with patch.object(response.raw, "read1", side_effect=read1), \
+                 patch("src.http_limits.transfer_monotonic", side_effect=lambda: clock[0]):
+                stream = iter_continuous_response(response, 8, .1)
+                try:
+                    for index, byte in enumerate(b"abcdefgh"):
+                        self.assertEqual(next(stream), bytes([byte]))
+                        self.drip_received[index].set()
+                    with self.assertRaises(StopIteration):
+                        next(stream)
+                    self.assertGreater(clock[0], .1)
+                except Exception:
+                    print(f"HTTP drip send/read trace: {self.drip_trace!r}", file=sys.stderr)
+                    raise
+                finally:
+                    stream.close()
     def test_idle_watchdog_interrupts_an_actual_blocked_read(self):
         url = f"http://127.0.0.1:{self.server.server_port}/stall"
         start = time.monotonic()
