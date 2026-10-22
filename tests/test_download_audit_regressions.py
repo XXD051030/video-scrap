@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import errno
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
@@ -226,10 +227,14 @@ class DownloadAuditTests(unittest.TestCase):
         ffmpeg = resolve_ffmpeg()
         if not ffmpeg:
             self.fail("FFmpeg is required to verify concat escaping")
-        # A backslash is a legal POSIX filename character and a Windows path
-        # separator; this exercises token preservation as well as apostrophes.
-        directory = self.directory / "space ' quote \\ directory"
-        directory.mkdir()
+        # Windows gets native separators between real directories; POSIX also
+        # exercises a literal backslash in a filename. Both retain apostrophes.
+        directory = self.directory / "space ' quote"
+        if os.name == "nt":
+            directory /= "directory"
+        else:
+            directory = Path(str(directory) + " \\ directory")
+        directory.mkdir(parents=True)
         source = directory / "segment ' 1.ts"
         subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
                         "-i", "sine=frequency=400", "-t", "0.3", "-c:a", "aac", str(source)],
@@ -289,10 +294,13 @@ class AuthenticatedDownloadTests(unittest.TestCase):
         subprocess.run(common + ["-i", str(source), "-c", "copy", "-hls_time", "0.5",
                                 "-hls_list_size", "0", "-hls_segment_filename", str(cls.root / "part%02d.ts"),
                                 str(cls.root / "media.m3u8")], check=True, capture_output=True)
-        subprocess.run(common + ["-i", str(source), "-map", "0:v:0", "-map", "0:a:0",
+        # The fixture models HTTP-relative DASH resources. In particular,
+        # Windows drive paths must not become part of its manifest URLs.
+        subprocess.run(common + ["-i", "source.mp4", "-map", "0:v:0", "-map", "0:a:0",
                                 "-c", "copy", "-seg_duration", "0.5", "-f", "dash",
-                                str(cls.root / "media.mpd")], check=True, capture_output=True)
+                                "media.mpd"], cwd=cls.root, check=True, capture_output=True)
         cls.seen = []
+        cls.missing_resources = []
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_args):
@@ -320,6 +328,7 @@ class AuthenticatedDownloadTests(unittest.TestCase):
                         return
                     resource = cls.root / path.removeprefix("/protected/")
                     if not resource.is_file():
+                        cls.missing_resources.append((path, str(resource)))
                         self.send_error(404)
                         return
                     payload = resource.read_bytes()
@@ -346,13 +355,21 @@ class AuthenticatedDownloadTests(unittest.TestCase):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
-        cls.addClassCleanup(cls.server.shutdown)
-        cls.addClassCleanup(cls.server.server_close)
+
+        def stop_server():
+            # Do not close a socket while Windows select() still owns it.
+            cls.server.shutdown()
+            cls.server.server_close()
+            cls.thread.join(5)
+
+        cls.addClassCleanup(stop_server)
         cls.base = f"http://127.0.0.1:{cls.server.server_port}"
         cls.cookies = [{"name": "auth", "value": "allowed", "domain": "127.0.0.1",
                         "host_only": True, "path": "/", "secure": False}]
 
     def setUp(self):
+        self.seen.clear()
+        self.missing_resources.clear()
         self.temporary_output = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_output.cleanup)
         self.downloader = VideoDownloader(Path(self.temporary_output.name))
@@ -377,10 +394,21 @@ class AuthenticatedDownloadTests(unittest.TestCase):
     def test_real_dash_ytdlp_receives_session_for_manifest_and_segments(self):
         item = VideoItem("Private DASH", self.base + "/protected/media.mpd", self.base,
                          is_direct=True, is_dash=True, browser_cookies=self.cookies)
-        result = self.downloader.download(item)
+        try:
+            result = self.downloader.download(item)
+        except yt_dlp.utils.DownloadError:
+            self.assertEqual(
+                self.missing_resources, [],
+                f"DASH fixture resources were missing; files: {sorted(p.name for p in self.root.iterdir())}",
+            )
+            raise
         probe = subprocess.run([self.ffmpeg, "-hide_banner", "-i", str(result)], capture_output=True)
         self.assertIn(b"Video:", probe.stderr)
         self.assertIn(b"Audio:", probe.stderr)
+        self.assertEqual(self.missing_resources, [])
+        fragments = [row for row in self.seen if row[0].endswith(".m4s")]
+        self.assertTrue(fragments, "DASH must fetch real media fragments")
+        self.assertTrue(all("auth=allowed" in cookie for _path, _host, cookie in fragments))
 
     def test_real_ydl_redirect_does_not_forward_host_only_cookie_to_alias(self):
         item = VideoItem("Cookie scopes", self.base, self.base, browser_cookies=self.cookies)

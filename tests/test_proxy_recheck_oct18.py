@@ -243,16 +243,24 @@ class ProxyRecheckTests(unittest.TestCase):
             with self.subTest(status=status, passthrough=passthrough):
                 child = self.entry()
                 child.total_size = 8
-                response = Response(status=status, delay=.012)
+                response = Response(status=status)
                 request = Request()
+                clock = [0.0]
+
+                def chunks(chunk_size=65536):
+                    for byte in response.body:
+                        clock[0] += .012
+                        yield bytes([byte])
+
+                response.iter_content = chunks
                 with patch.object(self.proxy._session, "get", return_value=response), \
-                     patch("src.media_proxy.READ_DEADLINE_SECONDS", .04):
-                    started = time.monotonic()
+                     patch("src.media_proxy.READ_DEADLINE_SECONDS", .04), \
+                     patch("src.http_limits.transfer_monotonic", side_effect=lambda: clock[0]):
                     if passthrough:
                         self.proxy._proxy_passthrough(request, child)
                     else:
                         self.proxy._serve_range(request, child)
-                    self.assertGreater(time.monotonic() - started, .04)
+                    self.assertGreater(clock[0], .04)
                 self.assertEqual(request.status, 200)
                 self.assertEqual(request.wfile.getvalue(), response.body)
                 self.assertTrue(response.closed)

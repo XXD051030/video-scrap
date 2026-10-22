@@ -40,6 +40,14 @@ def wait_for(predicate, timeout=10):
         time.sleep(.01)
 
 
+def has_exited(process):
+    """A process can disappear between the two native status queries."""
+    try:
+        return not process.is_running() or process.status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
 def quick_exit():
     """Another multiprocessing worker exercises its automatic child reaping."""
 
@@ -70,13 +78,13 @@ class ProcessOwnershipTests(unittest.TestCase):
                 # No descendants were enumerated before the root exited.
                 owner.terminate()
                 owner.wait_empty(5)
-                self.assertTrue(not child.is_running() or child.status() == psutil.STATUS_ZOMBIE)
+                self.assertTrue(has_exited(child))
         finally:
             owner.terminate()
             owner.close()
             if child is not None:
                 try:
-                    if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                    if not has_exited(child):
                         child.kill()
                 except psutil.NoSuchProcess:
                     pass
@@ -121,14 +129,14 @@ class ProcessOwnershipTests(unittest.TestCase):
                     owner.wait_empty(5)
                     owner.close()
                 self.assertIsNone(guard.poll())
-                self.assertTrue(not child.is_running() or child.status() == psutil.STATUS_ZOMBIE)
+                self.assertTrue(has_exited(child))
         finally:
             owner.close()
             if guard is not None:
                 guard.terminate(); guard.wait(5)
             if child is not None:
                 try:
-                    if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                    if not has_exited(child):
                         child.kill()
                 except psutil.NoSuchProcess:
                     pass
@@ -221,7 +229,7 @@ class ProcessOwnershipTests(unittest.TestCase):
                 def stopped():
                     for member in owned:
                         try:
-                            if member.is_running() and member.status() != psutil.STATUS_ZOMBIE:
+                            if not has_exited(member):
                                 return False
                         except psutil.NoSuchProcess:
                             pass
@@ -233,7 +241,7 @@ class ProcessOwnershipTests(unittest.TestCase):
                 process.wait(5)
                 for member in owned:
                     try:
-                        if member.is_running() and member.status() != psutil.STATUS_ZOMBIE:
+                        if not has_exited(member):
                             member.kill()
                     except psutil.NoSuchProcess:
                         pass

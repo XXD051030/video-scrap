@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QCoreApplication, QEvent, QPoint
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication
 
 from src import settings
@@ -107,7 +108,7 @@ def test_audio_format_visibility_defaults_and_selection_are_preserved():
         assert window.audio_format_combo.currentData() == "mp3"
 
 
-def test_audio_controls_fit_minimum_window_with_long_metadata_and_paths():
+def _check_audio_controls_fit_minimum_window():
     with _window() as window:
         window.video_list.set_videos([_fixture()])
         window.path_label.setText(str(Path(tempfile.gettempdir()) / ("long-folder-" * 25)))
@@ -134,13 +135,17 @@ def test_audio_controls_fit_minimum_window_with_long_metadata_and_paths():
                     assert widget.isVisible()
                     assert window.rect().contains(_rect_in_window(widget, window)), \
                         f"Control leaves the minimum window: {widget}"
+                    assert widget.parentWidget().rect().contains(widget.geometry()), \
+                        f"Control leaves its allocated panel: {widget}"
                 quality = _rect_in_window(window.quality_combo, window)
                 audio = _rect_in_window(window.audio_format_combo, window)
                 path = _rect_in_window(window.path_label, window)
                 download = _rect_in_window(window.download_button, window)
                 audio_label = _rect_in_window(window.audio_format_label, window)
                 assert quality.right() < audio_label.left() < audio.left()
-                assert audio.right() < download.left()
+                assert audio.right() < download.left(), \
+                    f"Audio/download controls overlap: {audio}, {download}; " \
+                    f"splitter widths={window.video_splitter.sizes()}"
                 assert abs(quality.center().y() - audio.center().y()) <= 1
                 assert abs(audio.center().y() - download.center().y()) <= 1
                 assert audio.bottom() < path.top()
@@ -150,6 +155,27 @@ def test_audio_controls_fit_minimum_window_with_long_metadata_and_paths():
                 stage = _rect_in_window(window.preview_panel.media_stack_host, window)
                 seek = _rect_in_window(window.preview_panel.position_slider, window)
                 assert stage.bottom() < seek.top()
+
+
+def test_audio_controls_fit_minimum_window_with_long_metadata_and_paths():
+    _check_audio_controls_fit_minimum_window()
+
+
+def test_audio_controls_fit_minimum_window_with_wide_font_metrics():
+    previous_font = APP.font()
+    previous_style = APP.style().objectName()
+    # Font metrics vary between macOS and Windows even at the stylesheet's
+    # fixed pixel size. Wide glyphs reproduce an otherwise platform-specific
+    # shortage of space in the splitter without weakening the geometry checks.
+    wide_font = QFont(previous_font)
+    wide_font.setStretch(150)
+    APP.setFont(wide_font)
+    APP.setStyle("Fusion")
+    try:
+        _check_audio_controls_fit_minimum_window()
+    finally:
+        APP.setFont(previous_font)
+        APP.setStyle(previous_style)
 
 
 def test_queue_freezes_each_audio_format_before_the_worker_starts():

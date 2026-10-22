@@ -267,6 +267,11 @@ class MainWindow(QMainWindow):
         header.setSpacing(8)
         title = QLabel("Discovered videos")
         title.setProperty("role", "title")
+        # This caption may shrink when platform font metrics need more room
+        # for the preview/download controls. Keeping its full text as a hard
+        # minimum makes QSplitter squeeze those controls below their minimums.
+        title.setMinimumWidth(1)
+        title.setToolTip("Discovered videos")
         header.addWidget(title)
 
         self.count_badge = QLabel("0")

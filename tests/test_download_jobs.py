@@ -9,9 +9,11 @@ mocking an operating-system call verifies a Windows executable.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import multiprocessing
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -31,6 +33,38 @@ from src.download_job import (
 )
 from src.ffmpeg import resolve_ffmpeg
 from src.scraper import VideoItem
+from src.temp_ownership import (
+    MARKER, add_temp_owner, cleanup_stale_dirs, create_owned_tempdir,
+    remove_owned_tempdir,
+)
+
+
+@contextmanager
+def blocked_marker_reader(thread_name):
+    """Hold a real marker descriptor open at the Windows sharing boundary."""
+    entered, release = threading.Event(), threading.Event()
+    real_open = Path.open
+
+    @contextmanager
+    def hold(stream):
+        with stream:
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError("Test did not release the marker reader")
+            yield stream
+
+    def open_path(path, *args, **kwargs):
+        stream = real_open(path, *args, **kwargs)
+        if (path.name == MARKER and threading.current_thread().name == thread_name
+                and kwargs.get("mode", args[0] if args else "r") == "r"):
+            return hold(stream)
+        return stream
+
+    with mock.patch.object(Path, "open", open_path):
+        try:
+            yield entered, release
+        finally:
+            release.set()
 
 
 def descendant_target(directory: str) -> None:
@@ -286,6 +320,82 @@ class DownloadJobTests(unittest.TestCase):
         self.assertEqual(states[-1], "cancelled")
         self.assertNotIn("completed", states)
         self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_early_cancel_waits_for_its_open_marker_before_removing_staging(self):
+        allow_creation_return = threading.Event()
+        cleanup_entered = threading.Event()
+
+        with blocked_marker_reader("StaleMediaCleanup") as (marker_open, release_marker):
+            def create_then_wait(prefix, directory):
+                work = create_owned_tempdir(prefix, directory)
+                if not marker_open.wait(5) or not allow_creation_return.wait(5):
+                    raise RuntimeError("Test did not reach early cancellation")
+                return work
+
+            def remove(work):
+                cleanup_entered.set()
+                return remove_owned_tempdir(work)
+
+            with mock.patch("src.download_job.create_owned_tempdir", create_then_wait), mock.patch(
+                "src.download_job.remove_owned_tempdir", remove,
+            ):
+                job, future, states, _ = self.start()
+                try:
+                    self.assertTrue(marker_open.wait(5))
+                    self.assertTrue(job.cancel())
+                    allow_creation_return.set()
+                    self.assertTrue(cleanup_entered.wait(5))
+                    # This also fails deterministically on POSIX if cleanup
+                    # unlinks an open marker instead of waiting for its reader.
+                    time.sleep(0.1)
+                    self.assertFalse(future.done())
+                    self.assertEqual(len(list(self.output.rglob(MARKER))), 1)
+                finally:
+                    allow_creation_return.set()
+                    release_marker.set()
+                with self.assertRaises(DownloadCancelled):
+                    future.result(timeout=10)
+        self.assertEqual(states[-1], "cancelled")
+        self.assertNotIn("failed", states)
+        self.assertIsNone(job.pid)
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_marker_update_waits_for_reader_without_blocking_other_directories(self):
+        with mock.patch("src.temp_ownership.schedule_stale_cleanup"):
+            work = create_owned_tempdir(".video-scrap-job-", self.output)
+            other_parent = self.output / "other"
+            other_parent.mkdir()
+            other = create_owned_tempdir(".video-scrap-job-", other_parent)
+        scan_errors = []
+
+        def scan():
+            try:
+                cleanup_stale_dirs(self.output, ".video-scrap-job-")
+            except BaseException as exc:
+                scan_errors.append(exc)
+
+        with blocked_marker_reader("ControlledStaleCleanup") as (marker_open, release_marker):
+            scanner = threading.Thread(target=scan, name="ControlledStaleCleanup")
+            scanner.start()
+            try:
+                self.assertTrue(marker_open.wait(5))
+                update = self.pool.submit(add_temp_owner, work, os.getpid())
+                time.sleep(0.1)
+                self.assertFalse(update.done())
+                # A scan of one task must not serialize I/O for a different
+                # task behind its process-identity checks or marker reader.
+                unrelated = self.pool.submit(add_temp_owner, other, os.getpid())
+                unrelated.result(timeout=2)
+                self.assertEqual(len(json.loads((other / MARKER).read_text())["owners"]), 2)
+                self.pool.submit(remove_owned_tempdir, other).result(timeout=2)
+                self.assertFalse(other.exists())
+            finally:
+                release_marker.set()
+                scanner.join(timeout=5)
+            update.result(timeout=5)
+        self.assertFalse(scanner.is_alive())
+        self.assertEqual(scan_errors, [])
+        self.assertEqual(len(json.loads((work / MARKER).read_text())["owners"]), 2)
 
     def test_concurrent_equal_titles_preserve_both_exact_outputs(self):
         first_job, first, _, _ = self.start("/quick.mp4", title="Equal title")
@@ -565,6 +675,25 @@ class DownloadJobTests(unittest.TestCase):
         self.assertEqual(caught.exception.retained_dir, work)
         self.assertEqual(states, ["failed"])
         self.assertEqual(job.state, "failed")
+
+    def test_staging_removal_error_remains_visible_and_retains_directory(self):
+        work = self.output / ".video-scrap-job-file-still-locked"
+        work.mkdir()
+        (work / "data.part").write_bytes(b"must remain inspectable")
+        states = []
+        job = DownloadJob(self.item(), self.output, on_state=states.append)
+        job._state = "cancelled"
+        with mock.patch("src.temp_ownership.shutil.rmtree", side_effect=PermissionError(
+            "another application still owns a file handle",
+        )):
+            with self.assertRaisesRegex(DownloadCleanupError, "PermissionError") as caught:
+                job._cleanup(
+                    process=None, tree=None, receiver=None, reader=None,
+                    work_dir=work, published=None, completed=False,
+                )
+        self.assertEqual(caught.exception.retained_dir, work)
+        self.assertEqual((work / "data.part").read_bytes(), b"must remain inspectable")
+        self.assertEqual(states, ["failed"])
 
     def test_tree_root_kill_failure_cannot_claim_success_or_drop_suspension(self):
         # Fault injection checks cleanup bookkeeping, not a platform pause.

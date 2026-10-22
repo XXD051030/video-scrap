@@ -58,7 +58,7 @@ from .http_limits import (
     iter_limited_response, read_limited_response, abort_response,
     resource_identity_url, iter_continuous_response,
 )
-from .temp_ownership import create_owned_tempdir
+from .temp_ownership import create_owned_tempdir, owned_tempdir_io
 
 
 M3U8_CONTENT_TYPES = {
@@ -1128,12 +1128,13 @@ class MediaProxyServer:
             self._thread = None
         self.clear()
         try:
-            for child in self._cache_dir.iterdir():
-                try:
-                    child.unlink()
-                except OSError:
-                    pass
-            self._cache_dir.rmdir()
+            with owned_tempdir_io(self._cache_dir):
+                for child in self._cache_dir.iterdir():
+                    try:
+                        child.unlink()
+                    except OSError:
+                        pass
+                self._cache_dir.rmdir()
         except OSError:
             pass
         try:

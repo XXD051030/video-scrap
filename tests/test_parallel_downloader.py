@@ -6,6 +6,7 @@ Run directly: ``python3 tests/test_parallel_downloader.py`` (no pytest needed).
 from __future__ import annotations
 
 import errno
+from contextlib import contextmanager
 import sys
 import tempfile
 import threading
@@ -22,6 +23,20 @@ from src import parallel_downloader
 
 
 PAYLOAD = bytes(range(256)) * 128
+
+
+@contextmanager
+def without_pwrite():
+    """Restore the native attribute, including when Windows never had it."""
+    missing = object()
+    original = getattr(parallel_downloader.os, "pwrite", missing)
+    if original is not missing:
+        del parallel_downloader.os.pwrite
+    try:
+        yield
+    finally:
+        if original is not missing:
+            parallel_downloader.os.pwrite = original
 
 
 class FakeResponse:
@@ -346,10 +361,7 @@ class ParallelDownloaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "single.bin"
             try:
-                with mock.patch.object(
-                    parallel_downloader.os, "pwrite", None, create=True
-                ):
-                    del parallel_downloader.os.pwrite
+                with without_pwrite():
                     result = downloader.download("http://example.test/media", output)
             finally:
                 downloader.close()
@@ -383,14 +395,11 @@ class ParallelDownloaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "range.bin"
             try:
-                with mock.patch.object(
-                    parallel_downloader.os, "pwrite", None, create=True
-                ), mock.patch.object(
+                with without_pwrite(), mock.patch.object(
                     parallel_downloader.os, "lseek", seek_then_yield
                 ), mock.patch.object(
                     parallel_downloader.os, "write", write_part
                 ):
-                    del parallel_downloader.os.pwrite
                     result = downloader.download("http://example.test/media", output)
             finally:
                 downloader.close()
@@ -420,12 +429,9 @@ class ParallelDownloaderTests(unittest.TestCase):
                     output = Path(directory) / "existing.bin"
                     output.write_bytes(b"previous download")
                     try:
-                        with mock.patch.object(
-                            parallel_downloader.os, "pwrite", None, create=True
-                        ), mock.patch.object(
+                        with without_pwrite(), mock.patch.object(
                             parallel_downloader.os, "write", write_then_fail
                         ):
-                            del parallel_downloader.os.pwrite
                             with self.assertRaises(OSError):
                                 downloader.download("http://example.test/media", output)
                     finally:

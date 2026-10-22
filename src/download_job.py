@@ -15,7 +15,6 @@ from multiprocessing.connection import Connection
 import os
 from pathlib import Path
 import queue
-import shutil
 import stat
 import sys
 import tempfile
@@ -29,7 +28,7 @@ from .downloader import DownloadLaneLimiter, DownloadProgress, VideoDownloader
 from .parallel_downloader import _publish_unique
 from .scraper import VideoItem
 from .process_owner import ProcessOwner
-from .temp_ownership import create_owned_tempdir, add_temp_owner
+from .temp_ownership import create_owned_tempdir, add_temp_owner, remove_owned_tempdir
 from .transfer_clock import configure_pause_offset
 
 
@@ -527,7 +526,7 @@ class DownloadJob:
         retained_dir = None
         if work_dir is not None:
             if all_exited:
-                attempt("remove private staging", lambda: shutil.rmtree(work_dir))
+                attempt("remove private staging", lambda: remove_owned_tempdir(work_dir))
                 if attempt("verify private staging removal", work_dir.exists) is not False:
                     retained_dir = work_dir
             else:

@@ -9,8 +9,12 @@ redirects.
 from __future__ import annotations
 
 import copy
+import io
+import http.client
 import threading
 import socket
+import sys
+import time
 import weakref
 from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 from typing import Iterable, Mapping, Optional
@@ -132,10 +136,81 @@ class ScopedCookieSession(requests.Session):
         # Cookie is rebuilt separately by requests and re-scoped in send().
 
 
+class _PollingResponseReader(io.RawIOBase):
+    """Keep Windows socket waits short without exposing polling timeouts.
+
+    Winsock shutdown need not wake an in-progress select used by Python's
+    socket timeout mode. Retry short recv waits below the buffered reader so
+    its state is not poisoned by an internal poll. The caller's actual socket
+    timeout still bounds each read, including TLS records split across polls.
+    """
+
+    POLL_SECONDS = .1
+
+    def __init__(self, sock, cancelled):
+        super().__init__()
+        self._socket = sock
+        self._cancelled = cancelled
+        # Retain the socket's normal makefile reference ownership, including
+        # HTTP/1.0 responses detached from their connection after headers.
+        self._raw = sock.makefile("rb", buffering=0)
+
+    def readable(self):
+        return True
+
+    def fileno(self):
+        return self._raw.fileno()
+
+    def readinto(self, buffer):
+        self._checkClosed()
+        timeout = self._socket.gettimeout()
+        if timeout == 0:
+            return self._raw.readinto(buffer)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            while True:
+                if self._cancelled.is_set():
+                    raise InterruptedError("HTTP response read cancelled")
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise socket.timeout("timed out")
+                self._socket.settimeout(self.POLL_SECONDS if remaining is None
+                                        else min(self.POLL_SECONDS, remaining))
+                try:
+                    return self._socket.recv_into(buffer)
+                except socket.timeout:
+                    # Do not call SocketIO.readinto here: its timeout flag
+                    # permanently invalidates subsequent buffered reads.
+                    continue
+        finally:
+            try:
+                self._socket.settimeout(timeout)
+            except OSError:
+                pass
+
+    def close(self):
+        if not self.closed:
+            try:
+                self._raw.close()
+            finally:
+                super().close()
+
+
+class _PollingResponseSocket:
+    def __init__(self, sock, cancelled):
+        self._socket, self._cancelled = sock, cancelled
+
+    def makefile(self, mode):
+        if mode != "rb":
+            return self._socket.makefile(mode)
+        return io.BufferedReader(_PollingResponseReader(self._socket, self._cancelled))
+
+
 class _CancelableAdapter(HTTPAdapter):
     """Own pooled sockets, including requests still waiting for headers."""
 
     HEADER_DEADLINE_SECONDS = 30.0
+    POLL_RESPONSE_READS = sys.platform == "win32"
 
     def __init__(self, **kwargs):
         self._active_connections = set()
@@ -147,7 +222,13 @@ class _CancelableAdapter(HTTPAdapter):
             def __init__(self, *args, **kwargs):
                 self._lease_lock = threading.RLock()
                 self._lease_generation = 0
+                self._read_cancelled = threading.Event()
                 super().__init__(*args, **kwargs)
+
+            def response_class(self, sock, *args, **kwargs):
+                if owner.POLL_RESPONSE_READS:
+                    sock = _PollingResponseSocket(sock, self._read_cancelled)
+                return http.client.HTTPResponse(sock, *args, **kwargs)
 
             def request(self, *args, **kwargs):
                 # Taking a pooled connection gives it a new owner before any
@@ -155,6 +236,7 @@ class _CancelableAdapter(HTTPAdapter):
                 # released the connection while its reader is still unwinding.
                 with self._lease_lock:
                     self._lease_generation += 1
+                    self._read_cancelled = threading.Event()
                 return super().request(*args, **kwargs)
 
             def connect(self):
@@ -174,6 +256,7 @@ class _CancelableAdapter(HTTPAdapter):
                 with self._lease_lock:
                     connection = self.sock
                     generation = self._lease_generation
+                    read_cancelled = self._read_cancelled
                 expired = threading.Event()
                 lifecycle_lock = threading.Lock()
                 active = True
@@ -185,6 +268,7 @@ class _CancelableAdapter(HTTPAdapter):
                         if not active:
                             return
                         expired.set()
+                        read_cancelled.set()
                         if connection is not None:
                             try:
                                 connection.shutdown(socket.SHUT_RDWR)
@@ -213,6 +297,7 @@ class _CancelableAdapter(HTTPAdapter):
                                     or generation != self._lease_generation
                                     or (self.sock is not None and self.sock is not connection)):
                                 return False
+                            read_cancelled.set()
                             if connection is not None:
                                 try:
                                     connection.shutdown(socket.SHUT_RDWR)
@@ -261,6 +346,7 @@ class _CancelableAdapter(HTTPAdapter):
             self._closed = True
             connections = list(self._active_connections)
         for connection in connections:
+            connection._read_cancelled.set()
             active_socket = getattr(connection, "sock", None)
             if active_socket is not None:
                 try:

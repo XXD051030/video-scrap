@@ -90,11 +90,21 @@ class Response:
 
 class ContinuousBodyTests(unittest.TestCase):
     def test_healthy_chunks_can_exceed_old_total_deadline(self):
-        response = Response()
-        start = time.monotonic()
-        actual = b"".join(iter_continuous_response(response, 64, .06))
+        response = Response(delay=0)
+        clock = [0.0]
+
+        def chunks(chunk_size):
+            for start in range(0, len(response.body), 8):
+                clock[0] += .02
+                yield response.body[start:start + 8]
+
+        # Test the total-vs-idle distinction without depending on a shared
+        # CI runner scheduling every simulated packet within 60 milliseconds.
+        response.iter_content = chunks
+        with patch("src.http_limits.transfer_monotonic", side_effect=lambda: clock[0]):
+            actual = b"".join(iter_continuous_response(response, 64, .06))
         self.assertEqual(actual, response.body)
-        self.assertGreater(time.monotonic() - start, .06)
+        self.assertGreater(clock[0], .06)
         self.assertFalse(response.closed.is_set())
 
     def test_slow_consumer_does_not_count_as_upstream_idle(self):
