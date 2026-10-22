@@ -220,6 +220,7 @@ LIVE_GRACE_SECONDS = 10.0
 READ_DEADLINE_SECONDS = 120.0
 # Bound decoded private bodies even when many slow player requests overlap.
 MAX_WRAPPED_PAYLOAD_REQUESTS = 2
+MAX_PROXY_ERROR_CHARS = 1024
 
 
 class _BoundedHlsPool:
@@ -1631,14 +1632,9 @@ class MediaProxyServer:
                 **entry.cookie_kwargs,
             )
         except Exception as exc:  # noqa: BLE001
-            self._emit(f"Player manifest error: {exc}")
-            request.send_response(502)
-            request.send_header("Content-Type", "text/plain; charset=utf-8")
-            request.end_headers()
-            try:
-                request.wfile.write(f"Upstream error: {exc}".encode("utf-8"))
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            message = str(exc)[:MAX_PROXY_ERROR_CHARS]
+            self._emit(f"Player manifest error: {message}")
+            self._send_manifest_error(request, 502, f"Upstream error: {message}")
             return True
 
         try:
@@ -1684,9 +1680,11 @@ class MediaProxyServer:
 
             self._ensure_hls_prefetcher(entry)
             return True
-        except (ValueError, UnicodeError, TimeoutError, InterruptedError) as exc:
-            self._emit(f"Player manifest error: {exc}")
-            self._send_manifest_error(request, 502, str(exc))
+        except (ValueError, UnicodeError, TimeoutError, InterruptedError,
+                requests.RequestException) as exc:
+            message = str(exc)[:MAX_PROXY_ERROR_CHARS]
+            self._emit(f"Player manifest error: {message}")
+            self._send_manifest_error(request, 502, message)
             return True
         finally:
             with entry._responses_lock:
@@ -1727,7 +1725,10 @@ class MediaProxyServer:
         request: BaseHTTPRequestHandler, status: int, message: str,
         *, body: bool = True,
     ) -> None:
-        payload = message.encode("utf-8")
+        # Keep upstream exception/error text bounded before encoding. UTF-8
+        # needs at most four bytes per character, including replacement of
+        # invalid surrogates; a malicious origin cannot inflate this reply.
+        payload = message[:MAX_PROXY_ERROR_CHARS].encode("utf-8", errors="replace")
         request.send_response(status)
         request.send_header("Content-Type", "text/plain; charset=utf-8")
         request.send_header("Content-Length", str(len(payload)))

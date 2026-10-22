@@ -20,6 +20,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.downloader import VideoDownloader, _HlsFallbackError, _HlsSegment
+from http_fixtures import inspected_hls_failure
 from src.parallel_downloader import ParallelDownloadResult
 from src.scraper import VideoItem
 
@@ -234,9 +235,8 @@ class DownloadNameReservationTests(unittest.TestCase):
         try:
             with mock.patch.object(
                 downloader, "_download_hls_parallel",
-                side_effect=_HlsFallbackError(
-                    "parallel failed", "https://example.test/video.m3u8"
-                ),
+                side_effect=inspected_hls_failure(
+                    downloader, "https://example.test/video.m3u8", "parallel failed"),
             ), mock.patch(
                 "src.downloader.yt_dlp.YoutubeDL", FailedWithFile
             ), mock.patch("src.downloader.resolve_ffmpeg", return_value=None):
@@ -260,11 +260,17 @@ class DownloadNameReservationTests(unittest.TestCase):
             _HlsSegment(index, f"https://example.test/{index}.ts", 1.0, None, None)
             for index in range(segment_count)
         ]
+        def inspected(*_args, **_kwargs):
+            url = "https://example.test/list.m3u8"
+            text = ("#EXTM3U\n" + "".join(f"#EXTINF:1,\n{part.url}\n" for part in segments)
+                    + "#EXT-X-ENDLIST\n")
+            downloader._remember_hls_snapshot(url, url, text)
+            return url, text, None
         stack.enter_context(
             mock.patch.object(
                 downloader,
                 "_fetch_hls_manifest",
-                return_value=("https://example.test/list.m3u8", "#EXTM3U", None),
+                side_effect=inspected,
             )
         )
         stack.enter_context(

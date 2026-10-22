@@ -225,6 +225,7 @@ class PreviewPanel(QWidget):
         self.position_slider.setAccessibleName("Playback position")
         self.position_slider.setRange(0, 0)
         self.position_slider.sliderMoved.connect(self._seek_to_slider_position)
+        self.position_slider.actionTriggered.connect(self._on_seek_action)
         seek_controls.addWidget(self.position_slider, stretch=1)
 
         self.time_label = QLabel("00:00 / 00:00")
@@ -910,6 +911,17 @@ class PreviewPanel(QWidget):
 
     def _seek_to_slider_position(self, value: int) -> None:
         self.player.setPosition(self._slider_to_position(value))
+
+    def _on_seek_action(self, action: int) -> None:
+        # Qt keyboard/wheel actions update sliderPosition before emitting this
+        # signal, but do not emit sliderMoved. Mouse dragging already uses the
+        # latter; programmatic positionChanged updates emit neither action.
+        if action == QSlider.SliderAction.SliderNoAction.value:
+            return
+        if (action == QSlider.SliderAction.SliderMove.value
+                and self.position_slider.isSliderDown()):
+            return
+        self._seek_to_slider_position(self.position_slider.sliderPosition())
 
     def _on_playback_state_changed(self, state) -> None:
         if state == QMediaPlayer.PlaybackState.PlayingState:

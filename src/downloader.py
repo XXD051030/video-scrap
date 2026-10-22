@@ -39,6 +39,10 @@ from .http_limits import iter_limited_response, read_limited_response, resource_
 from .parallel_downloader import ParallelDownloader, _publish_unique, _strong_etag
 from .scraper import VideoItem, is_x_post_url
 from .utils import safe_filename
+from .transfer_clock import monotonic as transfer_monotonic
+from .hls_snapshot import (
+    HlsSnapshotServer, ManifestSnapshot, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_PLAYLISTS,
+)
 
 
 QUALITY_FORMATS: Dict[str, str] = {
@@ -273,6 +277,8 @@ class VideoDownloader:
         self._hls_range_spool = None
         self._hls_range_objects: Dict[str, Path] = {}
         self._hls_range_object_locks: Dict[str, threading.Lock] = {}
+        self._hls_snapshots: Dict[str, ManifestSnapshot] = {}
+        self._hls_snapshot_bytes = 0
 
     def close(self) -> None:
         try:
@@ -376,6 +382,8 @@ class VideoDownloader:
     ) -> Path:
         """Normalize explicitly wrapped HLS before using the existing backends."""
         self._raise_if_cancelled()
+        self._hls_snapshots.clear()
+        self._hls_snapshot_bytes = 0
         # A downloader owns one task; never flatten a browser jar into headers.
         self._session.cookies = browser_cookiejar(getattr(item, "browser_cookies", None))
         with self._download_source(item) as source:
@@ -597,61 +605,7 @@ class VideoDownloader:
             except _HlsFallbackError as exc:
                 if self._cancelled:
                     raise
-                # Keep every backend on the same inspected media playlist.
-                # Reusing a master URL can select an unchecked ranged variant.
-                fallback_url = exc.manifest_url
-                if exc.master_context is not None:
-                    # Preserve an external audio rendition only after checking
-                    # every media choice a backend could make from the master.
-                    self._validate_hls_master_fallback(exc.master_context, item)
-                    fallback_url = exc.master_context.url
-                fallback_item = replace(item, url=fallback_url)
-                self._discard_staged_outputs()
-                if on_progress is not None:
-                    on_progress(
-                        DownloadProgress(
-                            status="downloading",
-                            message="Parallel HLS failed; retrying with yt-dlp...",
-                        )
-                    )
-                try:
-                    result = self._download_hls_ytdlp(fallback_item, on_progress, **(
-                        {"quality": quality} if quality != "best" else {}
-                    ))
-                    ffmpeg = resolve_ffmpeg()
-                    if not ffmpeg:
-                        raise RuntimeError("FFmpeg is required to verify HLS output")
-                    self._verify_hls_output(
-                        ffmpeg, result, exc.expected_duration or item.duration or 0.0,
-                        require_av=exc.require_av,
-                        expected_video_duration=exc.expected_video_duration,
-                        expected_audio_duration=exc.expected_audio_duration,
-                    )
-                    return result
-                except Exception:
-                    if self._cancelled:
-                        raise
-                    self._discard_staged_outputs()
-                    ffmpeg = resolve_ffmpeg()
-                    if not ffmpeg:
-                        raise
-                    if on_progress is not None:
-                        on_progress(
-                            DownloadProgress(
-                                status="downloading",
-                                message="Native HLS failed; retrying with ffmpeg...",
-                            )
-                        )
-                    result = self._download_hls_ffmpeg(fallback_item, ffmpeg, on_progress, **(
-                        {"quality": quality} if quality != "best" else {}
-                    ))
-                    self._verify_hls_output(
-                        ffmpeg, result, exc.expected_duration or item.duration or 0.0,
-                        require_av=exc.require_av,
-                        expected_video_duration=exc.expected_video_duration,
-                        expected_audio_duration=exc.expected_audio_duration,
-                    )
-                    return result
+                return self._run_hls_fallback(item, exc, quality, on_progress)
         if item.is_direct and not item.is_hls and not getattr(item, "is_dash", False):
             return self._download_direct(item, on_progress)
 
@@ -1146,6 +1100,135 @@ class VideoDownloader:
             )
         return output_path
 
+    def _remember_hls_snapshot(self, url, final_url, text):
+        alias = resource_identity_url(None, url)
+        final = resource_identity_url(None, final_url)
+        snapshot = ManifestSnapshot(final_url, text)
+        existing = self._hls_snapshots.get(alias) or self._hls_snapshots.get(final)
+        if existing is not None and existing != snapshot:
+            raise _HlsIntegrityError("HLS playlist changed after inspection")
+        if existing is None:
+            size = len(text.encode("utf-8"))
+            if (len(set(self._hls_snapshots.values())) >= MAX_SNAPSHOT_PLAYLISTS
+                    or self._hls_snapshot_bytes + size > MAX_SNAPSHOT_BYTES):
+                raise _HlsIntegrityError("HLS snapshots exceed their task budget")
+            self._hls_snapshot_bytes += size
+        self._hls_snapshots[alias] = self._hls_snapshots[final] = snapshot
+        return final_url, text
+
+    def _read_hls_snapshot(self, url, headers):
+        self._raise_if_cancelled()
+        saved = self._hls_snapshots.get(resource_identity_url(None, url))
+        if saved is not None:
+            return saved.base_url, saved.text
+        with self._session.get(
+            url, headers=headers, stream=True, timeout=(10, 15), allow_redirects=True
+        ) as response:
+            response.raise_for_status()
+            text = read_limited_response(
+                response, MAX_HLS_MANIFEST_BYTES, HLS_READ_DEADLINE_SECONDS,
+                lambda: self._cancelled,
+            ).decode("utf-8-sig")
+            final_url = response.url
+        self._validate_hls_manifest_header(text)
+        return self._remember_hls_snapshot(url, final_url, text)
+
+    @contextmanager
+    def _hls_fallback_source(self, item, failure):
+        upstream = failure.manifest_url
+        if failure.master_context is not None:
+            context = failure.master_context
+            self._remember_hls_snapshot(context.url, context.url, context.text)
+            self._validate_hls_master_fallback(context, item)
+            upstream = context.url
+        if resource_identity_url(None, upstream) not in self._hls_snapshots:
+            raise _HlsIntegrityError("HLS fallback has no inspected playlist snapshot")
+        snapshots = self._hls_snapshots
+        if failure.master_context is None:
+            selected = snapshots[resource_identity_url(None, upstream)]
+            snapshots = {url: value for url, value in snapshots.items() if value == selected}
+        session = build_session(pool=4)
+        session.cookies = browser_cookiejar(getattr(item, "browser_cookies", None),
+                                           base=self._session.cookies)
+        headers = build_request_headers(item.referer)
+        headers["Accept-Encoding"] = "identity"
+
+        def fetch(url, limit, stopped):
+            self._raise_if_cancelled()
+            with session.get(url, headers=headers, stream=True, timeout=(10, 15)) as response:
+                response.raise_for_status()
+                if response.status_code != 200:
+                    raise _HlsIntegrityError("HLS fallback requires a complete resource response")
+                try:
+                    return read_limited_response(
+                        response, limit, HLS_READ_DEADLINE_SECONDS,
+                        lambda: self._cancelled or stopped(),
+                    )
+                except (ValueError, TimeoutError) as exc:
+                    raise _HlsIntegrityError(f"HLS fallback resource exceeded its budget: {exc}") from exc
+
+        def validate_aes(payload, key, iv):
+            if not payload or len(payload) % 16:
+                raise _HlsIntegrityError("Encrypted HLS segment has an invalid AES block length")
+            previous = payload[-32:-16] if len(payload) > 16 else iv
+            tail = _strip_pkcs7_padding(_aes_cbc_decrypt_bytes(payload[-16:], key, previous))
+            if len(payload) == 16 and not tail:
+                raise _HlsIntegrityError("Encrypted HLS segment contains no media bytes")
+
+        try:
+            with HlsSnapshotServer(
+                snapshots, fetch, validate_aes, _parse_hls_iv,
+                (_HlsIntegrityError, _HlsByteRangeError), close_fetch=session.close,
+            ) as server:
+                yield replace(item, url=server.url(upstream)), server
+        except ValueError as exc:
+            raise _HlsIntegrityError(f"Invalid HLS fallback snapshot: {exc}") from exc
+        finally:
+            session.close()
+
+    def _run_hls_fallback(self, item, failure, quality, on_progress):
+        with self._hls_fallback_source(item, failure) as (fallback_item, snapshot):
+            self._discard_staged_outputs()
+            if on_progress is not None:
+                on_progress(DownloadProgress(status="downloading",
+                                             message="Parallel HLS failed; retrying with yt-dlp..."))
+            try:
+                result = self._download_hls_ytdlp(fallback_item, on_progress, **(
+                    {"quality": quality} if quality != "best" else {}
+                ))
+                snapshot.raise_if_failed()
+                ffmpeg = resolve_ffmpeg()
+                if not ffmpeg:
+                    raise RuntimeError("FFmpeg is required to verify HLS output")
+                self._verify_hls_output(
+                    ffmpeg, result, failure.expected_duration or item.duration or 0.0,
+                    require_av=failure.require_av,
+                    expected_video_duration=failure.expected_video_duration,
+                    expected_audio_duration=failure.expected_audio_duration,
+                )
+                return result
+            except Exception:
+                self._raise_if_cancelled()
+                snapshot.raise_if_failed()
+                self._discard_staged_outputs()
+                ffmpeg = resolve_ffmpeg()
+                if not ffmpeg:
+                    raise
+                if on_progress is not None:
+                    on_progress(DownloadProgress(status="downloading",
+                                                 message="Native HLS failed; retrying with ffmpeg..."))
+                result = self._download_hls_ffmpeg(fallback_item, ffmpeg, on_progress, **(
+                    {"quality": quality} if quality != "best" else {}
+                ))
+                snapshot.raise_if_failed()
+                self._verify_hls_output(
+                    ffmpeg, result, failure.expected_duration or item.duration or 0.0,
+                    require_av=failure.require_av,
+                    expected_video_duration=failure.expected_video_duration,
+                    expected_audio_duration=failure.expected_audio_duration,
+                )
+                return result
+
     def _fetch_hls_manifest(
         self,
         url: str,
@@ -1156,15 +1239,7 @@ class VideoDownloader:
         quality: str = "best",
     ) -> tuple[str, str, Optional[_HlsMasterContext]]:
         self._raise_if_cancelled()
-        with self._session.get(
-            url, headers=headers, stream=True, timeout=(10, 15), allow_redirects=True
-        ) as resp:
-            resp.raise_for_status()
-            text = read_limited_response(
-                resp, MAX_HLS_MANIFEST_BYTES, HLS_READ_DEADLINE_SECONDS,
-                lambda: self._cancelled,
-            ).decode("utf-8-sig")
-            final_url = resp.url
+        final_url, text = self._read_hls_snapshot(url, headers)
         self._raise_if_cancelled()
         self._validate_hls_manifest_header(text)
         if media_only:
@@ -1189,15 +1264,7 @@ class VideoDownloader:
             else None
         )
         self._raise_if_cancelled()
-        with self._session.get(
-            variant, headers=headers, stream=True, timeout=(10, 15), allow_redirects=True
-        ) as child:
-            child.raise_for_status()
-            child_url = child.url
-            child_text = read_limited_response(
-                child, MAX_HLS_MANIFEST_BYTES, HLS_READ_DEADLINE_SECONDS,
-                lambda: self._cancelled,
-            ).decode("utf-8-sig")
+        child_url, child_text = self._read_hls_snapshot(variant, headers)
         self._raise_if_cancelled()
         self._validate_hls_media_manifest(child_text)
         return child_url, child_text, master_context
@@ -1588,7 +1655,7 @@ class VideoDownloader:
                 request_headers["If-Match"] = validator
         last_error: Optional[Exception] = None
         saw_empty_media = False
-        deadline = time.monotonic() + HLS_READ_DEADLINE_SECONDS
+        deadline = transfer_monotonic() + HLS_READ_DEADLINE_SECONDS
         for _attempt in range(1, 11):
             if self._cancelled:
                 raise RuntimeError("Download cancelled")
@@ -1636,7 +1703,7 @@ class VideoDownloader:
                             raise _HlsByteRangeError("HLS byte-range resource version changed")
                     chunks = (self._spooled_hls_range(segment, headers, deadline, resource_url)
                               if is_ranged and use_spool else iter_limited_response(
-                        resp, MAX_HLS_SEGMENT_BYTES, deadline - time.monotonic(),
+                        resp, MAX_HLS_SEGMENT_BYTES, deadline - transfer_monotonic(),
                         lambda: self._cancelled,
                     ))
                     for chunk in chunks:
@@ -1712,7 +1779,7 @@ class VideoDownloader:
                 )
         while not lock.acquire(timeout=0.1):
             self._raise_if_cancelled()
-            if time.monotonic() >= deadline:
+            if transfer_monotonic() >= deadline:
                 raise TimeoutError("HLS range object exceeded its total read deadline")
         try:
             path = self._hls_range_objects.get(resource_url)
@@ -1737,7 +1804,7 @@ class VideoDownloader:
                             raise _HlsByteRangeError("HLS range object must not be content encoded")
                         with path.open("wb") as target:
                             for chunk in iter_limited_response(
-                                response, MAX_HLS_RANGE_OBJECT_BYTES, deadline - time.monotonic(),
+                                response, MAX_HLS_RANGE_OBJECT_BYTES, deadline - transfer_monotonic(),
                                 lambda: self._cancelled,
                             ):
                                 target.write(chunk)
@@ -2360,8 +2427,8 @@ def _parse_hls_iv(value: Optional[str], sequence: int) -> bytes:
 
 def _strip_pkcs7_padding(data: bytes) -> bytes:
     if not data:
-        return data
+        raise _HlsIntegrityError("Encrypted HLS segment has no PKCS#7 padding")
     pad = data[-1]
     if 1 <= pad <= 16 and data.endswith(bytes([pad]) * pad):
         return data[:-pad]
-    return data
+    raise _HlsIntegrityError("Encrypted HLS segment has invalid PKCS#7 padding")

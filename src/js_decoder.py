@@ -56,6 +56,32 @@ MAX_DECODER_CHARS = 2 * 1024 * 1024
 MAX_DECLARATIONS = 4096
 MAX_ARRAY_ELEMENTS = 8192
 MAX_CANDIDATE_CHARS = 64 * 1024
+MAX_TOTAL_CANDIDATE_CHARS = 2 * 1024 * 1024
+MAX_TRANSFORM_WORK_CHARS = 16 * 1024 * 1024
+_REPLACEMENT_TOKEN_RE = re.compile(r"\$([$&`'])")
+
+
+class _CandidateLimitExceeded(ValueError):
+    """One candidate would allocate a string beyond the supported limit."""
+
+
+class _PageWorkLimitExceeded(ValueError):
+    """Stop replaying transforms after a bounded amount of page work."""
+
+
+@dataclass
+class _TransformBudget:
+    remaining: int = MAX_TRANSFORM_WORK_CHARS
+
+    def consume(self, count: int) -> None:
+        if count > self.remaining:
+            raise _PageWorkLimitExceeded("JS decoder transform work limit reached")
+        self.remaining -= count
+
+
+def _check_candidate_size(length: int) -> None:
+    if length > MAX_CANDIDATE_CHARS:
+        raise _CandidateLimitExceeded("JS decoder candidate exceeds its size limit")
 
 
 def _try_parse_string_array(literal: str) -> List[str] | None:
@@ -69,9 +95,22 @@ def _try_parse_string_array(literal: str) -> List[str] | None:
 
 
 def _try_parse_int_array(literal: str) -> List[int] | None:
+    # Permutation indices can never exceed the element cap. Reject a giant
+    # integer token before int() sees it, without changing Python's global
+    # integer-string limit or losing other declarations in the same page.
+    def parse_index(token: str) -> int:
+        if len(token) > len(str(MAX_ARRAY_ELEMENTS - 1)):
+            raise ValueError("Permutation index is outside the supported range")
+        value = int(token)
+        if not 0 <= value < MAX_ARRAY_ELEMENTS:
+            raise ValueError("Permutation index is outside the supported range")
+        return value
+
+    if literal.count(",") + 1 > MAX_ARRAY_ELEMENTS:
+        return None
     try:
-        value = json.loads(literal)
-    except json.JSONDecodeError:
+        value = json.loads(literal, parse_int=parse_index)
+    except ValueError:
         return None
     if not isinstance(value, list) or not all(isinstance(v, int) for v in value):
         return None
@@ -153,22 +192,43 @@ def _parse_js_string(literal: str) -> str | None:
     return "".join(out)
 
 
-def _js_string_replace(value: str, needle: str, replacement: str) -> str:
+def _js_string_replace(
+    value: str, needle: str, replacement: str, budget: _TransformBudget | None = None,
+) -> str:
     """String-search JS replace changes one match and expands JS $ tokens."""
+    _check_candidate_size(len(value))
+    if budget is not None:
+        budget.consume(len(value) + len(needle) + len(replacement))
     index = value.find(needle)
     if index < 0:
         return value
+    # Calculate the real JS substitution size before taking slices or letting
+    # re.sub allocate an expanded replacement. $` and $' can repeat nearly the
+    # entire input for every token even when the template itself is tiny.
+    expanded_length = len(replacement)
+    token_lengths = {"$": 1, "&": len(needle), "`": index,
+                     "'": len(value) - index - len(needle)}
+    for match in _REPLACEMENT_TOKEN_RE.finditer(replacement):
+        expanded_length += token_lengths[match[1]] - len(match[0])
+    result_length = len(value) - len(needle) + expanded_length
+    _check_candidate_size(result_length)
+    if budget is not None:
+        budget.consume(result_length)
     prefix, suffix = value[:index], value[index + len(needle):]
-    replacement = re.sub(
-        r"\$([$&`'])",
+    replacement = _REPLACEMENT_TOKEN_RE.sub(
         lambda match: {"$": "$", "&": needle, "`": prefix, "'": suffix}[match[1]],
         replacement,
     )
     return prefix + replacement + suffix
 
 
-def _apply_expression(expression: str, target: str, value: str) -> str | None:
+def _apply_expression(
+    expression: str, target: str, value: str, budget: _TransformBudget | None = None,
+) -> str | None:
     """Evaluate the supported self-assignment chain, rejecting extra code."""
+    _check_candidate_size(len(value))
+    if budget is not None:
+        budget.consume(len(expression) + len(value))
     expression = expression.strip()
     decoded = re.match(rf"decodeURIComponent\(\s*{re.escape(target)}\s*\)", expression)
     if decoded:
@@ -178,6 +238,9 @@ def _apply_expression(expression: str, target: str, value: str) -> str | None:
             value = unquote(value, errors="strict")
         except UnicodeDecodeError:
             return None
+        _check_candidate_size(len(value))
+        if budget is not None:
+            budget.consume(len(value))
         position = decoded.end()
     else:
         identity = re.match(rf"{re.escape(target)}(?![\w$])", expression)
@@ -191,12 +254,15 @@ def _apply_expression(expression: str, target: str, value: str) -> str | None:
         needle, replacement = (_parse_js_string(part) for part in match.groups())
         if needle is None or replacement is None:
             return None
-        value = _js_string_replace(value, needle, replacement)
+        value = _js_string_replace(value, needle, replacement, budget)
         position = match.end()
     return value
 
 
-def _decode_pipeline(html: str, pair: _ArrayPair, joined: str) -> str | None:
+def _decode_pipeline(
+    html: str, pair: _ArrayPair, joined: str, budget: _TransformBudget | None = None,
+) -> str | None:
+    _check_candidate_size(len(joined))
     window = re.split(r"</script\b", html[pair.position:pair.position + 2000], maxsplit=1, flags=re.IGNORECASE)[0]
     window = _COMMENT_OR_STRING_RE.sub(
         lambda match: " " * len(match[0]) if match[0].startswith(("//", "/*")) else match[0],
@@ -247,15 +313,20 @@ def _decode_pipeline(html: str, pair: _ArrayPair, joined: str) -> str | None:
     for match in assignments:
         if target is None or match["target"] != target:
             continue
-        value = _apply_expression(match["value"], target, value)
+        value = _apply_expression(match["value"], target, value, budget)
         if value is None:
             return None
         transformed = True
     if not transformed and not value.lower().startswith(("http://", "https://")):
+        if budget is not None:
+            budget.consume(len(value))
         try:
             value = unquote(value, errors="strict")
         except UnicodeDecodeError:
             return None
+        _check_candidate_size(len(value))
+        if budget is not None:
+            budget.consume(len(value))
     return value
 
 
@@ -264,6 +335,9 @@ def decode_obfuscated_urls(html: str) -> List[str]:
     if len(html) > MAX_DECODER_CHARS:
         return []  # Browser fallback can handle scripts outside this budget.
     out: List[str] = []
+    seen: set[str] = set()
+    total_candidate_chars = 0
+    budget = _TransformBudget(MAX_TRANSFORM_WORK_CHARS)
     for pair in _candidate_pairs(html):
         strings, ints = pair.strings, pair.indices
         n = len(ints)
@@ -273,18 +347,29 @@ def decode_obfuscated_urls(html: str) -> List[str]:
             # a full scan of the permutation for every fragment.
             positions.setdefault(value, index)
         try:
+            # Check length before join creates a potentially oversized string.
+            joined_length = sum(len(part) for part in strings)
+            _check_candidate_size(joined_length)
+            budget.consume(joined_length)
             joined = "".join(strings[positions[i]] for i in range(n))
         except KeyError:
             continue
-        if len(joined) > MAX_CANDIDATE_CHARS:
+        except _CandidateLimitExceeded:
             continue
-        candidate = _decode_pipeline(html, pair, joined)
-        if candidate and candidate.lower().startswith(("http://", "https://")) and _MEDIA_EXT_RE.search(candidate):
+        except _PageWorkLimitExceeded:
+            break
+        try:
+            candidate = _decode_pipeline(html, pair, joined, budget)
+        except _CandidateLimitExceeded:
+            continue
+        except _PageWorkLimitExceeded:
+            break
+        if (candidate and candidate not in seen
+                and candidate.lower().startswith(("http://", "https://"))
+                and _MEDIA_EXT_RE.search(candidate)):
+            if total_candidate_chars + len(candidate) > MAX_TOTAL_CANDIDATE_CHARS:
+                continue
+            total_candidate_chars += len(candidate)
+            seen.add(candidate)
             out.append(candidate)
-    seen: set[str] = set()
-    unique: List[str] = []
-    for url in out:
-        if url not in seen:
-            seen.add(url)
-            unique.append(url)
-    return unique
+    return out

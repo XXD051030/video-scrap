@@ -942,7 +942,9 @@ class MainWindow(QMainWindow):
         )
         for item in items:
             if referer_url:
-                item.referer = referer_url
+                # URL fragments are a browser-only location; never send them
+                # as the HTTP Referer of a captured media request.
+                item.referer = referer_url.split("#", 1)[0]
             item.browser_cookies = [dict(cookie) for cookie in (browser_cookies or [])]
         self.video_list.set_videos(items)
         self._update_video_count_badge(len(items))

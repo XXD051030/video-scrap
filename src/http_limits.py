@@ -8,6 +8,8 @@ import threading
 from typing import Callable, Iterator, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from .transfer_clock import monotonic as transfer_monotonic
+
 
 def resource_identity_url(response, fallback_url: str) -> str:
     """Identity of the final HTTP resource, independent of a local ETag.
@@ -100,12 +102,12 @@ def iter_limited_response(
     Content-Length is only an early rejection; decoded bytes remain bounded.
     """
     limit = max(0, int(max_bytes))
-    deadline = time.monotonic() + max(0.0, float(deadline_seconds))
+    deadline = transfer_monotonic() + max(0.0, float(deadline_seconds))
 
     def check() -> None:
         if cancelled is not None and cancelled():
             raise InterruptedError("Response read cancelled")
-        if time.monotonic() >= deadline:
+        if transfer_monotonic() >= deadline:
             raise TimeoutError("Response exceeded its total read deadline")
 
     check()
@@ -134,8 +136,8 @@ def iter_limited_response(
     lifecycle_lock = threading.Lock()
 
     def watch():
-        while not finished.wait(min(.1, max(.001, deadline - time.monotonic()))):
-            if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
+        while not finished.wait(min(.1, max(.001, deadline - transfer_monotonic()))):
+            if transfer_monotonic() >= deadline or (cancelled is not None and cancelled()):
                 with lifecycle_lock:
                     if not finished.is_set():
                         abort_response(response)
@@ -221,7 +223,7 @@ def iter_continuous_response(
             with lock:
                 if finished.is_set():
                     return
-                expired = reading and time.monotonic() - read_started >= idle_seconds
+                expired = reading and transfer_monotonic() - read_started >= idle_seconds
                 if stop or expired:
                     timed_out = bool(expired)
                     abort_response(response)
@@ -240,7 +242,7 @@ def iter_continuous_response(
         while True:
             check()
             with lock:
-                reading, read_started = True, time.monotonic()
+                reading, read_started = True, transfer_monotonic()
             try:
                 chunk = next(chunks)
             except StopIteration:

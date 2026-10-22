@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.downloader import DownloadProgress, VideoDownloader, _HlsFallbackError, _HlsSegment
 from src.scraper import VideoItem
+from http_fixtures import inspected_hls_failure
 
 
 PAYLOAD = b"ordinary synthetic download payload"
@@ -336,7 +337,7 @@ class DownloadCancellationTests(unittest.TestCase):
                 downloader.cancel()
 
         with mock.patch.object(downloader, "_download_hls_parallel", side_effect=
-                               _HlsFallbackError("needs native backend", item(hls=True).url)), \
+                               inspected_hls_failure(downloader, item(hls=True).url, "needs native backend")), \
                 mock.patch("src.downloader.yt_dlp.YoutubeDL", self.ydl(record)), \
                 mock.patch.object(downloader, "_download_hls_ffmpeg") as ffmpeg:
             with self.assertRaisesRegex(RuntimeError, "cancelled"):
@@ -363,7 +364,7 @@ class DownloadCancellationTests(unittest.TestCase):
                 downloader.cancel()
 
         with mock.patch.object(downloader, "_download_hls_parallel", side_effect=
-                               _HlsFallbackError("needs fallback", item(hls=True).url)), \
+                               inspected_hls_failure(downloader, item(hls=True).url, "needs fallback")), \
                 mock.patch.object(downloader, "_download_hls_ytdlp", side_effect=RuntimeError("native unavailable")), \
                 mock.patch.object(downloader, "_probe_hls_duration", return_value=10), \
                 mock.patch("src.downloader.subprocess.Popen", side_effect=create):

@@ -281,24 +281,26 @@ class HlsIntegrityAudioTests(unittest.TestCase):
 
     def test_audio_parse_failure_still_requires_av_from_every_fallback(self):
         self.routes["/missing.m3u8"] = self.routes["/audio.m3u8"]
-        self.routes["/audio.m3u8"] = self.routes["/audio.m3u8"].replace(
-            b"#EXTM3U\n",
-            b'#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0xnothex\n',
-        )
-        self.routes["/key.bin"] = b"0123456789abcdef"
         video_only = self.output / "fixture-video-only.mp4"
         self.run_ffmpeg("-i", str(self.fixtures / "source.mp4"),
                         "-map", "0:v:0", "-c", "copy", str(video_only))
         payload = video_only.read_bytes()
         video_only.unlink()
         downloader = self.downloader()
+        original_parse = downloader._parse_hls_segments
+
+        def native_audio_parser_unavailable(text, url, headers):
+            if url.endswith("/audio.m3u8"):
+                raise RuntimeError("Native audio parser unavailable")
+            return original_parse(text, url, headers)
 
         def incomplete_fallback(_item, *_args):
             output = downloader.output_dir / "Synthetic.mp4"
             output.write_bytes(payload)
             return output
 
-        with mock.patch.object(downloader, "_download_hls_ytdlp", side_effect=incomplete_fallback) as ytdlp, \
+        with mock.patch.object(downloader, "_parse_hls_segments", side_effect=native_audio_parser_unavailable), \
+                mock.patch.object(downloader, "_download_hls_ytdlp", side_effect=incomplete_fallback) as ytdlp, \
                 mock.patch.object(downloader, "_download_hls_ffmpeg", side_effect=incomplete_fallback) as ffmpeg:
             with self.assertRaisesRegex(_HlsIntegrityError, "missing.*audio"):
                 downloader.download(self.item())

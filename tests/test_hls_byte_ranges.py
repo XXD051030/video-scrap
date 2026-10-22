@@ -399,7 +399,10 @@ ranged.m3u8
                 video.referer = "https://example.test/watch"
 
                 def finished(fallback_item, *_args):
-                    self.assertEqual(fallback_item.url, plain_url)
+                    self.assertTrue(fallback_item.url.startswith("http://127.0.0.1:"))
+                    frozen = requests.get(fallback_item.url, timeout=2).text
+                    self.assertIn("#EXTINF:1,", frozen)
+                    self.assertNotIn("#EXT-X-STREAM-INF", frozen)
                     self.assertEqual(fallback_item.source_url, MANIFEST_URL)
                     self.assertEqual(fallback_item.title, video.title)
                     self.assertEqual(fallback_item.referer, video.referer)
@@ -417,9 +420,9 @@ ranged.m3u8
                     result = downloader.download(video)
                     verify.assert_called_once()
                 self.assertEqual(result.read_bytes(), b"verified plain variant")
-                self.assertEqual(ytdlp.call_args.args[0].url, plain_url)
+                self.assertTrue(ytdlp.call_args.args[0].url.startswith("http://127.0.0.1:"))
                 if backend == "ffmpeg":
-                    self.assertEqual(ffmpeg.call_args.args[0].url, plain_url)
+                    self.assertEqual(ffmpeg.call_args.args[0].url, ytdlp.call_args.args[0].url)
                 else:
                     ffmpeg.assert_not_called()
                 self.assertTrue(all(url == plain_url for url, _ in downloader._session.media_requests))
@@ -448,7 +451,10 @@ other.m3u8
         downloader = self.downloader(self.audio_master(), respond)
 
         def finished(fallback_item, *_args):
-            self.assertEqual(fallback_item.url, MANIFEST_URL)
+            self.assertTrue(fallback_item.url.startswith("http://127.0.0.1:"))
+            frozen = requests.get(fallback_item.url, timeout=2).text
+            self.assertIn('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="sound"', frozen)
+            self.assertIn("#EXT-X-STREAM-INF:", frozen)
             self.assertEqual(fallback_item.source_url, MANIFEST_URL)
             output = downloader.output_dir / "Range clip.mp4"
             output.write_bytes(b"verified video with audio")
@@ -461,7 +467,7 @@ other.m3u8
                 mock.patch.object(downloader, "_verify_hls_output") as verify:
             result = downloader.download(self.item())
         self.assertEqual(result.read_bytes(), b"verified video with audio")
-        self.assertEqual(ytdlp.call_args.args[0].url, MANIFEST_URL)
+        self.assertTrue(ytdlp.call_args.args[0].url.startswith("http://127.0.0.1:"))
         self.assertTrue(verify.call_args.kwargs["require_av"])
         self.assertTrue(set(candidates).issubset({url for url, _ in downloader._session.media_requests}))
 

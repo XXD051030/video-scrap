@@ -538,6 +538,15 @@ class VideoScraper:
 
         for item in list(results):
             seen_urls.add(item.url)
+            # Extractor items retain the page URL and all format metadata.
+            # A later HTML candidate for one of those exact media URLs is a
+            # duplicate format, not another discovered video. Do not compare
+            # titles, hosts, or query-stripped URLs: different clips and signed
+            # format URLs must remain distinct.
+            for fmt in item.formats:
+                media_url = _resolve_player_media_url(fmt.get("url"), url)
+                if media_url:
+                    seen_urls.add(media_url)
 
         log("Scanning page HTML for direct video links...")
         document_url = base_url = url
@@ -581,6 +590,16 @@ class VideoScraper:
                     if it.url in seen_urls:
                         continue
                     seen_urls.add(it.url)
+                    media_urls = {
+                        resolved for fmt in it.formats
+                        if (resolved := _resolve_player_media_url(fmt.get("url"), iframe_url))
+                    }
+                    # HTML is scanned before embeds. Prefer the embed's full
+                    # format metadata over an earlier direct copy of that same
+                    # media; later hidden/config scans also see these URLs.
+                    results = [entry for entry in results if not (
+                        entry.is_direct and not entry.hls_png_wrapped and entry.url in media_urls)]
+                    seen_urls.update(media_urls)
                     it.source_url = url
                     if not it.thumbnail and poster:
                         it.thumbnail = poster

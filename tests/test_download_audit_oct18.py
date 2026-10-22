@@ -1,6 +1,8 @@
 """Offline regression evidence for downloader audit D01/D02/D03/D04/D09/D23."""
 
 from concurrent.futures import ThreadPoolExecutor
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from functools import partial
 import errno
 import os
 from pathlib import Path
@@ -8,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import tracemalloc
+import threading
 import unittest
 from unittest import mock
 
@@ -284,17 +287,31 @@ class HlsFallbackRealMediaTests(unittest.TestCase):
         self.output.mkdir()
         self.fixtures_copy = Path(temporary.name) / "source"
         shutil.copytree(self.fixtures, self.fixtures_copy)
+        class QuietHandler(SimpleHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+        self.server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), partial(QuietHandler, directory=str(self.fixtures_copy)))
+        self.server.daemon_threads = True
+        runner = threading.Thread(target=self.server.serve_forever, daemon=True)
+        runner.start()
+        self.addCleanup(runner.join, 2)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
         self.downloader = VideoDownloader(self.output)
         self.addCleanup(self.downloader.close)
 
     def item(self):
-        return VideoItem("fallback", str(self.fixtures_copy / "mixed.m3u8"),
+        return VideoItem("fallback", f"http://127.0.0.1:{self.server.server_port}/mixed.m3u8",
                          "https://example.test/", duration=3, is_direct=True, is_hls=True)
 
     def fallback(self, item, updates):
+        def native_failure(*_args, **_kwargs):
+            self.downloader._fetch_hls_manifest(item.url, {})
+            raise _HlsFallbackError("native failed", item.url, expected_duration=3,
+                                    expected_video_duration=3)
         with mock.patch.object(self.downloader, "_download_hls_parallel",
-                               side_effect=_HlsFallbackError("native failed", item.url, expected_duration=3,
-                                                             expected_video_duration=3)), \
+                               side_effect=native_failure), \
                 mock.patch.object(self.downloader, "_download_hls_ytdlp", side_effect=RuntimeError("offline unavailable")):
             return self.downloader.download(item, on_progress=updates.append)
 
@@ -334,10 +351,13 @@ class HlsFallbackRealMediaTests(unittest.TestCase):
             return output
 
         updates = []
-        with mock.patch.object(self.downloader, "_download_hls_parallel", side_effect=_HlsFallbackError(
-            "native failed", item.url, require_av=True, expected_duration=3.03,
-            expected_video_duration=3, expected_audio_duration=3.03,
-        )), mock.patch.object(self.downloader, "_download_hls_ytdlp", side_effect=incomplete) as ytdlp, \
+        def native_failure(*_args, **_kwargs):
+            self.downloader._fetch_hls_manifest(item.url, {})
+            raise _HlsFallbackError(
+                "native failed", item.url, require_av=True, expected_duration=3.03,
+                expected_video_duration=3, expected_audio_duration=3.03)
+        with mock.patch.object(self.downloader, "_download_hls_parallel", side_effect=native_failure), \
+                mock.patch.object(self.downloader, "_download_hls_ytdlp", side_effect=incomplete) as ytdlp, \
                 mock.patch.object(self.downloader, "_download_hls_ffmpeg", side_effect=incomplete) as ffmpeg:
             with self.assertRaisesRegex(_HlsIntegrityError, "audio track is shorter"):
                 self.downloader.download(item, on_progress=updates.append)

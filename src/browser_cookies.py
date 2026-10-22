@@ -23,6 +23,7 @@ from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.exceptions import ReadTimeoutError
 
 from .http_limits import origin_key
+from .transfer_clock import deadline_timer
 
 # Only these public request metadata headers may leave the original origin.
 # Custom extractor headers are credentials unless explicitly known otherwise.
@@ -189,7 +190,7 @@ class _CancelableAdapter(HTTPAdapter):
                                 connection.shutdown(socket.SHUT_RDWR)
                             except OSError:
                                 pass
-                timer = threading.Timer(owner.HEADER_DEADLINE_SECONDS, abort_headers)
+                timer = deadline_timer(owner.HEADER_DEADLINE_SECONDS, abort_headers)
                 timer.daemon = True
                 timer.start()
                 try:

@@ -65,7 +65,8 @@ _MEDIA_EXTENSIONS = (
 
 EXTRACT_SCRIPT = r"""
 (function () {
-    const out = { videos: [], iframes: [], pageTitle: document.title || '' };
+    const out = { videos: [], iframes: [], pageTitle: document.title || '',
+                  documentUrl: location.href };
     function push(arr, url) {
         if (!url || typeof url !== 'string') return;
         if (url.startsWith('blob:') || url.startsWith('data:')) return;
@@ -185,7 +186,7 @@ class _MediaInterceptor(QWebEngineUrlRequestInterceptor):  # type: ignore[misc]
 
     def __init__(
         self,
-        on_url: Callable[[str], None],
+        on_url: Callable[[str, str], None],
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -194,13 +195,14 @@ class _MediaInterceptor(QWebEngineUrlRequestInterceptor):  # type: ignore[misc]
     def interceptRequest(self, info) -> None:  # noqa: N802 (Qt API)
         try:
             url = info.requestUrl().toString()
+            document_url = info.firstPartyUrl().toString()
         except Exception:  # noqa: BLE001
             return
         if not url:
             return
         path = url.lower().split("?", 1)[0]
         if any(path.endswith("." + ext) for ext in _MEDIA_EXTENSIONS):
-            self._on_url(url)
+            self._on_url(url, document_url)
 
 
 class InteractiveScrapeDialog(QDialog):
@@ -224,7 +226,12 @@ class InteractiveScrapeDialog(QDialog):
         self.page_url = url
         self.browser_cookies: list[dict] = []
         self._disposed = False
+        self._page_generation = 0
+        self._extract_serial = 0
+        self._navigation_pending = False
         self._captured_media: Set[str] = set()
+        self._network_media: Set[str] = set()
+        self._dom_media: Set[str] = set()
         self._captured_iframes: Set[str] = set()
         self._page_title: str = ""
 
@@ -285,6 +292,9 @@ class InteractiveScrapeDialog(QDialog):
         self.finished.connect(self._detach_interceptor)
 
         self._page.loadFinished.connect(self._on_load_finished)
+        load_started = getattr(self._page, "loadStarted", None)
+        if load_started is not None:
+            load_started.connect(self._on_load_started)
         self._page.urlChanged.connect(self._on_url_changed)
         self._page.titleChanged.connect(self._on_title_changed)
 
@@ -292,18 +302,60 @@ class InteractiveScrapeDialog(QDialog):
 
     # ---------------------------------------------------------------- hooks
 
-    def _capture_url(self, url: str) -> None:
+    @staticmethod
+    def _document_identity(url: str) -> str:
+        # Fragment changes stay in the same document. Query/path changes
+        # represent a new capture scope, including SPA history navigation.
+        return QUrl(url).adjusted(QUrl.UrlFormattingOption.RemoveFragment).toString()
+
+    def _reset_capture(self) -> None:
+        self._page_generation += 1
+        self._extract_serial += 1
+        self._captured_media.clear()
+        self._network_media.clear()
+        self._dom_media.clear()
+        self._captured_iframes.clear()
+        self._page_title = ""
+        self.browser_cookies = []
+        self._use_btn.setEnabled(False)
+
+    def _on_load_started(self) -> None:
         if self._disposed:
             return
-        if url in self._captured_media:
+        self._navigation_pending = True
+        self._reset_capture()
+
+    def _capture_url(self, url: str, document_url: str = "") -> None:
+        if self._disposed:
             return
-        self._captured_media.add(url)
+        current = self._document_identity(self.page_url)
+        if self._navigation_pending:
+            # Reloading the same URL need not emit urlChanged. Keep network
+            # media from that document, while blocking the old page during
+            # navigation to a different requested URL.
+            requested = self._document_identity(self._page.requestedUrl().toString())
+            if requested != current:
+                return
+        if (not document_url or self._document_identity(document_url) != current
+                or self._document_identity(self._page.url().toString()) != current):
+            # firstPartyUrl is the top-level document even for a cross-origin
+            # iframe/CDN request. Unknown sources are not assigned to the page;
+            # current DOM extraction can still identify their video elements.
+            return
+        if url in self._network_media:
+            return
+        self._network_media.add(url)
         self.log.emit(redact_log_secrets(f"[interactive] media request: {url}"))
         self._refresh_status()
 
     def _on_url_changed(self, qurl: QUrl) -> None:
+        if self._disposed:
+            return
         text = qurl.toString()
+        if self._document_identity(text) != self._document_identity(self.page_url):
+            self._reset_capture()
         self.page_url = text
+        self._navigation_pending = False
         self._status.setText(f"At {text}")
 
     def _on_title_changed(self, title: str) -> None:
@@ -311,45 +363,82 @@ class InteractiveScrapeDialog(QDialog):
             self._page_title = title
 
     def _on_load_finished(self, ok: bool) -> None:
-        if self._disposed or not ok:
+        if self._disposed:
+            return
+        if self._page.isLoading():
+            return  # An aborted older navigation must not unlock a new one.
+        self._navigation_pending = False
+        if not ok:
             return
         self._run_extract()
 
     def _run_extract(self) -> None:
-        if self._disposed:
+        if self._disposed or self._navigation_pending:
             return
+        generation = self._page_generation
+        document_url = self._document_identity(self.page_url)
+        if self._document_identity(self._page.url().toString()) != document_url:
+            return
+        self._extract_serial += 1
+        serial = self._extract_serial
         try:
-            self._page.runJavaScript(EXTRACT_SCRIPT, self._on_extract_result)
+            self._page.runJavaScript(
+                EXTRACT_SCRIPT,
+                lambda result: self._on_extract_result(result, generation, document_url, serial),
+            )
         except Exception as exc:  # noqa: BLE001
             self.log.emit(f"[interactive] extract failed: {exc}")
 
-    def _on_extract_result(self, result) -> None:
-        if self._disposed or not isinstance(result, dict):
+    def _on_extract_result(self, result, generation: int, document_url: str, serial=None) -> None:
+        if (self._disposed or self._navigation_pending or not isinstance(result, dict)
+                or generation != self._page_generation
+                or (serial is not None and serial != self._extract_serial)
+                or document_url != self._document_identity(self.page_url)
+                or document_url != self._document_identity(self._page.url().toString())):
             return
-        for link in result.get("videos") or []:
+        reported_url = result.get("documentUrl")
+        if (isinstance(reported_url, str)
+                and self._document_identity(reported_url) != document_url):
+            return
+        videos = result.get("videos")
+        iframes = result.get("iframes")
+        # Re-scan replaces the prior DOM view; network-only media for this
+        # navigation is kept separately. A SPA may replace its video after
+        # updating history without creating a new document or loadFinished.
+        self._dom_media.clear()
+        self._captured_iframes.clear()
+        for link in videos if isinstance(videos, list) else []:
             if isinstance(link, str) and link.startswith("http"):
-                self._captured_media.add(link)
-        for link in result.get("iframes") or []:
+                self._dom_media.add(link)
+        for link in iframes if isinstance(iframes, list) else []:
             if isinstance(link, str) and link.startswith("http"):
                 self._captured_iframes.add(link)
-        title = result.get("pageTitle") or ""
-        if title:
+        title = result.get("pageTitle")
+        if isinstance(title, str) and title:
             self._page_title = title
         self._refresh_status()
 
     def _refresh_status(self) -> None:
+        self._captured_media = self._network_media | self._dom_media
         total = len(self._captured_media) + len(self._captured_iframes)
         self._status.setText(
             f"Captured {len(self._captured_media)} media URL(s), "
             f"{len(self._captured_iframes)} iframe(s)"
         )
-        self._use_btn.setEnabled(total > 0)
+        self._use_btn.setEnabled(total > 0 and not self._navigation_pending)
 
     # ---------------------------------------------------------------- exit
 
     def _finish(self) -> None:
-        if self._disposed:
+        if self._disposed or self._navigation_pending:
             return
+        current_url = self._page.url().toString()
+        if self._document_identity(current_url) != self._document_identity(self.page_url):
+            self._on_url_changed(QUrl(current_url))
+            return
+        if not self._captured_media and not self._captured_iframes:
+            return
+        self.page_url = current_url
         videos = sorted(self._captured_media)
         iframes = sorted(self._captured_iframes)
         self.browser_cookies = snapshot_browser_cookies(

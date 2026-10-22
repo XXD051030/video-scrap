@@ -30,6 +30,7 @@ from .parallel_downloader import _publish_unique
 from .scraper import VideoItem
 from .process_owner import ProcessOwner
 from .temp_ownership import create_owned_tempdir, add_temp_owner
+from .transfer_clock import configure_pause_offset
 
 
 class DownloadCancelled(RuntimeError):
@@ -75,8 +76,10 @@ def _download_child(
     owner_ready=None,
     owner_release=None,
     owner_pgid=None,
+    pause_offset=None,
 ) -> None:
     """Spawn target; imported normally by Python and the frozen executable."""
+    configure_pause_offset(pause_offset)
     if owner_ready is not None:
         if sys.platform != "win32":
             if owner_pgid is None:
@@ -562,6 +565,17 @@ class DownloadJob:
             destination.mkdir(parents=True, exist_ok=True)
             work_dir = create_owned_tempdir(".video-scrap-job-", destination)
             context = multiprocessing.get_context("spawn")
+            # Only this supervisor writes; no lock may be held by an OS-paused
+            # child when its clock is compensated before resume.
+            pause_offset = context.RawValue("q", 0)
+            pause_started = None
+
+            def resume_tree():
+                nonlocal pause_started
+                if pause_started is not None:
+                    pause_offset.value += max(0, time.monotonic_ns() - pause_started)
+                    pause_started = None
+                tree.resume()
             owner = ProcessOwner(cancelled=lambda: self._requests()[0])
             if owner.anchor_pid is not None:
                 add_temp_owner(work_dir, owner.anchor_pid, group=owner.pgid)
@@ -571,7 +585,7 @@ class DownloadJob:
                 target=_download_child,
                 args=(sender, _item_payload(self.item), str(work_dir), self.quality,
                       self.audio_format, self.parallel_connections, owner_ready, owner_release,
-                      owner.pgid),
+                      owner.pgid, pause_offset),
                 name="VideoScraperDownload",
             )
             with self._lock:
@@ -646,6 +660,7 @@ class DownloadJob:
                     raise DownloadCancelled("Download cancelled")
                 tree.discover()
                 if want_paused and not tree.suspended and process.is_alive():
+                    pause_started = time.monotonic_ns()
                     tree.suspend()
                     # A resume/cancel request can arrive during OS suspension.
                     cancelled, want_paused = self._requests()
@@ -654,10 +669,10 @@ class DownloadJob:
                     if want_paused:
                         self._state_to("paused")
                     else:
-                        tree.resume()
+                        resume_tree()
                         self._state_to("downloading")
                 elif not want_paused and tree.suspended:
-                    tree.resume()
+                    resume_tree()
                     self._state_to("downloading")
                 if not process.is_alive() and pipe_eof:
                     break

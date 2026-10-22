@@ -284,12 +284,12 @@ class WrappedHlsDownloadTests(unittest.TestCase):
 
         def fallback(item, _progress):
             self.assertFalse(item.hls_png_wrapped)
-            self.assertTrue(item.url.startswith(self.proxies[0].base_url + "/play/"))
+            self.assertTrue(item.url.startswith("http://127.0.0.1:"))
             response = requests.get(item.url, timeout=5)
             response.raise_for_status()
             self.assertTrue(response.text.startswith("#EXTM3U"))
             urls = [line for line in response.text.splitlines() if line and not line.startswith("#")]
-            self.assertTrue(all(url.startswith(self.proxies[0].base_url) for url in urls))
+            self.assertTrue(all(url.startswith(item.url.rsplit("/", 1)[0]) for url in urls))
             segment = requests.get(urls[0], timeout=5)
             segment.raise_for_status()
             self.assertEqual(segment.content, self.segments[0].read_bytes())
@@ -298,14 +298,18 @@ class WrappedHlsDownloadTests(unittest.TestCase):
             return target
 
         with mock.patch.object(downloader, "_remux_hls_segments", side_effect=RuntimeError("forced remux error")):
-            with mock.patch.object(downloader, "_download_hls_ytdlp", side_effect=fallback):
+            with mock.patch.object(downloader, "_download_hls_ytdlp", side_effect=fallback) as native, \
+                    mock.patch.object(downloader, "_download_hls_ffmpeg") as last_fallback:
                 output = downloader.download(self.item())
+                native.assert_called_once()
+                last_fallback.assert_not_called()
         self.assert_decodes(output)
         self.assert_proxy_cleaned()
 
     def test_real_ffmpeg_fallback_can_read_the_same_local_manifest_and_segments(self):
         downloader = self.downloader()
         def force_fallback(item, _progress):
+            downloader._fetch_hls_manifest(item.url, {})
             raise _HlsFallbackError("forced native failure", item.url, None)
 
         with mock.patch.object(downloader, "_download_hls_parallel", side_effect=force_fallback):
