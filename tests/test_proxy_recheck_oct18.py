@@ -266,19 +266,35 @@ class ProxyRecheckTests(unittest.TestCase):
                 self.assertTrue(response.closed)
 
     def test_slow_player_backpressure_does_not_count_as_upstream_idle(self):
+        # A controllable transfer clock: a real 5 ms upstream sleep can exceed
+        # the 25 ms idle budget on a shared CI runner. Each player write still
+        # moves the clock past the budget, so counting backpressure as upstream
+        # idle time would time out.
+        clock = [0.0]
+
         class SlowOutput(io.BytesIO):
             def write(output, data):
+                clock[0] += .055
                 time.sleep(.055)
                 return super().write(data)
 
         entry = self.entry()
         entry.total_size = 8
-        response = Response(delay=.005)
+        response = Response()
+
+        def chunks(chunk_size=65536):
+            for byte in response.body:
+                clock[0] += .005
+                yield bytes([byte])
+
+        response.iter_content = chunks
         request = Request(output=SlowOutput())
         with patch.object(self.proxy._session, "get", return_value=response), \
-             patch("src.media_proxy.READ_DEADLINE_SECONDS", .025):
+             patch("src.media_proxy.READ_DEADLINE_SECONDS", .025), \
+             patch("src.http_limits.transfer_monotonic", side_effect=lambda: clock[0]):
             self.proxy._serve_range(request, entry)
         self.assertEqual(request.wfile.getvalue(), response.body)
+        self.assertGreater(clock[0], .4)
 
     def test_whole_media_stall_times_out_and_cancellation_interrupts_blocked_read(self):
         for cancel in (False, True):
