@@ -20,6 +20,7 @@ def main() -> int:
     from src.settings import SETTINGS_PATH
     from src.single_instance import InstanceRole, SingleInstance
 
+    sys.excepthook = _report_unhandled_exception
     app = QApplication(sys.argv)
     app.setApplicationName("Video Scraper")
     app.setStyle("Fusion")
@@ -53,6 +54,15 @@ def main() -> int:
             _finish_download_shutdown(window, app)
             _safe_stop_proxy(window)
         instance.close()
+
+
+def _report_unhandled_exception(exc_type, exc, tb) -> None:
+    """Print an exception that escaped a Qt slot instead of aborting.
+
+    With the default sys.excepthook, PyQt6 calls qFatal() and the whole app
+    terminates, so one failed background callback would close every window.
+    """
+    sys.__excepthook__(exc_type, exc, tb)
 
 
 def _activate_window(window: MainWindow) -> None:

@@ -127,7 +127,8 @@ class ThumbnailNetworkTests(unittest.TestCase):
         self.stalled.clear()
         self.release.clear()
         worker, ready, failed = self.start("/stall")
-        self.assertTrue(self.stalled.wait(1))
+        # The fetch runs on this (GUI) thread's event loop.
+        pump_until(self.stalled.is_set, timeout=1)
         started = time.monotonic()
         worker.cancel()
         pump_until(lambda: worker not in workers._BACKGROUND_WORKERS, timeout=0.8)

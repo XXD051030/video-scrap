@@ -39,6 +39,21 @@ def pump_until(predicate, timeout=3):
     APP.processEvents()
 
 
+def drive_thumbnail(worker, rounds=3000):
+    """Run a thumbnail's GUI-thread fetch and decode thread to completion.
+
+    Avoids time.monotonic, which some tests replace with a fake clock.
+    """
+    for _ in range(rounds):
+        APP.processEvents()
+        if worker.isFinished():
+            break
+        time.sleep(0.001)
+    else:
+        raise AssertionError("Thumbnail worker did not finish")
+    APP.processEvents()
+
+
 def image_bytes(width=12, height=8):
     image = QImage(width, height, QImage.Format.Format_RGB32)
     image.fill(0x336699)
@@ -162,8 +177,8 @@ class ThumbnailInputTests(unittest.TestCase):
         self.assertEqual(names("https://origin.invalid/public"), {"domain", "base_host"})
         parent.deleteLater()
 
-    def run_thumbnail(self, response, extra_patches=()):
-        session = Session(response)
+    def run_thumbnail(self, response, extra_patches=(), session=None):
+        session = session or Session(response)
         worker = workers.ThumbnailWorker(7, "https://images.invalid/thumb.png")
         ready, failed = [], []
         worker.ready.connect(lambda *args: ready.append(args))
@@ -172,7 +187,8 @@ class ThumbnailInputTests(unittest.TestCase):
             for patch in extra_patches:
                 patch.start()
             try:
-                worker.run()
+                worker.start()
+                drive_thumbnail(worker)
             finally:
                 for patch in reversed(extra_patches):
                     patch.stop()
@@ -235,15 +251,59 @@ class ThumbnailInputTests(unittest.TestCase):
         worker.ready.connect(lambda *_: signals.append("ready"))
         worker.failed.connect(lambda *_: signals.append("failed"))
         with mock.patch.object(workers, "QNetworkAccessManager", return_value=session):
-            worker.run()
+            worker.start()
+            drive_thumbnail(worker)
         self.assertEqual(signals, [])
         self.assertTrue(response.closed and session.closed)
         worker.deleteLater()
+
+    def test_network_runs_on_gui_thread_and_only_decode_on_worker_thread(self):
+        # Qt network replies made on a worker thread can have their live PyQt
+        # wrapper invalidated by a late GUI-thread destroy notice for an older
+        # reply at the same address; the fetch must stay on the GUI thread.
+        threads = {}
+        response = Response([image_bytes(40, 20)])
+        session = Session(response)
+        session_get = session.get
+        def get(request):
+            threads["get"] = threading.get_ident()
+            return session_get(request)
+        session.get = get
+        decode = workers.decode_thumbnail
+        def traced_decode(data):
+            threads["decode"] = threading.get_ident()
+            return decode(data)
+        ready, failed, _ = self.run_thumbnail(
+            response, [mock.patch.object(workers, "decode_thumbnail", side_effect=traced_decode)],
+            session=session)
+        self.assertFalse(failed)
+        self.assertEqual(ready[0][0], 7)
+        self.assertEqual(threads["get"], threading.get_ident())
+        self.assertNotEqual(threads["decode"], threading.get_ident())
+
+    def test_failed_or_cancelled_fetch_still_finishes_the_thread(self):
+        for cancel in (False, True):
+            worker = workers.ThumbnailWorker(0, "file:///tmp/not-a-thumbnail.png")
+            finished, failed = [], []
+            worker.finished.connect(lambda: finished.append(True))
+            worker.failed.connect(lambda *args: failed.append(args))
+            if cancel:
+                worker.cancel()
+            worker.start()
+            drive_thumbnail(worker)
+            self.assertFalse(worker.fetch_pending)
+            self.assertEqual(finished, [True])
+            self.assertEqual(bool(failed), not cancel)
+            worker.deleteLater()
 
 
 class BlockedThumbnail(workers.ThumbnailWorker):
     release = threading.Event()
     entered = []
+
+    def start(self, priority=workers.QThread.Priority.InheritPriority):
+        # These ownership tests exercise thread lifetime, not the network fetch.
+        workers.QThread.start(self, priority)
 
     def run(self):
         self.entered.append(self)

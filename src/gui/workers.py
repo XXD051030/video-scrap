@@ -12,8 +12,8 @@ import threading
 import time
 from typing import List, Optional
 
-from PyQt6.QtCore import (QByteArray, QBuffer, QCoreApplication, QDateTime, QEvent, QEventLoop,
-                          QIODevice, QObject, QSize, QThread, QTimer, Qt, QUrl, pyqtSignal)
+from PyQt6.QtCore import (QByteArray, QBuffer, QDateTime, QIODevice, QObject, QSize, QThread,
+                          QTimer, Qt, QUrl, pyqtSignal)
 from PyQt6.QtGui import QImageReader
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkCookie, QNetworkCookieJar, QNetworkReply, QNetworkRequest
 
@@ -30,6 +30,7 @@ THUMB_MAX_BYTES = 8 * 1024 * 1024
 THUMB_MAX_PIXELS = 16 * 1024 * 1024
 THUMB_MAX_DIMENSION = 8192
 THUMB_TOTAL_SECONDS = 15.0
+THUMB_MAX_REQUESTS = 6  # the original request plus five redirects
 THUMB_DECODE_SIZE = QSize(1280, 720)
 
 # Workers have no widget parent. Keep them alive until QThread.finished,
@@ -68,9 +69,10 @@ def finish_background_workers(app) -> None:
         for worker in list(_BACKGROUND_WORKERS):
             if worker.isRunning():
                 worker.wait(50)
-            else:
+            elif not getattr(worker, "fetch_pending", False):
                 _BACKGROUND_WORKERS.discard(worker)
                 worker.deleteLater()
+        # Cancelled thumbnail fetches finish on this (GUI) thread's events.
         app.processEvents()
 
 
@@ -164,11 +166,189 @@ class ScrapeWorker(QThread):
                 self.failed.emit(str(exc))
 
 
+def _thumbnail_url_allowed(url: QUrl) -> bool:
+    return (url.isValid() and url.scheme().lower() in {"http", "https"}
+            and bool(url.host()) and not url.userInfo())
+
+
+class _ThumbnailFetch(QObject):
+    """Download thumbnail bytes asynchronously on the GUI thread.
+
+    PyQt invalidates the wrapper of a C++-created QObject, such as a
+    QNetworkReply, from a monitor that lives on the GUI thread. When a reply
+    is destroyed on a worker thread, that notice arrives through a queued
+    call; a newer reply can occupy the same address by then, so its live
+    wrapper is invalidated, the next slot raises RuntimeError and PyQt aborts
+    the process. Keeping every reply on the GUI thread removes that delay,
+    and QNetworkAccessManager is asynchronous, so it needs no thread of its own.
+    """
+
+    done = pyqtSignal(object, object)  # (bytes or None, Exception or None)
+
+    def __init__(self, worker: "ThumbnailWorker") -> None:
+        super().__init__(worker)
+        self._worker = worker
+        self._manager = None
+        self._reply = None
+        self._url = QUrl()
+        self._requests = 0
+        self._payload = bytearray()
+        self._finished = False
+        self._budget_timer = QTimer(self)
+        self._budget_timer.setInterval(25)
+        self._budget_timer.timeout.connect(self._check_budget)
+        # cancel() may run inside a reply slot; observe it on the next turn.
+        self._poke_timer = QTimer(self)
+        self._poke_timer.setSingleShot(True)
+        self._poke_timer.setInterval(0)
+        self._poke_timer.timeout.connect(self._check_budget)
+
+    def begin(self) -> None:
+        try:
+            self._worker._check_cancelled(self._worker._deadline)
+            url = QUrl(self._worker.url)
+            if not _thumbnail_url_allowed(url):
+                raise ValueError("Thumbnail URL must use HTTP(S) without credentials")
+            self._manager = QNetworkAccessManager(self)
+            self._manager.setCookieJar(thumbnail_cookiejar(
+                self._manager, self._worker.browser_cookies, self._worker.cookies))
+            self._budget_timer.start()
+            self._request(url)
+        except Exception as exc:  # noqa: BLE001
+            self._finish(None, exc)
+
+    def poke(self) -> None:
+        self._poke_timer.start()
+
+    def _check_budget(self) -> bool:
+        if self._finished:
+            return False
+        try:
+            self._worker._check_cancelled(self._worker._deadline)
+        except Exception as exc:  # noqa: BLE001
+            self._finish(None, exc)
+            return False
+        return True
+
+    def _request(self, url: QUrl) -> None:
+        # Qt automatic redirects can carry an already-prepared Cookie header
+        # to another host. A fresh request per hop asks the jar to scope it
+        # again, and never reuses the previous request's derived headers.
+        self._requests += 1
+        self._url = url
+        self._payload = bytearray()
+        request = QNetworkRequest(url)
+        request.setTransferTimeout(3000)
+        request.setMaximumRedirectsAllowed(5)
+        request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                             QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
+        headers = build_request_headers(self._worker.referer)
+        headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+        headers["Accept-Encoding"] = "identity"
+        for name, value in headers.items():
+            request.setRawHeader(name.encode(), value.encode())
+        reply = self._manager.get(request)
+        reply.setReadBufferSize(64 * 1024)
+        self._reply = reply
+        # Each slot names its reply, so signals from a released hop are ignored.
+        reply.metaDataChanged.connect(lambda: self._on_headers(reply))
+        reply.readyRead.connect(lambda: self._on_ready_read(reply))
+        reply.finished.connect(lambda: self._on_finished(reply))
+
+    def _on_headers(self, reply) -> None:
+        if reply is not self._reply or not self._check_budget():
+            return
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        if status is not None and 300 <= int(status) < 400:
+            location = bytes(reply.rawHeader(b"Location"))
+            if location:
+                self._follow(self._url.resolved(QUrl.fromEncoded(location)))
+            return
+        encoding = bytes(reply.rawHeader(b"Content-Encoding")).decode("ascii", "replace").lower()
+        if encoding not in {"", "identity"}:
+            self._finish(None, ValueError("Compressed thumbnail transport is not supported"))
+            return
+        content_type = bytes(reply.rawHeader(b"Content-Type")).decode("ascii", "replace").split(";", 1)[0].strip().lower()
+        if content_type and not (content_type.startswith("image/") or content_type == "application/octet-stream"):
+            self._finish(None, ValueError("Thumbnail response is not an image"))
+            return
+        try:
+            length = int(bytes(reply.rawHeader(b"Content-Length")) or b"0")
+        except ValueError:
+            length = 0
+        if length > THUMB_MAX_BYTES:
+            self._finish(None, ValueError("Thumbnail exceeds the image byte limit"))
+
+    def _on_ready_read(self, reply) -> None:
+        self._on_headers(reply)
+        if reply is not self._reply:
+            return
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        if status is not None and 300 <= int(status) < 400:
+            return
+        while reply is self._reply and reply.bytesAvailable():
+            chunk = bytes(reply.read(min(32 * 1024, THUMB_MAX_BYTES - len(self._payload) + 1)))
+            if not chunk or reply is not self._reply:
+                break
+            if len(self._payload) + len(chunk) > THUMB_MAX_BYTES:
+                self._finish(None, ValueError("Thumbnail exceeds the image byte limit"))
+                return
+            self._payload.extend(chunk)
+
+    def _on_finished(self, reply) -> None:
+        if reply is not self._reply:
+            return
+        self._on_ready_read(reply)
+        if reply is not self._reply:
+            return
+        if reply.error() != QNetworkReply.NetworkError.NoError:
+            self._finish(None, RuntimeError(reply.errorString()))
+            return
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        if status is None or not 200 <= int(status) < 300:
+            self._finish(None, ValueError("Thumbnail server returned an unsuccessful response"))
+            return
+        self._finish(bytes(self._payload), None)
+
+    def _follow(self, target: QUrl) -> None:
+        self._release_reply()
+        if (not _thumbnail_url_allowed(target)
+                or (self._url.scheme().lower() == "https" and target.scheme().lower() != "https")):
+            self._finish(None, ValueError("Thumbnail redirect has an unsafe destination"))
+        elif self._requests >= THUMB_MAX_REQUESTS:
+            self._finish(None, ValueError("Thumbnail exceeded the redirect limit"))
+        elif self._check_budget():
+            self._request(target)
+
+    def _release_reply(self) -> None:
+        # Clear first: abort() emits finished synchronously into our slots.
+        reply, self._reply = self._reply, None
+        if reply is not None:
+            reply.abort()
+            reply.deleteLater()
+
+    def _finish(self, data: Optional[bytes], error: Optional[Exception]) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._budget_timer.stop()
+        self._poke_timer.stop()
+        self._release_reply()
+        manager, self._manager = self._manager, None
+        if manager is not None:
+            manager.deleteLater()
+        self.done.emit(data, error)
+
+
 class ThumbnailWorker(QThread):
-    """Download a thumbnail image and emit raw bytes.
+    """Download a thumbnail on the GUI thread, then decode it on this thread.
 
     Sends a browser-like header set (with optional Referer) so CDNs that
-    hot-link-protect their image hosts will still serve the file.
+    hot-link-protect their image hosts will still serve the file. Call
+    start() from the thread that owns the worker (the GUI thread): the
+    asynchronous fetch runs there (see _ThumbnailFetch), and only the
+    untrusted image decode runs on the worker thread. finished is emitted
+    in every outcome, including failure or cancellation during the fetch.
     """
 
     ready = pyqtSignal(int, bytes)
@@ -190,10 +370,33 @@ class ThumbnailWorker(QThread):
         self.cookies = cookies
         self.browser_cookies = browser_cookies or []
         self._cancel_event = threading.Event()
+        self._deadline = 0.0
+        self._priority = QThread.Priority.InheritPriority
+        self._owner_ident = threading.get_ident()
+        self._fetch: Optional[_ThumbnailFetch] = None
+        self._fetched: Optional[bytes] = None
+        self._fetch_error: Optional[Exception] = None
+
+    @property
+    def fetch_pending(self) -> bool:
+        return self._fetch is not None
+
+    def start(self, priority: QThread.Priority = QThread.Priority.InheritPriority) -> None:
+        if self._fetch is not None or self.isRunning():
+            return
+        self._priority = priority
+        self._owner_ident = threading.get_ident()
+        self._deadline = time.monotonic() + THUMB_TOTAL_SECONDS
+        self._fetch = _ThumbnailFetch(self)
+        self._fetch.done.connect(self._on_fetch_done)
+        self._fetch.begin()
 
     def cancel(self) -> None:
         self._cancel_event.set()
         self.requestInterruption()
+        fetch = self._fetch
+        if fetch is not None and threading.get_ident() == self._owner_ident:
+            fetch.poke()
 
     def _check_cancelled(self, deadline: float) -> None:
         if self._cancel_event.is_set() or self.isInterruptionRequested():
@@ -201,143 +404,24 @@ class ThumbnailWorker(QThread):
         if time.monotonic() >= deadline:
             raise TimeoutError("Thumbnail exceeded its total time limit")
 
-    def _fetch_image(self, deadline: float) -> bytes:
-        """Use abortable Qt I/O so the deadline also covers DNS and headers."""
-        self._check_cancelled(deadline)
-        url = QUrl(self.url)
-        if (not url.isValid() or url.scheme().lower() not in {"http", "https"}
-                or not url.host() or url.userInfo()):
-            raise ValueError("Thumbnail URL must use HTTP(S) without credentials")
-        manager = QNetworkAccessManager()
-        manager.setCookieJar(thumbnail_cookiejar(manager, self.browser_cookies, self.cookies))
-        try:
-            for _hop in range(6):
-                self._check_cancelled(deadline)
-                data, target = self._fetch_reply(manager, url, deadline)
-                if target is None:
-                    return data
-                if (not target.isValid() or target.scheme().lower() not in {"http", "https"}
-                        or not target.host() or target.userInfo()
-                        or (url.scheme().lower() == "https" and target.scheme().lower() != "https")):
-                    raise ValueError("Thumbnail redirect has an unsafe destination")
-                url = target
-            raise ValueError("Thumbnail exceeded the redirect limit")
-        finally:
-            manager.deleteLater()
-            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-
-    def _fetch_reply(self, manager, url: QUrl, deadline: float) -> tuple[bytes, Optional[QUrl]]:
-        # Qt automatic redirects can carry an already-prepared Cookie header
-        # to another host. A fresh request per hop asks the jar to scope it
-        # again, and never reuses the previous request's derived headers.
-        request = QNetworkRequest(url)
-        request.setTransferTimeout(3000)
-        request.setMaximumRedirectsAllowed(5)
-        request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
-                             QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
-        headers = build_request_headers(self.referer)
-        headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-        headers["Accept-Encoding"] = "identity"
-        for name, value in headers.items():
-            request.setRawHeader(name.encode(), value.encode())
-        loop = QEventLoop()
-        timer = QTimer()
-        timer.setInterval(25)
-        payload = bytearray()
-        errors = []
-        redirect_target = []
-        reply = manager.get(request)
-        reply.setReadBufferSize(64 * 1024)
-
-        def fail(error):
-            if not errors:
-                errors.append(error)
-            reply.abort()
-            loop.quit()
-
-        def check_budget():
-            try:
-                self._check_cancelled(deadline)
-            except Exception as exc:
-                fail(exc)
-
-        def check_headers():
-            check_budget()
-            if errors:
-                return
-            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-            if status is not None and 300 <= int(status) < 400:
-                payload.clear()
-                location = bytes(reply.rawHeader(b"Location"))
-                if location and not redirect_target:
-                    redirect_target.append(url.resolved(QUrl.fromEncoded(location)))
-                    reply.abort()
-                    loop.quit()
-                return
-            encoding = bytes(reply.rawHeader(b"Content-Encoding")).decode("ascii", "replace").lower()
-            if encoding not in {"", "identity"}:
-                fail(ValueError("Compressed thumbnail transport is not supported"))
-                return
-            content_type = bytes(reply.rawHeader(b"Content-Type")).decode("ascii", "replace").split(";", 1)[0].strip().lower()
-            if content_type and not (content_type.startswith("image/") or content_type == "application/octet-stream"):
-                fail(ValueError("Thumbnail response is not an image"))
-                return
-            try:
-                length = int(bytes(reply.rawHeader(b"Content-Length")) or b"0")
-            except ValueError:
-                length = 0
-            if length > THUMB_MAX_BYTES:
-                fail(ValueError("Thumbnail exceeds the image byte limit"))
-
-        def read_available():
-            check_headers()
-            if errors:
-                return
-            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-            if status is not None and 300 <= int(status) < 400:
-                return
-            while reply.bytesAvailable():
-                chunk = bytes(reply.read(min(32 * 1024, THUMB_MAX_BYTES - len(payload) + 1)))
-                if not chunk:
-                    break
-                if len(payload) + len(chunk) > THUMB_MAX_BYTES:
-                    fail(ValueError("Thumbnail exceeds the image byte limit"))
-                    return
-                payload.extend(chunk)
-
-        reply.metaDataChanged.connect(check_headers)
-        reply.readyRead.connect(read_available)
-        reply.finished.connect(loop.quit)
-        timer.timeout.connect(check_budget)
-        timer.start()
-        try:
-            if not reply.isFinished():
-                loop.exec()
-            timer.stop()
-            self._check_cancelled(deadline)
-            if errors:
-                raise errors[0]
-            if redirect_target:
-                return b"", redirect_target[0]
-            read_available()
-            if errors:
-                raise errors[0]
-            if reply.error() != QNetworkReply.NetworkError.NoError:
-                raise RuntimeError(reply.errorString())
-            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-            if status is None or not 200 <= int(status) < 300:
-                raise ValueError("Thumbnail server returned an unsuccessful response")
-            return bytes(payload), None
-        finally:
-            timer.stop()
-            reply.abort()
-            reply.deleteLater()
+    def _on_fetch_done(self, data: Optional[bytes], error: Optional[Exception]) -> None:
+        fetch, self._fetch = self._fetch, None
+        if fetch is not None:
+            fetch.deleteLater()
+        self._fetched, self._fetch_error = data, error
+        # Run even after a failed or cancelled fetch so finished always fires.
+        super().start(self._priority)
 
     def run(self) -> None:
+        data, error = self._fetched, self._fetch_error
+        self._fetched = self._fetch_error = None
         try:
-            deadline = time.monotonic() + THUMB_TOTAL_SECONDS
-            thumbnail = decode_thumbnail(self._fetch_image(deadline))
-            self._check_cancelled(deadline)
+            if error is not None:
+                raise error
+            if data is None:
+                raise RuntimeError("Thumbnail fetch did not run")
+            thumbnail = decode_thumbnail(data)
+            self._check_cancelled(self._deadline)
             self.ready.emit(self.index, thumbnail)
         except Exception as exc:  # noqa: BLE001
             if not self._cancel_event.is_set() and not self.isInterruptionRequested():
