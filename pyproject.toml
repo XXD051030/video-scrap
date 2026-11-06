@@ -1,0 +1,10 @@
+# Tool configuration only; the application is run from source or packaged
+# with PyInstaller, not installed as a Python package.
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# Pyflakes checks: unused imports and variables, undefined names, and other
+# likely mistakes. Formatting and style are not enforced.
+select = ["F"]

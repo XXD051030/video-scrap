@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.downloader import VideoDownloader, _HlsFallbackError, _HlsSegment
+from src.downloader import VideoDownloader, _HlsSegment
 from http_fixtures import inspected_hls_failure
 from src.parallel_downloader import ParallelDownloadResult
 from src.scraper import VideoItem

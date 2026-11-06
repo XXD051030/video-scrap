@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from functools import partial
 import errno
-import os
 from pathlib import Path
 import shutil
 import sys

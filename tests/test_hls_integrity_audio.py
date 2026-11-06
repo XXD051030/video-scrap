@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import Counter
-from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re

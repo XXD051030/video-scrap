@@ -11,7 +11,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -74,7 +74,7 @@ def _page_html(script: str, body: str = "") -> str:
 def _scrape(html: str, ytdlp_items: list[VideoItem] | None = None) -> tuple[list[VideoItem], list[str]]:
     response = html_response(text=html, url=PAGE)
     logs: list[str] = []
-    with patch("src.scraper.ScopedCookieSession.get", return_value=response) as get, patch.object(
+    with patch("src.browser_cookies.ScopedCookieSession.get", return_value=response) as get, patch.object(
         VideoScraper, "_scrape_with_ytdlp", return_value=ytdlp_items or []
     ) as ytdlp:
         items = VideoScraper().scrape(PAGE, progress=logs.append)

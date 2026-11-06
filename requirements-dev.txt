@@ -1,0 +1,2 @@
+# Development checks; not needed to run or package the application.
+ruff==0.17.4

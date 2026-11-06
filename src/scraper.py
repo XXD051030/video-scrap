@@ -27,13 +27,12 @@ from http.cookiejar import CookieJar
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 
-import requests
 import yt_dlp
 from bs4 import BeautifulSoup
 
 from .js_decoder import decode_obfuscated_urls
 from .http_limits import read_limited_response
-from .browser_cookies import ScopedCookieSession, build_scoped_session
+from .browser_cookies import build_scoped_session
 
 HTML_MAX_BYTES = 8 * 1024 * 1024
 

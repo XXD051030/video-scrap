@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-import requests
 
 from .browser_cookies import build_scoped_session as build_session
 from .http_limits import resource_identity_url
