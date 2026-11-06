@@ -21,3 +21,9 @@ Must maintain independent judgment, prioritize identifying problems and risks, a
 - A retry of the same push does not require another version increment. Do not rewrite historical diaries, existing tags/releases, or previous build reports to change their recorded versions; existing binaries retain their version until rebuilt.
 - Versioning does not grant permission to push; follow the user's authorization for committing and pushing.
 - Preference recorded on 2026-10-12 (Asia/Kuala_Lumpur, UTC+08:00). The download-control update is version `0.3.1`.
+
+## Project records
+
+- Keep the repository root for user-facing documentation (`README.md`, `WINDOWS_BUILD.md`) and these instructions.
+- Write new code audits, fix reports and CI investigation records to `docs/audits/`, and progress diaries to `docs/diary/`; add each new file to the index in `docs/README.md`.
+- Do not edit existing records to update their paths or links. They were moved from the root on 2026-11-06 unchanged.
