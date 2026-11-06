@@ -9,7 +9,6 @@ import sys
 import time
 import unittest
 from unittest.mock import patch
-from urllib.parse import urlparse
 
 import requests
 from requests.adapters import BaseAdapter

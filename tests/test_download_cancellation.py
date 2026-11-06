@@ -16,7 +16,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.downloader import DownloadProgress, VideoDownloader, _HlsFallbackError, _HlsSegment
+from src.downloader import DownloadProgress, VideoDownloader, _HlsSegment
 from src.scraper import VideoItem
 from http_fixtures import inspected_hls_failure
 

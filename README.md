@@ -217,6 +217,13 @@ python scripts/run_tests.py
 python scripts/run_tests.py tests/test_audio_downloads.py tests/test_process_ownership.py
 ```
 
+Lint checks (unused imports, undefined names) use the pinned tools in `requirements-dev.txt`:
+
+```bash
+python -m pip install -r requirements-dev.txt
+ruff check .
+```
+
 The runner isolates Qt modules and reports actual executed tests and skips in `build/test-results/`. GitHub Actions provides macOS/Windows jobs; a manual run with **package** enabled also builds and checks native bundles. Windows results remain pending until that job runs. `requirements-release-macos-arm64.txt` records exact versions from the local Python 3.12 build environment.
 
 ## Logs and Build Records
@@ -241,6 +248,7 @@ Third-party license texts are bundled in the `third-party/` resource directory.
 | `app_bundle/` | macOS/Windows PyInstaller configurations and runtime hook |
 | `scripts/` | Build scripts and packaged application checks |
 | `tests/` | Regression checks |
+| `docs/` | Historical audit reports and progress diaries ([index](docs/README.md)) |
 | `Logo.png` | Shared application icon |
 
 ## Known Limitations

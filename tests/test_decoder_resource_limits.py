@@ -109,7 +109,7 @@ class DecoderResourceTests(unittest.TestCase):
         page_url = "https://page.example.test/watch"
         html = '<video src="https://cdn.example.test/normal.mp4"></video>' + block(quote(hidden, safe="")) + "<script>const _noise=[" + "9" * 5000 + "];</script>"
         logs = []
-        with patch("src.scraper.ScopedCookieSession.get", return_value=html_response(text=html, url=page_url)), patch.object(VideoScraper, "_scrape_with_ytdlp", return_value=[]):
+        with patch("src.browser_cookies.ScopedCookieSession.get", return_value=html_response(text=html, url=page_url)), patch.object(VideoScraper, "_scrape_with_ytdlp", return_value=[]):
             items = VideoScraper().scrape(page_url, logs.append)
         self.assertEqual({item.url for item in items}, {"https://cdn.example.test/normal.mp4", hidden})
         self.assertFalse(any("JS decoder failed" in line for line in logs))

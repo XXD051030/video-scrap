@@ -7,7 +7,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -42,7 +42,7 @@ class ScraperValidationTests(unittest.TestCase):
             calls.append(url)
             return []
 
-        with patch("src.scraper.ScopedCookieSession.get", return_value=html_response(text=html, url=final)), patch.object(
+        with patch("src.browser_cookies.ScopedCookieSession.get", return_value=html_response(text=html, url=final)), patch.object(
             VideoScraper, "_scrape_with_ytdlp", side_effect=extract
         ):
             items = VideoScraper().scrape(REQUESTED)

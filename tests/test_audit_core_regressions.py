@@ -1,11 +1,9 @@
 """Reproductions for the 2026-10-18 settings, scraping and ownership audit."""
 from __future__ import annotations
-import base64
 import json
 import math
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import threading
@@ -93,7 +91,7 @@ class SettingsOrderingTests(unittest.TestCase):
 class ScrapingBoundaryTests(unittest.TestCase):
     def test_direct_media_url_is_not_fetched_as_a_page(self):
         url = "https://cdn.example.test/large.mp4?token=private"
-        with patch("src.scraper.ScopedCookieSession.get") as get, patch.object(VideoScraper, "_scrape_with_ytdlp") as extract:
+        with patch("src.browser_cookies.ScopedCookieSession.get") as get, patch.object(VideoScraper, "_scrape_with_ytdlp") as extract:
             items = VideoScraper().scrape(url)
         self.assertEqual(items[0].url, url)
         self.assertTrue(items[0].is_direct)
@@ -102,7 +100,7 @@ class ScrapingBoundaryTests(unittest.TestCase):
     def test_extensionless_video_headers_skip_body_read(self):
         response = html_response(text="not read", url="https://cdn.test/media?id=1")
         response.headers["Content-Type"] = "video/mp4"
-        with patch.object(response, "iter_content", side_effect=AssertionError("Media body must not be read")), patch("src.scraper.ScopedCookieSession.get", return_value=response):
+        with patch.object(response, "iter_content", side_effect=AssertionError("Media body must not be read")), patch("src.browser_cookies.ScopedCookieSession.get", return_value=response):
             scan = VideoScraper()._scrape_html(response.url, lambda _: None)
         self.assertTrue(scan.items[0].is_direct)
         self.assertEqual(scan.html, "")
@@ -110,11 +108,11 @@ class ScrapingBoundaryTests(unittest.TestCase):
     def test_oversized_html_and_cancelled_scrape_fail_bounded(self):
         response = html_response(text="x", url="https://a.test/watch")
         response.headers["Content-Length"] = str(HTML_MAX_BYTES + 1)
-        with patch("src.scraper.ScopedCookieSession.get", return_value=response), patch.object(response, "iter_content", side_effect=AssertionError("Reject before reading")):
+        with patch("src.browser_cookies.ScopedCookieSession.get", return_value=response), patch.object(response, "iter_content", side_effect=AssertionError("Reject before reading")):
             with self.assertRaises(ValueError):
                 VideoScraper()._scrape_html(response.url, lambda _: None)
         cancelled = threading.Event(); cancelled.set()
-        with patch("src.scraper.ScopedCookieSession.get") as get, self.assertRaises(InterruptedError):
+        with patch("src.browser_cookies.ScopedCookieSession.get") as get, self.assertRaises(InterruptedError):
             VideoScraper().scrape(response.url, cancel_event=cancelled)
         get.assert_not_called()
 
@@ -125,7 +123,7 @@ class ScrapingBoundaryTests(unittest.TestCase):
             page = '<script id="__NEXT_DATA__">' + json.dumps(data) + '</script>' + route
             self.assertIsNone(_extract_next_data_ev_hls(page))
             response = html_response(text=page, url="https://a.test/watch")
-            with patch("src.scraper.ScopedCookieSession.get", return_value=response), patch.object(VideoScraper, "_scrape_with_ytdlp", return_value=[]):
+            with patch("src.browser_cookies.ScopedCookieSession.get", return_value=response), patch.object(VideoScraper, "_scrape_with_ytdlp", return_value=[]):
                 items = VideoScraper().scrape(response.url)
             self.assertEqual(items[0].url, "https://a.test/api/hls/valid")
 

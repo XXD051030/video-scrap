@@ -224,7 +224,7 @@ class MediaDeduplicationTests(unittest.TestCase):
         page = "https://page.example/watch"
         item = VideoItem("Original metadata", page, page, formats=formats)
         with patch.object(VideoScraper, "_scrape_with_ytdlp", return_value=[item]), \
-                patch("src.scraper.ScopedCookieSession.get",
+                patch("src.browser_cookies.ScopedCookieSession.get",
                       return_value=html_response(text=html, url=page)):
             result = VideoScraper().scrape(page)
         return item, result
@@ -254,7 +254,7 @@ class MediaDeduplicationTests(unittest.TestCase):
         item = VideoItem("Embedded metadata", embed, embed, formats=[{"url": media, "height": 1080}])
         html = f'<video src="{media}"></video><video src="{other}"></video><iframe src="{embed}"></iframe>'
         with patch.object(VideoScraper, "_scrape_with_ytdlp", side_effect=lambda url, *_: [item] if url == embed else []), \
-                patch("src.scraper.ScopedCookieSession.get", return_value=html_response(text=html, url=page)):
+                patch("src.browser_cookies.ScopedCookieSession.get", return_value=html_response(text=html, url=page)):
             result = VideoScraper().scrape(page)
         self.assertEqual({entry.url for entry in result}, {embed, other})
         self.assertIn(item, result)

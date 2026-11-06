@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import time
-from typing import Callable, List, Optional, Set
+from typing import Callable, Optional, Set
 from urllib.parse import urlparse
 from ..utils import redact_log_secrets
 

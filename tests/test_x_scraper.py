@@ -81,7 +81,7 @@ def test_x_scrape_uses_only_ytdlp_and_keeps_real_playlist_indices() -> None:
     ydl = _FakeYDL(info)
 
     with patch("src.scraper.yt_dlp.YoutubeDL", return_value=ydl) as youtube_dl, patch(
-        "src.scraper.requests.get"
+        "src.browser_cookies.ScopedCookieSession.get"
     ) as get:
         items = VideoScraper().scrape(POST)
 
@@ -134,7 +134,7 @@ def test_x_scrape_reports_extraction_failure_without_html_fallback() -> None:
             raise ValueError("login required")
 
     with patch("src.scraper.yt_dlp.YoutubeDL", return_value=_FailingYDL(None)), patch(
-        "src.scraper.requests.get"
+        "src.browser_cookies.ScopedCookieSession.get"
     ) as get:
         with TestCase().assertRaisesRegex(RuntimeError, "login required"):
             VideoScraper().scrape(POST)

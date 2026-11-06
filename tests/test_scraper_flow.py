@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -86,7 +86,7 @@ def test_scrape_combines_html_embed_and_hidden_media() -> None:
             ]
         return []
 
-    with patch("src.scraper.ScopedCookieSession.get", return_value=html_response(text=html, url=page)), patch.object(
+    with patch("src.browser_cookies.ScopedCookieSession.get", return_value=html_response(text=html, url=page)), patch.object(
         VideoScraper, "_scrape_with_ytdlp", side_effect=fake_ytdlp
     ):
         items = VideoScraper().scrape(page)
@@ -110,7 +110,7 @@ def test_redirected_response_with_absolute_media_preserves_page_metadata() -> No
     html = f'<html><video src="{media}"></video></html>'
     response = html_response(text=html, url=final)
 
-    with patch("src.scraper.ScopedCookieSession.get", return_value=response), patch.object(
+    with patch("src.browser_cookies.ScopedCookieSession.get", return_value=response), patch.object(
         VideoScraper, "_scrape_with_ytdlp", return_value=[]
     ):
         items = VideoScraper().scrape(requested)

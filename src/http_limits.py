@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 import socket
 import threading
 from typing import Callable, Iterator, Optional

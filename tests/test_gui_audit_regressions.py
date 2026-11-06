@@ -10,11 +10,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QObject, QPoint, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, Qt, pyqtSignal
 from PyQt6.QtTest import QTest
 
 import test_download_controls as controls
-from src.downloader import DownloadProgress
 from src.gui import main_window
 from src.gui.preview_panel import ClickableSlider
 from src.scraper import VideoItem

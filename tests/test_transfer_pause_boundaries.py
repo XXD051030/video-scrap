@@ -13,7 +13,6 @@ from unittest.mock import patch
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).parent)]
 from src import download_job, downloader, transfer_clock
 from src.browser_cookies import _CancelableAdapter
-from src.http_limits import iter_limited_response
 from src.scraper import VideoItem
 from test_hls_integrity_audio import HlsIntegrityAudioTests
 

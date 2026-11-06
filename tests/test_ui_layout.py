@@ -16,7 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QBuffer, QCoreApplication, QEvent, QIODevice, QPoint, Qt
+from PyQt6.QtCore import QBuffer, QCoreApplication, QEvent, QIODevice, QPoint
 from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication

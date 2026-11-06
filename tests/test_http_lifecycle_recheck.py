@@ -1,7 +1,6 @@
 """N03/N05: independent header ownership and healthy continuous reads."""
 from __future__ import annotations
 
-import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import socket
