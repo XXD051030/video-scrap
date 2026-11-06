@@ -229,7 +229,7 @@ class DownloadCancellationTests(unittest.TestCase):
                         downloader.cancel(keep_partial=keep_partial)
 
                 with mock.patch("src.downloader.yt_dlp.YoutubeDL", self.ydl({})), \
-                        mock.patch("src.downloader._publish_unique") as publish:
+                        mock.patch("src.downloader.publish_unique") as publish:
                     with self.assertRaisesRegex(RuntimeError, "cancelled"):
                         downloader.download(item(), on_progress=progress)
                 publish.assert_not_called()

@@ -54,9 +54,10 @@ import requests
 
 from .browser_cookies import browser_cookiejar, build_scoped_session, scoped_headers
 from .hls_payload import MAX_HLS_PAYLOAD_BYTES, decode_hls_payload
+from .hls_playlist import parse_m3u8_attrs
 from .http_limits import (
     iter_limited_response, read_limited_response, abort_response,
-    resource_identity_url, iter_continuous_response,
+    resource_identity_url, iter_continuous_response, strong_etag,
 )
 from .temp_ownership import create_owned_tempdir, owned_tempdir_io
 
@@ -132,8 +133,6 @@ def _select_hls_master_variant(
     text: str, manifest_url: str, variant_url: str,
 ) -> str:
     """Keep one requested video variant and its related media groups."""
-    from .downloader import _parse_m3u8_attrs
-
     lines = text.splitlines()
     variants = []
     pending = None
@@ -144,7 +143,7 @@ def _select_hls_master_variant(
                 raise ValueError("HLS master contains a variant without a playlist URL")
             pending = index
         elif stripped and not stripped.startswith("#") and pending is not None:
-            attrs = _parse_m3u8_attrs(lines[pending].split(":", 1)[1])
+            attrs = parse_m3u8_attrs(lines[pending].split(":", 1)[1])
             variants.append((pending, index, urljoin(manifest_url, stripped), attrs))
             pending = None
     if pending is not None:
@@ -187,7 +186,7 @@ def _select_hls_master_variant(
         if stripped.startswith("#EXT-X-I-FRAME-STREAM-INF:"):
             continue
         if stripped.startswith("#EXT-X-MEDIA:"):
-            attrs = _parse_m3u8_attrs(stripped.split(":", 1)[1])
+            attrs = parse_m3u8_attrs(stripped.split(":", 1)[1])
             group = (attrs.get("TYPE"), attrs.get("GROUP-ID"))
             if group not in referenced_groups:
                 continue
@@ -289,11 +288,6 @@ class _CacheBudget:
             self.used = max(0, self.used - count)
 
 
-def _strong_etag(response):
-    value = (response.headers.get("ETag") or "").strip()
-    return value if re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]*"', value) else None
-
-
 def _retry_after(response) -> float:
     value = (getattr(response, "headers", {}) or {}).get("Retry-After", "")
     try:
@@ -336,6 +330,11 @@ def _parse_range_header(value: Optional[str]) -> Optional[Tuple[Optional[int], O
 
 
 def _parse_content_range(value: Optional[str]) -> Optional[Tuple[int, int, Optional[int]]]:
+    """Parse ``bytes start-end/total``, where total may be ``*`` (unknown).
+
+    Unlike the parallel downloader's parser, this only splits the header;
+    _validated_partial_range checks the range against the request.
+    """
     if not value:
         return None
     match = _CONTENT_RANGE_RE.fullmatch(value.strip())
@@ -514,7 +513,7 @@ class _Entry:
                     self.resource_changed = True
                     self.discard_cache()
                 return False
-            tag = _strong_etag(response)
+            tag = strong_etag(response.headers)
             final_url = resource_identity_url(response, self.upstream)
             if self.resource_etag is not None and (
                 tag != self.resource_etag or final_url != self.resource_url
@@ -772,7 +771,7 @@ class _Prefetcher(threading.Thread):
                     return False
                 # No strong validator means a later range cannot safely be
                 # joined to this one. Serve on demand, without background cache.
-                if _strong_etag(response) is None:
+                if strong_etag(response.headers) is None:
                     return False
                 checked = None
                 if response.status_code == 206:
@@ -951,7 +950,7 @@ class _HlsPrefetcher(threading.Thread):
                     return False
                 if interval is not None:
                     checked = _validated_partial_range(response, start, end - 1, segment.total_size)
-                    if checked is None or _strong_etag(response) is None:
+                    if checked is None or strong_etag(response.headers) is None:
                         return False
                     declared_end, total = checked
                     if declared_end != end - 1:
@@ -968,7 +967,7 @@ class _HlsPrefetcher(threading.Thread):
                     max_bytes = MAX_SEGMENT_BYTES
                     # Full unvalidated bodies are published only after EOF;
                     # their complete cache never joins independent responses.
-                    unpublished = _strong_etag(response) is None
+                    unpublished = strong_etag(response.headers) is None
                 position = start
                 for chunk in iter_limited_response(response, max_bytes, READ_DEADLINE_SECONDS, cancelled):
                     if not segment.write_at(position, chunk, publish=not unpublished):
@@ -2023,7 +2022,7 @@ class MediaProxyServer:
                     safe = chunk[:declared_end + 1 - pos]
                     if not safe:
                         return
-                    if _strong_etag(resp) is not None:
+                    if strong_etag(resp.headers) is not None:
                         entry.write_at(pos, safe)
                     pos += len(safe)
                     yield safe
@@ -2062,7 +2061,7 @@ class MediaProxyServer:
             # into the cache as we stream; seeking back no longer forces a
             # full re-download.
             cache_chunk = chunk if end_inclusive is None else chunk[:max(0, end_inclusive + 1 - chunk_start)]
-            if _strong_etag(resp) is not None:
+            if strong_etag(resp.headers) is not None:
                 entry.write_at(chunk_start, cache_chunk)
             if chunk_end_excl <= start:
                 continue

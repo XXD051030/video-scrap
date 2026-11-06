@@ -28,7 +28,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 
 from .browser_cookies import build_scoped_session as build_session
-from .http_limits import resource_identity_url
+from .http_limits import resource_identity_url, strong_etag
 
 
 @dataclass
@@ -52,6 +52,11 @@ _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)", re.IGNORECASE)
 
 
 def _parse_content_range(value: str) -> Optional[Tuple[int, int, int]]:
+    """Parse a coherent ``bytes start-end/total`` header.
+
+    Unlike the playback proxy's parser, the total must be known: parallel
+    segments are planned against a fixed file size.
+    """
     match = _CONTENT_RANGE_RE.fullmatch(value.strip())
     if match is None:
         return None
@@ -61,7 +66,7 @@ def _parse_content_range(value: str) -> Optional[Tuple[int, int, int]]:
     return start, end, total
 
 
-def _publish_unique(part_path: Path, output_path: Path) -> Path:
+def publish_unique(part_path: Path, output_path: Path) -> Path:
     """Atomically publish a finished file without replacing an existing one."""
     index = 0
     while True:
@@ -115,12 +120,6 @@ def _rename_without_replacement(source: Path, destination: Path) -> None:
     if result != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), str(destination))
-
-
-def _strong_etag(headers: Dict[str, str]) -> Optional[str]:
-    value = headers.get("ETag", "").strip()
-    # RFC entity tags are quoted and a weak validator cannot bind ranges.
-    return value if re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]*"', value) else None
 
 
 def _open_unique_part(directory: Path) -> Tuple[int, Path]:
@@ -263,7 +262,7 @@ class ParallelDownloader:
                     if accept_ranges and size > 0:
                         if resource_identity_url(resp, url) != self._entity_url:
                             raise RuntimeError("Range resource URL changed during download")
-                        if _strong_etag(resp.headers) != self._entity_tag:
+                        if strong_etag(resp.headers) != self._entity_tag:
                             raise RuntimeError("Range resource version changed during download")
                         expected_length = end - start + 1
                         actual_range = _parse_content_range(
@@ -378,7 +377,7 @@ class ParallelDownloader:
                 raise RuntimeError("Download cancelled")
             if size > 0 and part_path.stat().st_size != size:
                 raise RuntimeError("Download length mismatch")
-            published_path = _publish_unique(part_path, output_path)
+            published_path = publish_unique(part_path, output_path)
         except Exception:
             part_path.unlink(missing_ok=True)
             raise
@@ -447,7 +446,7 @@ class ParallelDownloader:
                     )
                     if accept_ranges and reported_range is not None:
                         size = reported_range[2]
-                        self._entity_tag = _strong_etag(resp.headers)
+                        self._entity_tag = strong_etag(resp.headers)
                         self._entity_url = resource_identity_url(resp, url)
                         # A response length/Last-Modified date alone cannot
                         # prove multiple requests belong to the same entity.

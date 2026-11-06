@@ -35,8 +35,9 @@ except Exception:  # noqa: BLE001
 
 from .browser_cookies import browser_cookiejar, build_scoped_session as build_session
 from .ffmpeg import resolve_ffmpeg
-from .http_limits import iter_limited_response, read_limited_response, resource_identity_url
-from .parallel_downloader import ParallelDownloader, _publish_unique, _strong_etag
+from .hls_playlist import parse_m3u8_attrs
+from .http_limits import iter_limited_response, read_limited_response, resource_identity_url, strong_etag
+from .parallel_downloader import ParallelDownloader, publish_unique
 from .scraper import VideoItem, is_x_post_url
 from .utils import safe_filename
 from .transfer_clock import monotonic as transfer_monotonic
@@ -497,7 +498,7 @@ class VideoDownloader:
                     ))
                 with self._process_lock:
                     self._raise_if_cancelled(allow_cancelled=keep_partial)
-                    published = _publish_unique(staged, destination / staged.name)
+                    published = publish_unique(staged, destination / staged.name)
             finally:
                 self._clear_hls_range_cache()
                 self.output_dir = destination
@@ -1280,11 +1281,11 @@ class VideoDownloader:
         for raw_line in text.splitlines():
             line = raw_line.strip()
             if line.startswith("#EXT-X-MEDIA:"):
-                attrs = _parse_m3u8_attrs(line.split(":", 1)[1])
+                attrs = parse_m3u8_attrs(line.split(":", 1)[1])
                 if attrs.get("TYPE") == "AUDIO":
                     renditions.append(attrs)
             elif line.startswith("#EXT-X-STREAM-INF:"):
-                stream_attrs = _parse_m3u8_attrs(line.split(":", 1)[1])
+                stream_attrs = parse_m3u8_attrs(line.split(":", 1)[1])
             elif line and not line.startswith("#"):
                 if urljoin(manifest_url, line) == variant_url:
                     bandwidth = int(stream_attrs.get("BANDWIDTH") or 0)
@@ -1311,13 +1312,13 @@ class VideoDownloader:
         lines = [line.strip() for line in text.splitlines()]
         for line in lines:
             if line.startswith("#EXT-X-MEDIA:"):
-                attrs = _parse_m3u8_attrs(line.split(":", 1)[1])
+                attrs = parse_m3u8_attrs(line.split(":", 1)[1])
                 if attrs.get("TYPE") == "AUDIO" and attrs.get("URI"):
                     external_audio_groups.add(attrs.get("GROUP-ID"))
         stream_attrs: Dict[str, str] = {}
         for line in lines:
             if line.startswith("#EXT-X-STREAM-INF:"):
-                stream_attrs = _parse_m3u8_attrs(line.split(":", 1)[1])
+                stream_attrs = parse_m3u8_attrs(line.split(":", 1)[1])
             elif line and not line.startswith("#"):
                 if (
                     urljoin(manifest_url, line) == variant_url
@@ -1344,7 +1345,7 @@ class VideoDownloader:
                 elif _is_hls_tag(line, "#EXT-X-MEDIA") or _is_hls_tag(
                     line, "#EXT-X-I-FRAME-STREAM-INF"
                 ):
-                    attrs = _parse_m3u8_attrs(line.split(":", 1)[1] if ":" in line else "")
+                    attrs = parse_m3u8_attrs(line.split(":", 1)[1] if ":" in line else "")
                     uri = attrs.get("URI")
                     if uri:
                         candidates.add(urljoin(context.url, uri))
@@ -1427,7 +1428,7 @@ class VideoDownloader:
                 pending_duration = False
                 resources += 1
             elif any(_is_hls_tag(line, tag) for tag in ("#EXT-X-KEY", "#EXT-X-MAP")):
-                attrs = _parse_m3u8_attrs(line.split(":", 1)[1] if ":" in line else "")
+                attrs = parse_m3u8_attrs(line.split(":", 1)[1] if ":" in line else "")
                 if attrs.get("URI"):
                     auxiliary_uris.add(attrs["URI"])
             if resources + len(auxiliary_uris) > MAX_HLS_PLAYLIST_RESOURCES:
@@ -1450,7 +1451,7 @@ class VideoDownloader:
                 continue
             if not line.startswith("#EXT-X-STREAM-INF") or next_media_uri is None:
                 continue
-            attrs = _parse_m3u8_attrs(line.split(":", 1)[1] if ":" in line else "")
+            attrs = parse_m3u8_attrs(line.split(":", 1)[1] if ":" in line else "")
             try:
                 bandwidth = int(attrs.get("BANDWIDTH") or 0)
             except ValueError:
@@ -1492,7 +1493,7 @@ class VideoDownloader:
             _is_hls_tag(line, "#EXT-X-I-FRAMES-ONLY") for line in lines
         ) and any(
             line.startswith("#EXT-X-KEY:")
-            and _parse_m3u8_attrs(line.split(":", 1)[1]).get("METHOD") == "AES-128"
+            and parse_m3u8_attrs(line.split(":", 1)[1]).get("METHOD") == "AES-128"
             for line in lines
         ):
             # Encrypted I-frame ranges require block-boundary expansion and
@@ -1526,7 +1527,7 @@ class VideoDownloader:
             elif line.startswith("#EXTINF:"):
                 pending_duration = float(line.split(":", 1)[1].split(",", 1)[0])
             elif line.startswith("#EXT-X-KEY:"):
-                attrs = _parse_m3u8_attrs(line.split(":", 1)[1])
+                attrs = parse_m3u8_attrs(line.split(":", 1)[1])
                 key_method = attrs.get("METHOD")
                 key_uri = attrs.get("URI")
                 key_iv = attrs.get("IV")
@@ -1687,7 +1688,7 @@ class VideoDownloader:
                     if is_ranged:
                         total = self._validate_hls_range_response(resp, segment)
                         resource_url = resource_identity_url(resp, segment.url)
-                        validator = _strong_etag(resp.headers)
+                        validator = strong_etag(resp.headers)
                         with self._hls_range_entity_lock:
                             previous_url = self._hls_range_aliases.setdefault(alias_url, resource_url)
                             if previous_url != resource_url:
@@ -2405,16 +2406,6 @@ def _parse_ffmpeg_time(value: str) -> Optional[float]:
 
 def _clean_yt_dlp_text(value: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", value).strip()
-
-
-def _parse_m3u8_attrs(value: str) -> Dict[str, str]:
-    attrs: Dict[str, str] = {}
-    for match in re.finditer(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', value):
-        raw = match.group(2).strip()
-        if raw.startswith('"') and raw.endswith('"'):
-            raw = raw[1:-1]
-        attrs[match.group(1)] = raw
-    return attrs
 
 
 def _parse_hls_iv(value: Optional[str], sequence: int) -> bytes:

@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from Crypto.Cipher import AES
 from src import downloader as module
 from src.downloader import VideoDownloader, _HlsFallbackError, _HlsIntegrityError, _HlsSegment
-from src.parallel_downloader import ParallelDownloader, _publish_unique
+from src.parallel_downloader import ParallelDownloader, publish_unique
 from src import parallel_downloader
 from src.scraper import VideoItem
 from test_parallel_downloader import FakeSession, FakeResponse
@@ -127,7 +127,7 @@ class DownloadAuditBoundaryTests(unittest.TestCase):
 
         with mock.patch.object(parallel_downloader.os, "link", side_effect=OSError(errno.EOPNOTSUPP, "no links")), \
                 mock.patch.object(parallel_downloader, "_rename_without_replacement", side_effect=third_party_first):
-            result = _publish_unique(source, target)
+            result = publish_unique(source, target)
         self.assertEqual(target.read_bytes(), b"third party")
         self.assertEqual(result.name, "media (1).mp4")
         self.assertEqual(result.read_bytes(), b"new media")

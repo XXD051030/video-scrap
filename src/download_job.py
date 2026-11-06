@@ -25,7 +25,7 @@ from typing import Callable, Optional
 import psutil
 
 from .downloader import DownloadLaneLimiter, DownloadProgress, VideoDownloader
-from .parallel_downloader import _publish_unique
+from .parallel_downloader import publish_unique
 from .scraper import VideoItem
 from .process_owner import ProcessOwner
 from .temp_ownership import create_owned_tempdir, add_temp_owner, remove_owned_tempdir
@@ -687,7 +687,7 @@ class DownloadJob:
             if self._requests()[0]:
                 raise DownloadCancelled("Download cancelled")
             # No UI-facing lock is held during filesystem publication.
-            published = _publish_unique(staged, destination / staged.name)
+            published = publish_unique(staged, destination / staged.name)
             with self._lock:
                 if self._cancelled:
                     raise DownloadCancelled("Download cancelled")

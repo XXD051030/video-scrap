@@ -522,7 +522,7 @@ class DownloadJobTests(unittest.TestCase):
             DownloadJob._validate_result(str(link), work)
 
     def test_cancel_during_publication_discards_only_this_result(self):
-        from src.download_job import _publish_unique as real_publish
+        from src.download_job import publish_unique as real_publish
         job = DownloadJob(self.item("/quick.mp4"), self.output)
         self.jobs.append(job)
         older = self.output / "Test clip.mp4"
@@ -533,7 +533,7 @@ class DownloadJobTests(unittest.TestCase):
             job.cancel()
             return result
 
-        with mock.patch("src.download_job._publish_unique", side_effect=publish_then_cancel):
+        with mock.patch("src.download_job.publish_unique", side_effect=publish_then_cancel):
             with self.assertRaises(DownloadCancelled):
                 job.run()
         self.assertEqual(older.read_bytes(), b"previous download")
