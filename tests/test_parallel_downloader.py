@@ -563,7 +563,7 @@ class ParallelDownloaderTests(unittest.TestCase):
                         side_effect=OSError(errno.EPERM, "hard links unavailable"),
                     ), patch_target:
                         with self.assertRaisesRegex(OSError, failed_step):
-                            parallel_downloader._publish_unique(part, output)
+                            parallel_downloader.publish_unique(part, output)
 
                     self.assertEqual(output.read_bytes(), b"previous download")
                     self.assertFalse((output.parent / "existing (1).bin").exists())

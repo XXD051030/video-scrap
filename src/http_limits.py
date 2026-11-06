@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import re
 import socket
 import threading
 from typing import Callable, Iterator, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from .transfer_clock import monotonic as transfer_monotonic
+
+_STRONG_ETAG_RE = re.compile(r'"[\x21\x23-\x7e\x80-\xff]*"')
+
+
+def strong_etag(headers) -> Optional[str]:
+    """Return the response's strong entity tag, or None.
+
+    RFC entity tags are quoted, and a weak (W/) validator cannot bind ranges.
+    """
+    value = (headers.get("ETag") or "").strip()
+    return value if _STRONG_ETAG_RE.fullmatch(value) else None
 
 
 def resource_identity_url(response, fallback_url: str) -> str:
