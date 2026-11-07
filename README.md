@@ -7,7 +7,7 @@ The interface uses PyQt6, with extraction handled by yt-dlp, HTML parsing, and Q
 
 ## Current Status
 
-Current version: **0.3.10**, targeting macOS Apple Silicon and Windows x64. Windows runtime testing for this version is pending.
+Current version: **0.3.11**, targeting macOS Apple Silicon and Windows x64. Windows runtime testing for this version is pending.
 
 See [GitHub Releases](https://github.com/XXD051030/video-scrap/releases) for published packages and release notes.
 
@@ -18,7 +18,7 @@ See [GitHub Releases](https://github.com/XXD051030/video-scrap/releases) for pub
 - Open **Full screen** or double-click the preview; use **Esc** to return without losing playback position. Fullscreen also works before selecting a video.
 - Adjust player volume from 0–100% or mute independently of system volume; each launch starts at 60%.
 - Choose best, 1080p, 720p, 480p, or audio only, with progress, logs, and a custom download folder.
-- Download direct media in parallel and merge HLS segments, with byte-range validation and protection against filename conflicts.
+- Download direct media in parallel and merge HLS segments, with byte-range validation and protection against filename conflicts. Direct downloads keep only audio/video file extensions; others, such as `.php` or `.exe`, are saved as `.mp4`.
 - Pause, resume, or cancel individual downloads beside their percentages; pausing one task leaves the other running.
 - Switch between saved dark and light themes. **More** contains **Preferences** and **About**, including the logo, version, and GitHub link.
 - Configure playback read-ahead in **Preferences**: 60 seconds by default, 0–300 seconds available; 0 disables it.
@@ -257,4 +257,4 @@ Third-party license texts are bundled in the `third-party/` resource directory.
 - Some yt-dlp sources provide streams that cannot be previewed directly in Qt, although downloading may still work.
 - A long pause may outlive the source's network session or signed link. Resume can then fail and require a new download; progress is not restored after closing the app.
 - The current HLS implementation does not support some combinations of initialization segments and byte ranges, or special encrypted range formats. It reports an error rather than continuing when it cannot handle them safely.
-- Earlier Windows builds were tested for startup, playback, and downloads; automated Windows regression and smoke-test reports have not been collected for 0.3.10.
+- Earlier Windows builds were tested for startup, playback, and downloads; automated Windows regression and smoke-test reports have not been collected for 0.3.11.
