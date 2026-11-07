@@ -39,7 +39,7 @@ from .hls_playlist import parse_m3u8_attrs
 from .http_limits import iter_limited_response, read_limited_response, resource_identity_url, strong_etag
 from .parallel_downloader import ParallelDownloader, publish_unique
 from .scraper import VideoItem, is_x_post_url
-from .utils import safe_filename
+from .utils import safe_filename, url_extension
 from .transfer_clock import monotonic as transfer_monotonic
 from .hls_snapshot import (
     HlsSnapshotServer, ManifestSnapshot, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_PLAYLISTS,
@@ -2160,7 +2160,7 @@ class VideoDownloader:
         on_progress: Optional[ProgressHandler],
     ) -> Path:
         """Pull a direct media URL using N parallel Range connections."""
-        ext = item.ext or _guess_ext(item.url) or "mp4"
+        ext = item.ext or url_extension(item.url) or "mp4"
         title = safe_filename(item.title)
         output_path = self.output_dir / f"{title}.{ext}"
 
@@ -2382,15 +2382,6 @@ class VideoDownloader:
             return self._hls_playlist_duration(text) or None
         except Exception:  # noqa: BLE001
             return None
-
-
-def _guess_ext(url: str) -> Optional[str]:
-    tail = url.rsplit("/", 1)[-1].split("?", 1)[0]
-    if "." in tail:
-        ext = tail.rsplit(".", 1)[-1].lower()
-        if 1 <= len(ext) <= 5 and ext.isalnum():
-            return ext
-    return None
 
 
 def _parse_ffmpeg_time(value: str) -> Optional[float]:

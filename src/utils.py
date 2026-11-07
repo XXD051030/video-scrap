@@ -18,6 +18,20 @@ def is_valid_url(url: str) -> bool:
         return False
 
 
+def url_extension(url: str) -> Optional[str]:
+    """Lower-case extension of the URL path's last segment, or None.
+
+    The host, query and fragment never count, so ``https://cdn.example.com``
+    has no extension. Only 1-5 alphanumeric characters are accepted.
+    """
+    tail = urlparse(url).path.rsplit("/", 1)[-1]
+    if "." in tail:
+        ext = tail.rsplit(".", 1)[-1].lower()
+        if 1 <= len(ext) <= 5 and ext.isalnum():
+            return ext
+    return None
+
+
 def format_duration(seconds: Optional[float]) -> str:
     """Format seconds into HH:MM:SS / MM:SS, or '--:--' when unknown."""
     try:
