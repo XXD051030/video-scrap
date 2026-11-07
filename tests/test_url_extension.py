@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import downloader
 from src.downloader import VideoDownloader
-from src.scraper import VideoItem
+from src.scraper import VideoItem, build_items_from_urls
 from src.utils import url_extension
 
 
@@ -60,14 +60,17 @@ class DirectDownloadNameTests(unittest.TestCase):
         self.downloader = VideoDownloader(Path(directory.name))
         self.addCleanup(self.downloader.close)
 
-    def output_name(self, url, ext=None):
+    def saved_name(self, item):
         recorded = []
-        item = VideoItem("Title", url, "https://cdn.example.com/watch", ext=ext, is_direct=True)
         with mock.patch.object(downloader, "ParallelDownloader",
                                side_effect=lambda **_kwargs: _RecordingParallel(recorded)), \
                 self.assertRaisesRegex(RuntimeError, "stop after naming"):
             self.downloader._download_direct(item, None)
         return recorded[0].name
+
+    def output_name(self, url, ext=None):
+        return self.saved_name(VideoItem("Title", url, "https://cdn.example.com/watch",
+                                         ext=ext, is_direct=True))
 
     def test_missing_extension_falls_back_to_mp4_instead_of_host_or_fragment(self):
         # Previously the host suffix or fragment was taken as the extension,
@@ -80,6 +83,30 @@ class DirectDownloadNameTests(unittest.TestCase):
 
     def test_scraped_extension_still_takes_precedence(self):
         self.assertEqual(self.output_name("https://cdn.example.com/clip.mov", ext="webm"), "Title.webm")
+
+    def test_audio_and_video_extensions_are_kept(self):
+        for ext in ("webm", "mkv", "mov", "ts", "mp3", "m4a", "ogg", "flac"):
+            with self.subTest(ext=ext):
+                self.assertEqual(self.output_name(f"https://cdn.example.com/clip.{ext.upper()}"),
+                                 f"Title.{ext}")
+
+    def test_program_and_script_extensions_are_saved_as_mp4(self):
+        # The content check only rejects pages and text, so the extension
+        # must not let a downloaded program or script keep its own type.
+        for url in ("https://cdn.example.com/files/movie.exe",
+                    "https://cdn.example.com/get_video.php?id=1",
+                    "https://cdn.example.com/run.bat",
+                    "https://cdn.example.com/screen.scr",
+                    "https://cdn.example.com/page.html"):
+            with self.subTest(url=url):
+                self.assertEqual(self.output_name(url), "Title.mp4")
+        self.assertEqual(self.output_name("https://cdn.example.com/clip.webm", ext="exe"), "Title.webm")
+
+    def test_page_labelled_executable_downloads_as_mp4(self):
+        page = "https://page.example/watch"
+        item = build_items_from_urls(["https://cdn.example/files/movie.exe"], [], page, "Cat video")[0]
+        self.assertEqual((item.ext, item.is_direct), ("exe", True))
+        self.assertEqual(self.saved_name(item), "Cat video - rendered 1.mp4")
 
 
 if __name__ == "__main__":

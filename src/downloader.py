@@ -90,6 +90,28 @@ DEFAULT_USER_AGENT = (
 )
 
 
+# A direct download keeps its extension only when it is a recognised audio or
+# video format. Anything else, such as .php or .exe, is saved as .mp4: a page
+# can label any link as video, and the content check below only rejects
+# pages and text, so a script or program must not keep its own extension.
+_SAVED_MEDIA_EXTENSIONS = frozenset({
+    # video
+    "3g2", "3gp", "avi", "f4v", "flv", "m2ts", "m4v", "mkv", "mov", "mp4",
+    "mpeg", "mpg", "ogv", "ts", "webm", "wmv",
+    # audio
+    "aac", "aiff", "flac", "m4a", "m4b", "mka", "mp3", "oga", "ogg",
+    "opus", "wav", "weba", "wma",
+})
+
+
+def _saved_media_extension(item: VideoItem) -> str:
+    """Extension for a direct download's file name."""
+    for candidate in (item.ext, url_extension(item.url)):
+        if candidate and candidate.lower() in _SAVED_MEDIA_EXTENSIONS:
+            return candidate.lower()
+    return "mp4"
+
+
 def build_request_headers(referer: Optional[str]) -> Dict[str, str]:
     """Browser-like header set used for both downloads and proxying."""
     headers: Dict[str, str] = {
@@ -2160,7 +2182,7 @@ class VideoDownloader:
         on_progress: Optional[ProgressHandler],
     ) -> Path:
         """Pull a direct media URL using N parallel Range connections."""
-        ext = item.ext or url_extension(item.url) or "mp4"
+        ext = _saved_media_extension(item)
         title = safe_filename(item.title)
         output_path = self.output_dir / f"{title}.{ext}"
 

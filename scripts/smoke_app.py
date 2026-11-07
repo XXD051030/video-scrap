@@ -778,6 +778,7 @@ def _run_smoke_test(report_path: str) -> int:
                     f"Controlled task {suffix}", base + "/" + name, base,
                     ext="bin", is_direct=True, referer=base,
                 ))
+            # .bin is not an audio/video extension, so the app saves these as .mp4.
             output = root / "controlled-downloads"
             output.mkdir()
             old_output, old_visible = window.output_dir, window.isVisible()
@@ -834,7 +835,7 @@ def _run_smoke_test(report_path: str) -> int:
                 return {
                     "captured_monotonic": time.monotonic(), "tasks": tasks,
                     "output_dir": str(output), "output_and_staging_files": files,
-                    "expected_outputs": [f"Controlled task {suffix}.bin" for suffix in ("a", "b", "c")],
+                    "expected_outputs": [f"Controlled task {suffix}.mp4" for suffix in ("a", "b", "c")],
                     "http_requests": controlled_request_snapshot(),
                 }
 
@@ -850,7 +851,7 @@ def _run_smoke_test(report_path: str) -> int:
                 frozen_progress = window._download_tasks[first]["progress_pct"]
                 second = start(1)
                 controlled_gates["controlled-task-b.bin"].set()
-                second_file = output / "Controlled task b.bin"
+                second_file = output / "Controlled task b.mp4"
                 wait_until(
                     lambda: second_file.exists() and second not in window.download_workers,
                     "A second download did not finish while the first was paused",
@@ -859,7 +860,7 @@ def _run_smoke_test(report_path: str) -> int:
                 assert window._download_tasks[first]["state"] == "paused"
                 assert window._download_tasks[first]["progress_pct"] == frozen_progress
                 controls(first)["pause"].click()
-                first_file = output / "Controlled task a.bin"
+                first_file = output / "Controlled task a.mp4"
                 wait_until(
                     lambda: first_file.exists() and first not in window.download_workers,
                     "The actual packaged task did not resume and finish",
@@ -877,7 +878,7 @@ def _run_smoke_test(report_path: str) -> int:
                     lambda: third not in window.download_workers,
                     "Cancelling a paused packaged download did not stop its worker",
                 )
-                assert not (output / "Controlled task c.bin").exists()
+                assert not (output / "Controlled task c.mp4").exists()
                 assert not list(output.glob(".video-scrap-job-*"))
                 return {
                     "toolbar_stop_removed": True,
