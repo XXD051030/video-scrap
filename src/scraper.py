@@ -33,6 +33,7 @@ from bs4 import BeautifulSoup
 from .js_decoder import decode_obfuscated_urls
 from .http_limits import read_limited_response
 from .browser_cookies import build_scoped_session
+from .utils import url_extension
 
 HTML_MAX_BYTES = 8 * 1024 * 1024
 
@@ -118,20 +119,11 @@ def _x_full_post_url(url: str) -> str:
 
 
 def _is_hls(url: str, ext: Optional[str] = None) -> bool:
-    return (ext or _ext_of(url) or "").lower() in HLS_EXTS
+    return (ext or url_extension(url) or "").lower() in HLS_EXTS
 
 
 def _is_dash(url: str, ext: Optional[str] = None) -> bool:
-    return (ext or _ext_of(url) or "").lower() == "mpd"
-
-
-def _ext_of(url: str) -> Optional[str]:
-    tail = urlparse(url).path.rsplit("/", 1)[-1]
-    if "." in tail:
-        ext = tail.rsplit(".", 1)[-1].lower()
-        if 1 <= len(ext) <= 5 and ext.isalnum():
-            return ext
-    return None
+    return (ext or url_extension(url) or "").lower() == "mpd"
 
 
 def _is_known_player_placeholder(url: str) -> bool:
@@ -518,7 +510,7 @@ class VideoScraper:
 
         # A pasted media URL is already discovered. Never read its body as a
         # web page, or ask a generic extractor to scan the complete video.
-        if _ext_of(url) in {"mp4", "webm", "mov", "m4v", "mkv", "m3u8", "mpd"}:
+        if url_extension(url) in {"mp4", "webm", "mov", "m4v", "mkv", "m3u8", "mpd"}:
             direct = build_items_from_urls([url], [], url, urlparse(url).path.rsplit("/", 1)[-1])
             log(f"Found {len(direct)} direct media URL(s).")
             return direct
@@ -639,7 +631,7 @@ class VideoScraper:
                 if not link or _is_known_player_placeholder(link) or link in seen_urls:
                     continue
                 seen_urls.add(link)
-                ext = _ext_of(link)
+                ext = url_extension(link)
                 results.append(
                     VideoItem(
                         title=f"{page_title} - hidden source {idx}",
@@ -1093,7 +1085,7 @@ class VideoScraper:
         items: List[VideoItem] = []
         page_title = (soup.title.string.strip() if soup.title and soup.title.string else url)
         for idx, link in enumerate(unique, 1):
-            ext = _ext_of(link)
+            ext = url_extension(link)
             items.append(
                 VideoItem(
                     title=f"{page_title} - clip {idx}",
@@ -1127,12 +1119,12 @@ def build_items_from_urls(
         link = _resolve_player_media_url(link, source_url)
         if not link or link in seen:
             return
-        if is_direct and _ext_of(link) in {"ts", "m4s"}:
+        if is_direct and url_extension(link) in {"ts", "m4s"}:
             # A network request for one streaming fragment is not evidence
             # of a complete movie; retain manifests/full media candidates.
             return
         seen.add(link)
-        ext = _ext_of(link) if is_direct else None
+        ext = url_extension(link) if is_direct else None
         items.append(
             VideoItem(
                 title=f"{page_title or source_url} - {kind} {label_idx}",
