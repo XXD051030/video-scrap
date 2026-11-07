@@ -18,7 +18,7 @@ See [GitHub Releases](https://github.com/XXD051030/video-scrap/releases) for pub
 - Open **Full screen** or double-click the preview; use **Esc** to return without losing playback position. Fullscreen also works before selecting a video.
 - Adjust player volume from 0–100% or mute independently of system volume; each launch starts at 60%.
 - Choose best, 1080p, 720p, 480p, or audio only, with progress, logs, and a custom download folder.
-- Download direct media in parallel and merge HLS segments, with byte-range validation and protection against filename conflicts.
+- Download direct media in parallel and merge HLS segments, with byte-range validation and protection against filename conflicts. Direct downloads keep only audio/video file extensions; others, such as `.php` or `.exe`, are saved as `.mp4`.
 - Pause, resume, or cancel individual downloads beside their percentages; pausing one task leaves the other running.
 - Switch between saved dark and light themes. **More** contains **Preferences** and **About**, including the logo, version, and GitHub link.
 - Configure playback read-ahead in **Preferences**: 60 seconds by default, 0–300 seconds available; 0 disables it.
