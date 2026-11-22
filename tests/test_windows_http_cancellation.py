@@ -16,8 +16,8 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).res
 
 from src.browser_cookies import _CancelableAdapter, _PollingResponseReader, build_scoped_session
 from src.http_limits import iter_continuous_response
-from test_connection_lease_recheck import NativeConnectionLeaseTests
-from test_http_lifecycle_recheck import NativeContinuousBodyTests
+from test_http_connection_leases import NativeConnectionLeaseTests
+from test_http_response_deadlines import NativeContinuousBodyTests
 from test_scraper_network_boundaries import ScraperNetworkTests
 
 

@@ -21,6 +21,24 @@ These records were written in the repository root and moved here on 2026-11-06 w
 | [audit_fixes_2026-10-22.md](audits/audit_fixes_2026-10-22.md) | Fixes R01–R09 and final verification |
 | [ci_failure_39744314319.md](audits/ci_failure_39744314319.md) | Investigation of GitHub Actions run 39744314319 |
 
+## Renamed test files
+
+On 2026-11-22 the test files named after audit rounds were renamed after what they test, without changing their contents. The records above still use the old names.
+
+| Old name | New name |
+| --- | --- |
+| `tests/test_audit_core_regressions.py` | `tests/test_settings_scraping_cleanup_edges.py` |
+| `tests/test_connection_lease_recheck.py` | `tests/test_http_connection_leases.py` |
+| `tests/test_download_audit_oct18.py` | `tests/test_download_integrity.py` |
+| `tests/test_download_audit_regressions.py` | `tests/test_download_quality_and_sessions.py` |
+| `tests/test_download_recheck_oct18.py` | `tests/test_download_redirects_and_hls_playlists.py` |
+| `tests/test_gui_audit_regressions.py` | `tests/test_gui_input_and_task_state.py` |
+| `tests/test_gui_lifecycle_regressions.py` | `tests/test_browser_and_settings_lifecycle.py` |
+| `tests/test_http_lifecycle_recheck.py` | `tests/test_http_response_deadlines.py` |
+| `tests/test_proxy_audit_boundaries.py` | `tests/test_proxy_cache_and_transport.py` |
+| `tests/test_proxy_protocol_regressions.py` | `tests/test_proxy_ranges_and_cookie_scope.py` |
+| `tests/test_proxy_recheck_oct18.py` | `tests/test_proxy_cache_bounds_and_refresh.py` |
+
 ## Progress diaries (`diary/`)
 
 | File | Contents |

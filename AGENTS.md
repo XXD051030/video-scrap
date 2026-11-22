@@ -27,3 +27,8 @@ Must maintain independent judgment, prioritize identifying problems and risks, a
 - Keep the repository root for user-facing documentation (`README.md`, `WINDOWS_BUILD.md`) and these instructions.
 - Write new code audits, fix reports and CI investigation records to `docs/audits/`, and progress diaries to `docs/diary/`; add each new file to the index in `docs/README.md`.
 - Do not edit existing records to update their paths or links. They were moved from the root on 2026-11-06 unchanged.
+
+## Test file names
+
+- Name test files after the feature they cover, such as `tests/test_download_integrity.py`, not after an audit round, recheck or date. Prefer adding a test to the existing file for that feature.
+- Test files named after audit rounds were renamed on 2026-11-22; `docs/README.md` maps the old names to the new ones.

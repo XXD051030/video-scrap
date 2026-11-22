@@ -23,7 +23,7 @@ from src.gui.preview_panel import PreviewPanel
 from src.scraper import VideoItem, build_items_from_urls
 from src.utils import redact_log_secrets
 import test_download_controls as controls
-from test_gui_lifecycle_regressions import FakePage
+from test_browser_and_settings_lifecycle import FakePage
 
 APP = QApplication.instance() or QApplication([])
 APP.setQuitOnLastWindowClosed(False)
